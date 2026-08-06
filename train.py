@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import hydra
 import torch
 import wandb
@@ -27,12 +28,175 @@ import custom_resolvers  # noqa: F401  # Registers OmegaConf resolvers at import
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
 
+
+# --- Run-directory loss-configuration guard (Requirement 6.6) -----------------
+# The Hydra run directory is derived from the objective, so two arms that differ
+# only in a loss knob can resolve to the same directory and silently auto-resume
+# each other. That has already cost this project a run once
+# (SHORT_BUDGET_PILOTS.md section 3). A "loss signature" is every configuration
+# value that changes the objective.
+LOSS_SIGNATURE_KEYS = (
+    "straighten",
+    "stop_grad",
+    "vcreg",
+    "vcreg_std_coeff",
+    "vcreg_cov_coeff",
+    "lambda_cf",
+    "ccr_rho",
+    "ccr_rollout_len",
+    "ccr_action_source",
+    "mca_weight",
+)
+
+# Used only when falling back to a run that predates `loss_config.json`: a key the
+# previous run never wrote is read as the value it would have had.
+LOSS_SIGNATURE_DEFAULTS = {
+    "straighten": False,
+    "stop_grad": True,
+    "vcreg": False,
+    "vcreg_std_coeff": 0,
+    "vcreg_cov_coeff": 0,
+    "lambda_cf": 0.0,
+    "ccr_rho": 0.0,
+    "ccr_rollout_len": 5,
+    "ccr_action_source": "synthetic",
+    "mca_weight": 0.0,
+}
+
+LOSS_CONFIG_BASENAME = "loss_config.json"
+
+# --- Telemetry (Requirements 6.7, 6.8) ----------------------------------------
+# Loss components currently go to wandb only, which under WANDB_MODE=offline means
+# they are not readable from the shell. This sink makes each term's scaled value and
+# its share of the objective greppable, which is what decides a pilot
+# (SHORT_BUDGET_PILOTS.md section 6). Consumer: summarize_training_log.py.
+TELEMETRY_BASENAME = "training_log.jsonl"
+
+# (key in `loss_components`, telemetry name). Ordered, so `enabled_terms` and the
+# `terms` block come out in a stable order run to run. A key that is absent from
+# `loss_components` (its term is disabled) is simply omitted from the record.
+TELEMETRY_TERMS = (
+    ("z_loss", "prediction"),
+    ("curvature_loss_scaled", "curvature"),
+    ("ccr_loss_scaled", "ccr"),
+    ("mca_loss_scaled", "mca"),
+    ("z_vcreg_loss_scaled", "vcreg"),
+    ("decoder_loss_reconstructed", "decoder"),
+)
+
+
+def _cfg_value(cfg_node, key, default):
+    """
+    Read one key from a config node, treating an absent key and an explicit `null`
+    the same way: fall back to `default`. Hydra keys are the single source of truth
+    (Requirement 3.5); `default` here only covers a config node that predates a key.
+    """
+    if cfg_node is None:
+        return default
+    try:
+        value = cfg_node.get(key, default)
+    except AttributeError:
+        value = getattr(cfg_node, key, default)
+    return default if value is None else value
+
+
+def _cfg_int(cfg_node, key, default):
+    try:
+        return int(_cfg_value(cfg_node, key, default))
+    except (TypeError, ValueError):
+        log.warning(
+            "training.%s is not an integer; falling back to %s", key, default
+        )
+        return int(default)
+
+
+def _cfg_float(cfg_node, key, default):
+    try:
+        return float(_cfg_value(cfg_node, key, default))
+    except (TypeError, ValueError):
+        log.warning("training.%s is not a number; falling back to %s", key, default)
+        return float(default)
+
+
+def _as_plain_float(value):
+    """
+    Plain Python float for JSON, or None if the value cannot be one.
+
+    `.item()` is called only on tensors: by the time telemetry sees them the loss
+    components have already been gathered and reduced to floats, and calling
+    `.item()` on a float would raise.
+    """
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        if value.numel() != 1:
+            value = value.mean()
+        value = value.float().cpu().item()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rounded(value, places=6):
+    if value is None:
+        return None
+    return round(float(value), places)
+
+
+def _normalize_signature_value(value):
+    """
+    Put a signature value into a form that survives a JSON round trip and compares
+    stably: booleans stay booleans, numbers become floats (so `0` recorded by one
+    run and `0.0` by another do not read as a conflict), everything else becomes a
+    string (`straighten` is either `False` or a tag like `aggcos1e-1`).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    return str(value)
+
+
+def loss_signature_from_training_cfg(training_cfg):
+    """Flat, JSON-serializable loss signature over LOSS_SIGNATURE_KEYS."""
+    return {
+        key: _normalize_signature_value(
+            _cfg_value(training_cfg, key, LOSS_SIGNATURE_DEFAULTS[key])
+        )
+        for key in LOSS_SIGNATURE_KEYS
+    }
+
+
+def _is_rank_zero():
+    """
+    Which process may write, decided from the environment.
+
+    The guard runs before the Accelerator is constructed, on purpose: it must abort
+    before *any* training artifact is written, and that includes wandb's. So the
+    rank comes from the launcher's environment rather than from `self.accelerator`.
+    """
+    for var in ("RANK", "SLURM_PROCID", "LOCAL_RANK"):
+        value = os.environ.get(var)
+        if value is None or not value.strip():
+            continue
+        try:
+            return int(value) == 0
+        except ValueError:
+            return True
+    return True
+
+
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
         with open_dict(cfg):
             cfg["saved_folder"] = os.getcwd()
             log.info(f"Model saved dir: {cfg['saved_folder']}")
+        # Immediately after `saved_folder` is known and before wandb.init, before
+        # hydra.yaml is written and before any checkpoint write (Requirement 6.6).
+        self._guard_run_dir()
         cfg_dict = cfg_to_dict(cfg)
         model_name = cfg_dict["saved_folder"].split("checkpoints/")[-1]
         model_name += f"_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
@@ -74,6 +238,29 @@ class Trainer:
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
+        # Optimizer steps completed across the whole run, checkpointed alongside
+        # `epoch` so a resumed pilot honours the same total bound (Requirement 6.3).
+        self.global_iter = 0
+        # <= 0 means "run the configured epochs", i.e. exactly today's behaviour
+        # (Requirement 6.2). The cap can only ever shorten a run, never lengthen it.
+        self.max_iterations = _cfg_int(self.cfg.training, "max_iterations", 0)
+        self._stop_requested = False
+
+        # JSONL telemetry sink, appended in the Hydra run directory (which is cwd).
+        # Default cadence 200 matches the reference run, so step-200 rows are
+        # directly comparable between arms.
+        self.telemetry_every = _cfg_int(
+            self.cfg.training, "telemetry_every_x_iterations", 200
+        )
+        self._telemetry_path = Path(cfg["saved_folder"]) / TELEMETRY_BASENAME
+        self._telemetry_start = time.perf_counter()
+        self._telemetry_last_time = self._telemetry_start
+        # Steps taken by *this process*, used for it_per_s. `global_iter` cannot be
+        # used for the rate because a resumed run starts it from the checkpoint.
+        self._iters_this_process = 0
+        self._telemetry_last_iters = 0
+        self._telemetry_last_written = None
+        self._telemetry_failed = False
         self.decoder_start_epoch = int(self.cfg.training.get("decoder_start_epoch", 1))
         if self.decoder_start_epoch < 1:
             log.warning(
@@ -169,6 +356,11 @@ class Trainer:
 
         self._keys_to_save = [
             "epoch",
+            # Persisted so the cap is counted against the whole run, not this
+            # process (Requirement 6.3). Checkpoints written before this feature
+            # have no such key: `load_ckpt` reports it through the existing
+            # "Keys not found in ckpt" warning and the counter simply starts at 0.
+            "global_iter",
         ]
         self._keys_to_save += (
             ["encoder", "encoder_optimizer"] if self.train_encoder else []
@@ -186,7 +378,297 @@ class Trainer:
         self.init_models()
         self.init_optimizers()
 
+        # After init_models, so the line reflects the resumed `global_iter` rather
+        # than a pre-resume 0.
+        self._log_iteration_budget()
+
         self.epoch_log = OrderedDict()
+
+    def _guard_run_dir(self, run_dir=None):
+        """
+        Refuse to continue a run directory whose checkpoint was trained under a
+        different objective (Requirement 6.6).
+
+        The Hydra run directory is derived from the objective, so two arms differing
+        only in a loss knob that is not in the run name resolve to one directory and
+        silently auto-resume each other. Hydra creates the output directory and its
+        `.hydra/` snapshot before user code runs; this guard covers every *training*
+        artifact (checkpoints, hydra.yaml, training_log.jsonl, plots), which is what
+        makes an accidental overwrite destructive.
+
+            1. No `checkpoints/model_latest.pth`: nothing to conflict with. Record
+               the signature and return.
+            2. Otherwise compare against `loss_config.json`, falling back to the
+               previous run's resolved `hydra.yaml` with missing keys read as their
+               defaults. If neither is readable, warn and proceed so legacy runs
+               stay resumable.
+            3. On mismatch, raise before writing anything.
+        """
+        run_dir = Path(self.cfg["saved_folder"] if run_dir is None else run_dir)
+        current = loss_signature_from_training_cfg(self.cfg.training)
+        ckpt_path = run_dir / "checkpoints" / "model_latest.pth"
+        record_path = run_dir / LOSS_CONFIG_BASENAME
+
+        if not ckpt_path.exists():
+            if _is_rank_zero():
+                self._write_loss_config(record_path, current)
+            return
+
+        recorded, source = self._read_recorded_loss_signature(run_dir)
+        if recorded is None:
+            log.warning(
+                "Run directory %s already contains %s but no readable loss "
+                "configuration (%s or hydra.yaml), so the loss configuration of the "
+                "existing checkpoint cannot be verified. Proceeding, which keeps "
+                "runs predating this check resumable: confirm by hand that this "
+                "launch shares the objective of that checkpoint.",
+                run_dir,
+                ckpt_path.name,
+                LOSS_CONFIG_BASENAME,
+            )
+            return
+
+        differing = {
+            key: (recorded.get(key), current[key])
+            for key in LOSS_SIGNATURE_KEYS
+            if recorded.get(key) != current[key]
+        }
+        if differing:
+            detail = "; ".join(
+                f"{key}: recorded={rec!r} current={cur!r}"
+                for key, (rec, cur) in differing.items()
+            )
+            raise RuntimeError(
+                f"Loss-configuration conflict in run directory {run_dir}: it already "
+                f"contains {ckpt_path.name} trained under a different objective "
+                f"(recorded signature read from {source}). Differing keys -> "
+                f"{detail}. Nothing was written. Auto-resuming here would continue "
+                f"and overwrite that run. Give this arm its own directory (put the "
+                f"knob in the run name, or override ckpt_base_path) before relaunching."
+            )
+
+        log.info(
+            "Loss configuration matches the checkpoint already in %s (verified "
+            "against %s); resuming is safe.",
+            run_dir,
+            source,
+        )
+
+    def _write_loss_config(self, record_path, signature):
+        try:
+            record_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(record_path, "w", encoding="utf-8") as fh:
+                json.dump(signature, fh, indent=2, sort_keys=False)
+                fh.write("\n")
+        except OSError as exc:
+            # Not fatal: failing to record the signature must not stop a run, but a
+            # later launch then cannot be guarded, so say so loudly.
+            log.warning(
+                "Could not write %s (%s); a later launch into this directory cannot "
+                "be checked for a loss-configuration conflict.",
+                record_path,
+                exc,
+            )
+        else:
+            log.info("Recorded loss configuration in %s", record_path)
+
+    def _read_recorded_loss_signature(self, run_dir):
+        """
+        (signature, source) for the run already in `run_dir`, or (None, "").
+
+        Keys absent from the recorded source are read as their defaults, which is
+        what makes a run predating a knob comparable against one that has it.
+        """
+        record_path = Path(run_dir) / LOSS_CONFIG_BASENAME
+        if record_path.is_file():
+            try:
+                with open(record_path, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+            except (OSError, ValueError) as exc:
+                log.warning("Could not read %s (%s)", record_path, exc)
+            else:
+                if isinstance(raw, dict):
+                    return (
+                        {
+                            key: _normalize_signature_value(
+                                raw[key]
+                                if raw.get(key) is not None
+                                else LOSS_SIGNATURE_DEFAULTS[key]
+                            )
+                            for key in LOSS_SIGNATURE_KEYS
+                        },
+                        str(record_path),
+                    )
+                log.warning("%s is not a JSON object; ignoring it", record_path)
+
+        # Fall back to the resolved config the previous run wrote.
+        hydra_yaml = Path(run_dir) / "hydra.yaml"
+        if hydra_yaml.is_file():
+            try:
+                previous = OmegaConf.load(hydra_yaml)
+            except Exception as exc:  # OmegaConf raises a family of errors here
+                log.warning("Could not read %s (%s)", hydra_yaml, exc)
+            else:
+                training_cfg = None
+                if previous is not None:
+                    try:
+                        training_cfg = previous.get("training", None)
+                    except AttributeError:
+                        training_cfg = None
+                if training_cfg is not None:
+                    return (
+                        loss_signature_from_training_cfg(training_cfg),
+                        str(hydra_yaml),
+                    )
+                log.warning("%s has no `training` section; ignoring it", hydra_yaml)
+
+        return None, ""
+
+    def _write_telemetry(self, components, batch_index, force=False):
+        """
+        Append one telemetry record for the current iteration (Requirements 6.7, 6.8).
+
+        Cadence is `training.telemetry_every_x_iterations`, plus `force=True` for the
+        final step of a capped run. Main process only, one JSON object per line,
+        flushed on write so a killed job still leaves every completed row on disk.
+        """
+        if self._telemetry_failed or not self.accelerator.is_main_process:
+            return
+        if not force:
+            if self.telemetry_every <= 0:
+                return
+            if self.global_iter % self.telemetry_every != 0:
+                return
+        if self._telemetry_last_written == self.global_iter:
+            # The cap's forced row would otherwise duplicate a cadence row when the
+            # cap happens to land on the cadence.
+            return
+
+        record = self._telemetry_record(components, batch_index)
+        try:
+            with open(self._telemetry_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record))
+                fh.write("\n")
+                fh.flush()
+        except OSError as exc:
+            # A log write must not kill a 17-hour run, but losing telemetry loses the
+            # pilot verdict, so report it once and stop trying.
+            self._telemetry_failed = True
+            log.warning(
+                "Telemetry disabled: could not append to %s (%s). The pilot verdict "
+                "is read out of this file, so fix the path before relaunching.",
+                self._telemetry_path,
+                exc,
+            )
+            return
+        self._telemetry_last_written = self.global_iter
+
+    def _telemetry_record(self, components, batch_index):
+        now = time.perf_counter()
+        elapsed = now - self._telemetry_last_time
+        steps = self._iters_this_process - self._telemetry_last_iters
+        it_per_s = steps / elapsed if elapsed > 0 and steps > 0 else None
+        self._telemetry_last_time = now
+        self._telemetry_last_iters = self._iters_this_process
+
+        total = _as_plain_float(components.get("loss"))
+        terms = OrderedDict()
+        for key, name in TELEMETRY_TERMS:
+            if key not in components:
+                continue  # the term is disabled this run
+            scaled = _as_plain_float(components[key])
+            if scaled is None:
+                continue
+            # Share against the same iteration's total, from the already-gathered
+            # per-iteration dict, so it is the number that drove this step rather
+            # than an epoch mean.
+            share = scaled / total if total not in (None, 0.0) else None
+            terms[name] = {"scaled": _rounded(scaled), "share": _rounded(share)}
+
+        return {
+            "global_iter": int(self.global_iter),
+            "epoch": int(self.epoch),
+            # Batches completed in this epoch, so it equals `global_iter` for a run
+            # that started from scratch in its first epoch.
+            "iter_in_epoch": int(batch_index) + 1,
+            "wall_time_s": _rounded(now - self._telemetry_start, 3),
+            "it_per_s": _rounded(it_per_s, 4),
+            "loss": _rounded(total),
+            "terms": terms,
+            "enabled_terms": list(terms),
+            "ccr": self._ccr_telemetry_block(components),
+        }
+
+    def _ccr_telemetry_block(self, components):
+        """
+        Self-describing CCR block: reading a pilot's telemetry six weeks later must
+        not require reconstructing which arm it was from the directory name.
+        """
+        training_cfg = self.cfg.training
+        rollout_len = _cfg_int(training_cfg, "ccr_rollout_len", 5)
+        action_source = str(_cfg_value(training_cfg, "ccr_action_source", "synthetic"))
+        num_hist = int(self.cfg.num_hist)
+        num_frames = num_hist + int(self.cfg.num_pred)
+        # Frames past the recorded window that have to be synthesized to reach the
+        # imagined horizon. `logged` never synthesizes: an infeasible horizon is
+        # rejected upstream instead. A `synthetic` arm reporting 0 here is silently
+        # a `logged` arm, which summarize_training_log.py flags.
+        synthesized = (
+            max(0, num_hist + rollout_len - 1 - num_frames)
+            if action_source == "synthetic"
+            else 0
+        )
+        block = OrderedDict()
+        raw = _as_plain_float(components.get("ccr_loss"))
+        if raw is not None:
+            block["raw"] = _rounded(raw)
+        block["lambda_cf"] = _cfg_float(training_cfg, "lambda_cf", 0.0)
+        block["rho"] = _cfg_float(training_cfg, "ccr_rho", 0.0)
+        block["rollout_len"] = rollout_len
+        block["action_source"] = action_source
+        block["synthesized_action_frames"] = synthesized
+        return block
+
+    def _log_iteration_budget(self):
+        """
+        Log the run's iteration arithmetic at startup so a pilot cap can be set from
+        real numbers instead of a guess (SHORT_BUDGET_PILOTS.md section 2):
+
+            Iteration budget: steps/epoch=61929 epochs=3 total=185787 max_iterations=8000 (cap active)
+        """
+        try:
+            steps_per_epoch = len(self.dataloaders["train"])
+        except TypeError:  # an iterable-style dataloader has no length
+            steps_per_epoch = None
+        total = (
+            steps_per_epoch * self.total_epochs if steps_per_epoch is not None else None
+        )
+        log.info(
+            "Iteration budget: steps/epoch=%s epochs=%s total=%s max_iterations=%s %s",
+            steps_per_epoch if steps_per_epoch is not None else "unknown",
+            self.total_epochs,
+            total if total is not None else "unknown",
+            self.max_iterations,
+            "(cap active)" if self.max_iterations > 0 else "(no cap)",
+        )
+        if self.max_iterations > 0 and total is not None and self.max_iterations >= total:
+            # The cap can only shorten a run, so a cap at or above the budget is inert.
+            log.warning(
+                "training.max_iterations=%s is >= the %s-step budget, so the epoch "
+                "boundary will end this run, not the cap. SHORT_BUDGET_PILOTS.md "
+                "section 2: raise training.epochs so the cap is what stops it.",
+                self.max_iterations,
+                total,
+            )
+        if self.global_iter:
+            log.info(
+                "Resumed with global_iter=%s already completed; %s step(s) remain "
+                "under the cap.",
+                self.global_iter,
+                max(0, self.max_iterations - self.global_iter)
+                if self.max_iterations > 0
+                else "unbounded",
+            )
 
     def _configure_encoder_trainability(self):
         base_model = getattr(self.encoder, "base_model", None)
@@ -403,6 +885,13 @@ class Trainer:
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
             vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
+            # CCR / MCA knobs come from conf/train.yaml only (no Python literal
+            # fallback that could diverge from the yaml).
+            lambda_cf=self.cfg.training.get("lambda_cf"),
+            ccr_rho=self.cfg.training.get("ccr_rho"),
+            ccr_rollout_len=self.cfg.training.get("ccr_rollout_len"),
+            ccr_action_source=self.cfg.training.get("ccr_action_source"),
+            mca_weight=self.cfg.training.get("mca_weight"),
         )
         self._log_trainable_params(self.model, "model")
 
@@ -492,6 +981,11 @@ class Trainer:
             )
             self.monitor_thread.start()
 
+        # Baseline the telemetry clock here so `wall_time_s` and `it_per_s` measure
+        # training, not the dataset and DINOv2 load that precede it.
+        self._telemetry_start = time.perf_counter()
+        self._telemetry_last_time = self._telemetry_start
+
         init_epoch = self.epoch + 1  # epoch starts from 1
         for epoch in range(init_epoch, init_epoch + self.total_epochs):
             self.epoch = epoch
@@ -507,6 +1001,23 @@ class Trainer:
             self.accelerator.wait_for_everyone()
             self.train()
             self.accelerator.wait_for_everyone()
+            if self._stop_requested:
+                # The iteration cap stopped this epoch mid-way, so `val()` and
+                # `logs_flash` are deliberately skipped. `logs_flash` formats
+                # `train_loss` and `val_loss` and would raise KeyError with no
+                # validation pass, and a partial-epoch validation number invites
+                # comparison against full-epoch numbers, which
+                # SHORT_BUDGET_PILOTS.md section 7b warns against. The cap already
+                # wrote the final checkpoint and telemetry row; pilot judgement
+                # comes from that telemetry and the offline probe.
+                log.info(
+                    "Stopping after epoch %s at global_iter=%s: iteration cap reached. "
+                    "Validation and the epoch log flush are skipped because the epoch "
+                    "is incomplete.",
+                    self.epoch,
+                    self.global_iter,
+                )
+                break
             self.val()
             self.logs_flash(step=self.epoch)
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
@@ -610,6 +1121,11 @@ class Trainer:
             loss_components = {
                 key: value.mean().item() for key, value in loss_components.items()
             }
+            # Snapshot of this iteration's already-gathered scalars, taken before the
+            # `train_` prefixing below. Telemetry shares are computed from these, so
+            # they are the numbers that actually drove this step rather than an
+            # epoch mean.
+            iter_components = dict(loss_components)
             if decoder_active and plot:
                 # only eval images when plotting due to speed
                 if self.cfg.has_predictor:
@@ -671,6 +1187,30 @@ class Trainer:
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
+            # The optimizer steps for this batch are done, so the step counts.
+            self.global_iter += 1
+            self._iters_this_process += 1
+            self._write_telemetry(iter_components, batch_index=i)
+
+            if 0 < self.max_iterations <= self.global_iter:
+                self._stop_requested = True
+                self._write_telemetry(iter_components, batch_index=i, force=True)
+                self.logs_flash_iter(iteration=i)
+                self.save_ckpt()
+                log.info(
+                    "Iteration cap reached: global_iter=%s == training.max_iterations=%s; "
+                    "stopping mid-epoch (epoch %s, batch %s). Validation skipped: the "
+                    "epoch is incomplete.",
+                    self.global_iter,
+                    self.max_iterations,
+                    self.epoch,
+                    i,
+                )
+                break
+
+            # Unchanged, deliberately: `i % N == 0` also fires at i == 0, so a
+            # checkpoint exists within seconds and an empty checkpoint directory a
+            # minute into a run is diagnosable as a crash (Requirement 6.9).
             if (
                 self.cfg.training.save_every_x_iterations > 0
                 and i % self.cfg.training.save_every_x_iterations == 0

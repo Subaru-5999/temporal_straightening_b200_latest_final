@@ -15,9 +15,9 @@ ckpt_base_path: ./checkpoints
 
 hydra:
   run:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${ccr_tag:${training.lambda_cf},${training.ccr_rho},${training.ccr_action_source},${training.mca_weight}}
   sweep:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${ccr_tag:${training.lambda_cf},${training.ccr_rho},${training.ccr_action_source},${training.mca_weight}}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -33,6 +33,17 @@ training:
   epochs: 20
   batch_size: 32 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
+  # --- Counterfactual Curvature Regularization (default OFF) ---
+  lambda_cf: 0.0            # weight on the CCR term; 0 disables the whole path
+  ccr_rho: 0.0              # perturbation radius in normalized-action units (dimensionless)
+  ccr_rollout_len: 5        # imagined predictor steps; default == planner horizon (25/frameskip 5)
+  ccr_action_source: synthetic   # 'logged' | 'synthetic'; synthetic keeps the default L=5 feasible
+  # --- Metric-Consistent Aggregation (pilot only, default OFF) ---
+  mca_weight: 0.0
+  # --- Pilot infrastructure ---
+  max_iterations: 0         # <=0 means "run the configured epochs" (current behaviour)
+  telemetry_every_x_iterations: 200
+  # unchanged; fires at i == 0 so an empty ckpt dir means a crash
   save_every_x_iterations: 1000
   straighten: False  # e.g. cos1e-2 or aggcos1e-2
   decoder_start_epoch: 1  # start optimizing decoder at this epoch

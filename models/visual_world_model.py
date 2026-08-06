@@ -7,6 +7,12 @@ from einops import rearrange, repeat
 
 log = logging.getLogger(__name__)
 
+# Permitted values for `training.ccr_action_source`.
+#   'logged'    -- perturb recorded normalized actions only; the training window caps L
+#   'synthetic' -- keep and perturb the recorded prefix, synthesize actions past the edge
+CCR_ACTION_SOURCES = ("logged", "synthetic")
+
+
 class VWorldModel(nn.Module):
     def __init__(
         self,
@@ -32,6 +38,11 @@ class VWorldModel(nn.Module):
         vcreg_std_coeff=0,
         vcreg_cov_coeff=0,
         vcreg_apply_to="enc",
+        lambda_cf=0.0,
+        ccr_rho=0.0,
+        ccr_rollout_len=5,
+        ccr_action_source="synthetic",
+        mca_weight=0.0,
         **kwargs,
     ):
         super().__init__()
@@ -74,6 +85,55 @@ class VWorldModel(nn.Module):
 
         self.straighten = self.curvature_mode is not None and self.straighten_scale > 0
 
+        # --- Counterfactual Curvature Regularization / Metric-Consistent Aggregation ---
+        # These are plain Python scalars and booleans. Nothing in the CCR/MCA path may
+        # construct an nn.Module, parameter or buffer: VWorldModel is built *after*
+        # accelerator.prepare() in train.py and is never itself prepared, so any module
+        # created here would keep CPU parameters, never be registered in an optimizer, and
+        # kill the run about two seconds into epoch 1 with a device mismatch
+        # (SHORT_BUDGET_PILOTS.md section 9).
+        #
+        # train.py forwards these with `self.cfg.training.get(key)` and no fallback, so a
+        # yaml key that is absent arrives here as None. None means "use the default".
+        self.lambda_cf = float(0.0 if lambda_cf is None else lambda_cf)
+        self.ccr_rho = float(0.0 if ccr_rho is None else ccr_rho)
+        self.ccr_rollout_len = int(5 if ccr_rollout_len is None else ccr_rollout_len)
+        self.ccr_action_source = str(
+            "synthetic" if ccr_action_source is None else ccr_action_source
+        )
+        self.mca_weight = float(0.0 if mca_weight is None else mca_weight)
+
+        for _name, _value in (
+            ("lambda_cf", self.lambda_cf),
+            ("ccr_rho", self.ccr_rho),
+            ("mca_weight", self.mca_weight),
+        ):
+            if _value < 0:
+                raise ValueError(f"training.{_name} must be >= 0, got {_value}.")
+        # Validated eagerly, even when lambda_cf == 0: a typo in an unused knob that only
+        # surfaces once the term is enabled is exactly the class of mistake a pilot cannot
+        # afford. This is a string comparison, so it adds no tensor work to the off path.
+        if self.ccr_action_source not in CCR_ACTION_SOURCES:
+            raise ValueError(
+                f"training.ccr_action_source must be one of {CCR_ACTION_SOURCES}, "
+                f"got {self.ccr_action_source!r}."
+            )
+        # L + 2 is the curvature window, and total_curvature needs at least 3 frames.
+        if self.ccr_rollout_len < 1:
+            raise ValueError(
+                f"training.ccr_rollout_len must be >= 1, got {self.ccr_rollout_len} "
+                "(the CCR curvature window is ccr_rollout_len + 2 frames and "
+                "total_curvature requires at least 3)."
+            )
+        # Cheap boolean gates: the disabled path is one attribute lookup and one comparison.
+        self.ccr = self.lambda_cf > 0
+        self.mca = self.mca_weight > 0
+        # Plain bool, not a buffer: `synthesized_action_frames` needs num_frames, which is
+        # not available in __init__ (it is a property of the batch, not of the model), so
+        # the startup line below reports the formula and the first CCR forward reports the
+        # resolved count.
+        self._ccr_forward_logged = False
+
         log.info("num_action_repeat: %s", self.num_action_repeat)
         log.info("num_proprio_repeat: %s", self.num_proprio_repeat)
         log.info("proprio encoder: %s", proprio_encoder)
@@ -96,6 +156,37 @@ class VWorldModel(nn.Module):
             self.std_coeff,
             self.cov_coeff,
         )
+        # Emitted here, after accelerate has already placed the submodules, so the device
+        # reported is the device the terms will actually compute on. This is the two-minute
+        # smoke check from the pilot checklist.
+        _ccr_device = self._param_device()
+        if self.ccr:
+            log.info(
+                "CCR enabled: term=ccr, weight(lambda_cf)=%s, rho=%s, rollout_len=%s, "
+                "action_source=%s, synthesized_action_frames=max(0, %s + %s - 1 - "
+                "num_frames) [resolved on the first forward], curvature_mode=aggcos, "
+                "device=%s",
+                self.lambda_cf,
+                self.ccr_rho,
+                self.ccr_rollout_len,
+                self.ccr_action_source,
+                self.num_hist,
+                self.ccr_rollout_len,
+                _ccr_device,
+            )
+        if self.mca:
+            log.info(
+                "MCA enabled: term=mca, weight(mca_weight)=%s, rho=n/a, device=%s",
+                self.mca_weight,
+                _ccr_device,
+            )
+        _disabled = []
+        if not self.ccr:
+            _disabled.append(f"CCR disabled (lambda_cf={self.lambda_cf})")
+        if not self.mca:
+            _disabled.append(f"MCA disabled (mca_weight={self.mca_weight})")
+        if _disabled:
+            log.info("; ".join(_disabled))
 
         self.concat_dim = concat_dim # 0 or 1
         assert concat_dim == 0 or concat_dim == 1, f"concat_dim {concat_dim} not supported."
@@ -115,6 +206,20 @@ class VWorldModel(nn.Module):
         self.decoder_criterion = nn.MSELoss()
         self.decoder_latent_loss_weight = 0.25
         self.emb_criterion = nn.MSELoss()
+
+    def _param_device(self):
+        """Device the model's tensors live on, i.e. `next(self.parameters()).device`.
+
+        Falls back to buffers and then CPU so that a parameterless test double cannot
+        turn a log line into a StopIteration.
+        """
+        param = next(self.parameters(), None)
+        if param is not None:
+            return param.device
+        buf = next(self.buffers(), None)
+        if buf is not None:
+            return buf.device
+        return torch.device("cpu")
 
     def train(self, mode=True):
         super().train(mode)
@@ -368,6 +473,26 @@ class VWorldModel(nn.Module):
                 curvature_loss = self.total_curvature(feats, mode=self.curvature_mode)
                 loss = loss + curvature_loss * self.straighten_scale
                 loss_components["curvature_loss_used_for_training"] = curvature_loss
+                # Telemetry only: the scaled value makes the baseline curvature term
+                # comparable against ccr_loss_scaled in loss shares. Adding a key does not
+                # change the loss.
+                loss_components["curvature_loss_scaled"] = (
+                    curvature_loss * self.straighten_scale
+                )
+
+            # Both new terms sit behind a boolean, so the disabled path is one attribute
+            # lookup and one comparison: no tensor work, no extra predictor rollout, no
+            # extra encoder forward pass.
+            if self.ccr:
+                ccr_loss = self.compute_ccr(z, act)
+                loss = loss + ccr_loss * self.lambda_cf
+                loss_components["ccr_loss"] = ccr_loss
+                loss_components["ccr_loss_scaled"] = ccr_loss * self.lambda_cf
+            if self.mca:
+                mca_loss = self.compute_mca(z)
+                loss = loss + mca_loss * self.mca_weight
+                loss_components["mca_loss"] = mca_loss
+                loss_components["mca_loss_scaled"] = mca_loss * self.mca_weight
         else:
             visual_pred = None
             z_pred = None
@@ -407,18 +532,15 @@ class VWorldModel(nn.Module):
         return z
 
 
-    def rollout(self, obs_0, act):
+    def _rollout_latents(self, z, action):
+        """Predictor rollout body.
+
+        Identical tensor ops, in identical order, to the previous ``rollout`` loop.
+
+        input:  z: (b, n, num_patches, emb_dim) latent context (already encoded)
+                action: (b, t, action_dim) actions past the context window
+        output: z: (b, n+t+1, num_patches, emb_dim)
         """
-        input:  obs_0 (dict): (b, n, 3, img_size, img_size)
-                  act: (b, t+n, action_dim)
-        output: embeddings of rollout obs
-                visuals: (b, t+n+1, 3, img_size, img_size)
-                z: (b, t+n+1, num_patches, emb_dim)
-        """
-        num_obs_init = obs_0['visual'].shape[1]
-        act_0 = act[:, :num_obs_init]
-        action = act[:, num_obs_init:] 
-        z = self.encode(obs_0, act_0)
         t = 0
         inc = 1
         while t < action.shape[1]:
@@ -431,5 +553,139 @@ class VWorldModel(nn.Module):
         z_pred = self.predict(z[:, -self.num_hist :])
         z_new = z_pred[:, -1 :, ...] # take only the next pred
         z = torch.cat([z, z_new], dim=1)
+        return z
+
+    def rollout(self, obs_0, act):
+        """
+        input:  obs_0 (dict): (b, n, 3, img_size, img_size)
+                  act: (b, t+n, action_dim)
+        output: embeddings of rollout obs
+                visuals: (b, t+n+1, 3, img_size, img_size)
+                z: (b, t+n+1, num_patches, emb_dim)
+        """
+        num_obs_init = obs_0['visual'].shape[1]
+        act_0 = act[:, :num_obs_init]
+        action = act[:, num_obs_init:] 
+        z = self.encode(obs_0, act_0)
+        z = self._rollout_latents(z, action)
         z_obses, z_acts = self.separate_emb(z)
         return z_obses, z
+
+    def _sample_action_perturbation(self, act):
+        """Uniform perturbation, elementwise bounded by rho in normalized-action units.
+
+        `uniform_(-1, 1)` is a closed interval and multiplication by a non-negative rho is
+        monotone, so every element lies in [-rho, +rho] as rho is represented in
+        `act.dtype`. No clamping and no rejection sampling.
+
+        There is deliberately **no** `if rho == 0` branch: rho = 0 must produce exact zeros
+        through the identical code path and consume the identical RNG draws, so the control
+        arm is a genuine code-path twin of the treatment arm.
+
+        `empty_like` inherits device and dtype from `act`, which is what makes the
+        "new tensor on the wrong device" failure structurally unreachable. Nothing here is
+        moved with `.to(device)`, and rho is the only scalar involved, so no
+        environment-specific or dataset-specific constant reaches this function.
+        """
+        rho = torch.as_tensor(self.ccr_rho, dtype=act.dtype, device=act.device)
+        return torch.empty_like(act).uniform_(-1.0, 1.0).mul_(rho)
+
+    def _ccr_actions(self, act, required):
+        """Base action sequence of length `required`, plus one bounded uniform perturbation.
+
+        input:  act: (b, available, action_dim) recorded normalized actions
+                required: total number of action frames the imagined rollout needs
+        output: (b, required, action_dim)
+
+        The recorded prefix is perturbed under both action sources; frames past the window
+        edge are synthesized as zeros (the planner's initialisation point) and then
+        perturbed by the same sampler. There is no `ccr_action_source` argument on purpose:
+        the source is enforced upstream by the guard in `compute_ccr`, which rejects
+        `required > available` under 'logged', so the padding branch below is reachable only
+        under 'synthetic'.
+        """
+        n_logged = min(required, act.shape[1])
+        base = act[:, :n_logged]                                # recorded, normalized
+        if required > n_logged:                                 # 'synthetic' only
+            b, _, d = base.shape
+            base = torch.cat([base, base.new_zeros(b, required - n_logged, d)], dim=1)
+        return base + self._sample_action_perturbation(base)
+
+    def compute_ccr(self, z, act):
+        """Counterfactual curvature of an imagined, off-log rollout.
+
+        input:  z: (b, num_frames, num_patches, emb_dim) latents `forward` already encoded
+                act: (b, num_frames, action_dim) recorded normalized actions
+        output: scalar curvature loss
+
+        Zero additional encoder forward passes: `z` is reused, only its action channels are
+        overwritten with the perturbed actions. The cost is L extra predictor calls, one
+        action_encoder call and one encoder.agg call.
+        """
+        L = self.ccr_rollout_len
+        required = self.num_hist + L - 1            # actions needed for L predictor steps
+        available = act.shape[1]
+        if self.ccr_action_source == "logged" and required > available:
+            raise ValueError(
+                f"CCR is enabled (lambda_cf={self.lambda_cf}) with ccr_rollout_len={L} and "
+                f"ccr_action_source='logged', which needs an action sequence of length "
+                f"{required} (num_hist={self.num_hist} + {L} - 1), but only {available} "
+                f"action frames are available (num_frames={available}). Set "
+                f"training.ccr_rollout_len <= {available - self.num_hist + 1}, or set "
+                f"training.ccr_action_source=synthetic to synthesize the "
+                f"{required - available} action frames past the window edge."
+            )
+        # One-shot completion of the __init__ startup line: `synthesized_action_frames`
+        # needs num_frames, which is a property of the batch and is unknown in __init__.
+        # This is the only place where both `required` and `available` are in scope, so the
+        # resolved count is logged once here rather than being recomputed elsewhere.
+        # A 'synthetic' arm reporting synthesized_action_frames=0 is silently a 'logged'
+        # arm, which is exactly what the pilot smoke check reads this number for.
+        if not self._ccr_forward_logged:
+            self._ccr_forward_logged = True
+            log.info(
+                "CCR first forward: term=ccr, weight(lambda_cf)=%s, rho=%s, rollout_len=%s, "
+                "action_source=%s, synthesized_action_frames=%s, curvature_mode=aggcos, "
+                "device=%s",
+                self.lambda_cf,
+                self.ccr_rho,
+                L,
+                self.ccr_action_source,
+                max(0, required - available),
+                z.device,
+            )
+        act_cf = self._ccr_actions(act, required)   # logged prefix (+ synthesized tail)
+        # `.clone()` is essential: replace_actions_from_z writes in place, and mutating a
+        # view of `z` would corrupt the baseline prediction term's autograd graph.
+        z_ctx = self.replace_actions_from_z(
+            z[:, : self.num_hist].clone(), act_cf[:, : self.num_hist]
+        )
+        z_imag = self._rollout_latents(z_ctx, act_cf[:, self.num_hist : required])
+        # Last L + 2 frames: every velocity pair entering _cos_curvature touches at least
+        # one imagined frame, so the purely-real triple the baseline term already penalises
+        # is not double-counted. `visual_only` matches the baseline curvature term's channel
+        # selection (visual+proprio is unreachable: agg_mlp's input width is fixed at
+        # num_patches * emb_dim). `aggcos` is hardcoded: CCR is defined on the aggregated
+        # geometry.
+        feats = self.visual_only(z_imag[:, -(L + 2) :])
+        return self.total_curvature(feats, mode="aggcos")
+
+    def compute_mca(self, z, eps=1e-6):
+        """Metric-Consistent Aggregation (pilot only).
+
+        Penalises `encoder.agg` for distorting velocity norms: straightness is enforced in
+        aggregated space while planning/objectives.py scores distances in patch space.
+        `agg` only needs to be a *similarity* (distance-preserving up to one global
+        constant) for straightness to transfer, so the penalty compares each velocity's
+        norm ratio against the batch-mean ratio and is therefore scale-invariant.
+
+        `encoder.agg` is an existing module; this adds no module and no parameter.
+        """
+        feats = self.visual_only(z)                                  # (b, t, p, d)
+        b, t, p, d = feats.shape
+        agg = self.encoder.agg(feats.reshape(b * t, p, d)).reshape(b, t, -1)
+        v_patch = (feats[:, 1:] - feats[:, :-1]).flatten(2).norm(dim=-1)   # (b, t-1)
+        v_agg = (agg[:, 1:] - agg[:, :-1]).norm(dim=-1)                    # (b, t-1)
+        r = v_agg / (v_patch + eps)
+        r_bar = r.mean().detach().clamp_min(eps)
+        return ((r / r_bar) - 1.0).pow(2).mean()

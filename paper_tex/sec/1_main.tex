@@ -1,0 +1,552 @@
+\section{Introduction}
+
+Latent world models offer a compelling solution for planning due to better efficiency and generalization~\citep{truck-backer-upper, dyna, worldmodel, Hafner2020Dream, hafner2022dreamerv2, hafner2023dreamerv3, hansen2022temporal, hansen2023td}. They compress high-dimensional observations into compact latent representations, learn predictive dynamics in that latent space, and enable imaginary rollouts for action optimization. Compared to operating directly in pixel or state space, the latent abstraction reduces dimensionality and ignores noise, making dynamics learning more efficient. At test time, planning is typically posed as optimizing an action sequence by rolling the model forward and minimizing a cost function between the goal and the predicted states in the latent space.
+
+\begin{figure}
+\center
+\includegraphics[width=\linewidth]{images/wall_teaser.pdf}
+\caption{Latent trajectories encoded by a pretrained visual encoder are usually highly curved, increasing the difficulty of prediction and planning. We learn a representation space where feasible trajectories are straighter to facilitate latent planning.
+}
+\vspace{-0.2in}
+\label{img:teaser}
+\end{figure}
+
+In practice, however, optimization in the learned latent space remains challenging. The induced planning objective is typically highly non-convex, potentially causing gradient-based optimizers to struggle. As a result, many successful practices~\citep{hafner2019planet, hansen2023td, dinowm, sobal2025learning, terver2026drivessuccessphysicalplanning} rely on search-based methods such as CEM~\citep{rubinstein1997optimization} or MPPI~\citep{mppi}, which achieve competitive performance but introduce a substantial compute burden and latency. Moreover, commonly used goal cost metrics based on Euclidean distance can be misleading if the embedding space is not properly regularized. In particular, when latent trajectories are highly curved, straight-line distances in embedding space misrepresent the geodesic distance along feasible transitions. These challenges call for better representations that facilitate latent planning.
+
+\begin{figure*}
+    \centering
+    \begin{subfigure}[t]{\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/pusht_exp_pca_mse.pdf}
+    \end{subfigure}
+    \begin{subfigure}[t]{\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/umaze_exp_pca_mse.pdf}
+    \end{subfigure}
+\caption{Latent trajectories before vs.\ after straightening. The upper PushT example is a rotation and the bottom UMaze example shows the agent traveling from the top-left to the top-right, with the star denoting the target. Straightening yields less curved and smoother trajectories, and makes Euclidean distance a more faithful proxy for geodesic progress towards the goal. More examples are in~\Cref{app:pca}.}
+\vspace{-0.1in}
+\label{img:pca_mse}
+\end{figure*}
+
+What is a ``good'' representation for latent planning? Although general-purpose visual pretraining provides powerful semantic-aware features, it is not tailored to the dynamics of the environment and often retains plenty of planning-irrelevant low-level details. We argue that planning could benefit from representations that are (i) sufficient for predicting dynamics but without task-irrelevant information and (ii) properly regularized so that embedding distances reflect the geodesic distance and gradient-based optimization is reliable. With such representations, we can exploit the differentiability of latent world models and enable efficient gradient-based planning, bypassing the need for computationally expensive search-based methods.
+
+Inspired by the perceptual straightening hypothesis in human vision~\citep{perceptual_straightening}, which posits that visual systems transform complex natural videos into straighter internal representations, we introduce a simple approach to straighten latent trajectories for planning. Concretely, we jointly learn an encoder and a predictor of a Joint-Embedding Predictive Architecture (JEPA) world model, while imposing regularization on the curvature of latent trajectories during training. We
+find that the JEPA prediction objective alone induces \emph{implicit straightening} to some extent, and introducing an \emph{explicit} curvature regularizer further strengthens and
+stabilizes this effect. The resulting encoded trajectories are significantly straighter, with Euclidean distances better aligned with geodesic distances~(\Cref{img:pca_mse}). We prove that reducing curvature improves convergence of gradient-based planners, and observe superior empirical gains across a suite of goal-reaching tasks: open-loop planning success improves by 20--60\% and MPC by 20--30\% with a simple gradient-based planner.
+
+\begin{figure*}[t]
+\center
+\includegraphics[width=0.9\textwidth]{images/architecture.pdf}
+\caption{During training, we minimize the prediction loss between the predicted embedding $\hat{z}_{t}^t$ and the target ${z}_{t}^t$ with stop-grad in the target branch, and minimize the local curvature of embeddings. During planning, we roll out for the horizon $T$ using the trained predictor and select optimal actions that minimize the cost between the predicted terminal state and the goal in the embedding space.
+}
+\label{img:train}
+\end{figure*}
+
+\section{Related Work}
+
+While early visual world models directly predict in pixel spaces and use generated images for control~\citep{oh2015actionconditionalvideopredictionusing, finn2017deep,ebert2018visual, unipi}, an increasing number of recent works first encode high-dimensional sensory inputs into compact latent representations and plan in the resulting latent space. Learning representations is central to these latent world models. 
+
+To obtain meaningful representations for world modeling, prior methods add reconstruction-based objectives when training the encoder along with the predictor~\citep{watter2015embedcontrollocallylinear, zhang2019solardeepstructuredrepresentations, Levine2020pcc, worldmodel,hafner2019planet, Hafner2020Dream, iris, transformer100k}. However, these reconstruction objectives overemphasize low-level visual details that are unnecessary for planning and may fail to capture task-relevant information. More recent approaches decouple perception from dynamics by leveraging strong pretrained visual encoders~\citep{nair2022r3muniversalvisualrepresentation, dinowm, bar2025navigation, dexwm, bai2025wholebodyconditionedegocentricvideo, assran2025vjepa2selfsupervisedvideo}. Closest to our setup, DINO-WM~\citep{dinowm} trains task-agnostic predictors and plans directly in frozen DINOv2~\citep{oquab2024dinov2} feature space. While DINOv2 features provide high-quality visual representations, they are not optimized for planning and may lead to planning objectives that are challenging to optimize. In this work, we improve the representation space for planning by introducing a curvature regularization during world model training.
+
+Joint-Embedding Predictive Architecture (JEPA) emerges as a promising paradigm for world models by learning representations through prediction~\citep{jepa, vjepa, assran2025vjepa2selfsupervisedvideo}. It aims to capture predictable structure without retaining unpredictable low-level details, making it more effective and efficient than reconstruction objectives~\citep{vanassel2025jointembeddingvsreconstruction}. This paradigm has been shown to be effective for predictive modeling and planning, with training from scratch on offline simulator data~\citep{sobal2025learning} and large-scale real-world video pretraining followed by action-conditioned post-training for robotic planning~\citep{assran2025vjepa2selfsupervisedvideo}. Our work also belongs to the JEPA family and focuses on learning better representations.
+
+Temporal Contrastive Learning~\citep{sermanet2018timecontrastivenetworksselfsupervisedlearning, tclr, eysenbach2024inference, yang2025memory} is also a popular paradigm for learning representations that can reflect the temporal relationships. It encourages temporally close frames to have similar embeddings while distant frames have more dissimilar embeddings through InfoNCE loss~\citep{radford2021learningtransferablevisualmodels}. However, how to choose positive and negative samples requires careful tuning and this objective might push away geodesically close states if suboptimal trajectories are used. Instead, our regularization-based method does not require negatives and applies \emph{local} straightening without requiring expert trajectories. 
+
+Motivated by the perceptual straightening hypothesis in human vision~\citep{perceptual_straightening}, some prior works have examined implicit straightening in pretrained visual encoders~\citep{harrington2023exploring,interno2025aigenerated} or used it as an objective to obtain robust video models~\citep{niu2024learning, bagad2025chirality}. Relatedly, early work on learning linearized video representations also regularizes the curvature of latent trajectories~\citep{goroshin2015learninglinearizeuncertainty}. Implicit straightening is also observed in autoregressive language models optimized for next-word prediction~\citep{hosseini2023large, hosseini2026context}. To the best of our knowledge, however, none of these prior works have studied the impact of straightening on world modeling and planning. We further discuss the connection of our work to a broader literature in control and learning plannable representations in~\Cref{sec:related_cont}.
+
+\section{Temporal Straightening}
+We consider control tasks with high-dimensional observations $o_t \in \mathbb{R}^{n_o}$ of an agent interacting with its environment using actions $a_t \in \mathbb{R}^{n_a}$. Our goal is to learn a world model that maps observations to a latent space and models the dynamics in this space, which we use for latent planning. 
+
+In this section, we first outline the architecture of our world model, then define the training objectives with a novel geometric regularization that straightens latent trajectories. 
+
+\subsection{World Model}
+Our world model predicts future states in a learned latent space and consists of three components: a sensory encoder, an action encoder, and a predictor. 
+
+\paragraph{Sensory encoder.}
+The sensory encoder $\mathcal{E}^s_\phi$ maps raw observations $o_t$ into latent representations
+\begin{align}
+z_t \in \mathbb{R}^{d} = \mathcal{E}^s_\phi(o_t).
+\end{align}
+
+The sensory encoder can be any function that maps observations to latent representations. For visual observations, the encoder may preserve spatial structure or collapse it into a global vector representation.
+
+\paragraph{Action encoder.}
+Each action $a_t \in \mathbb{R}^{n_a}$ is mapped to a latent action embedding via 
+\[
+\mathcal{E}^a_\psi: \mathbb{R}^{n_a} \to \mathbb{R}^{d_a}.
+\]
+
+
+\paragraph{Predictor.}
+The predictor \mbox{$f_\theta: \mathbb{R}^{K \times d} \times \mathbb{R}^{K \times d_a} \to \mathbb{R}^{d}$} models transitions in the latent space. Given a history of $K$ past latent states and actions, it predicts the next latent state
+\begin{equation}
+\hat{z}_{t} = f_\theta \left( \{z_i\}_{i=t-K}^{t-1}, \{\mathcal{E}^a_\psi(a_i)\}_{i=t-K}^{t-1} \right). \end{equation}
+
+
+\subsection{Straightening Latent Trajectories}
+We seek to straighten the latent space induced by the sensory encoder $\mathcal{E}^s_\phi$ by penalizing the curvature along trajectories. Let $z_t, z_{t+1}$, and $z_{t+2}$ be three consecutive latent representations  obtained by encoding observations $o_t, o_{t+1}$, and $o_{t+2}$ using $\mathcal{E}^s_\phi$ . We define approximate latent velocity vectors
+\begin{equation}
+v_t = z_{t+1} - z_t, \quad v_{t+1} = z_{t+2} - z_{t+1},
+\end{equation}
+and seek to minimize the angle between them, or equivalently maximize their cosine similarity
+\begin{equation}
+\label{eq:cossim}
+\mathcal{C}= \frac{v_t \cdot v_{t+1}}{||v_t||_2 \cdot ||v_{t+1}||_2}.
+\end{equation}
+
+\subsection{Training Objective.}
+
+The parameters $\phi, \psi$ and $\theta$ of the world model components $\mathcal{E}^s_\phi$, $\mathcal{E}^a_\psi$ and $f_\theta$ are trained jointly to minimize prediction error and enforce straightened trajectories. 
+
+\paragraph{Prediction objective.} We minimize the MSE between the predicted and target latent states $\hat{z}_{t+1}$ and $z_{t+1}$:
+
+\begin{equation}
+\mathcal{L}_{pred} = || \hat{z}_{t+1} - \operatorname{sg}(z_{t+1}) ||_2^2 \\ \text{ },
+\label{eq:pred}
+\end{equation}
+where $\mathrm{sg}$ denotes the stop-gradient operation to prevent collapse of the latent space.
+
+\paragraph{Straightening objective.}
+We minimize trajectory curvatures by minimizing the negative cosine similarity
+\begin{equation}
+\mathcal{L}_{curv} = 1 - \mathcal{C}.
+\label{eq:curvature}
+\end{equation}
+This straightening loss can be applied to any differentiable sensory encoder, either in isolation or jointly with the prediction objective.
+
+\paragraph{Overall objective.}
+The total training objective combines prediction and straightening as
+
+\begin{equation}
+\mathcal{L}_{total} = \mathcal{L}_{pred} + \lambda \mathcal{L}_{curv},
+\end{equation}
+
+where $\lambda \geq 0$ controls the strength of the straightening.
+
+\paragraph{Collapse prevention.}
+Since our encoder is trainable, the model is likely to produce degenerate solutions in which all latent representations collapse to a constant. Common anti-collapse strategies can be regularization-based~\citep{bardes2022vicregvarianceinvariancecovarianceregularizationselfsupervised, zhu2024variancecovarianceregularizationimprovesrepresentation,balestriero2025lejepa,kuang2026rectified}, contrastive-based~\citep{SimCLR,moco}, and stop-gradient-based~\citep{chen2020simsiam, byol}. Our curvature regularizer is \emph{orthogonal to
+these anti-collapse methods} and can be combined with any of them. We use stop-grad for major experiments due to its simplicity and efficiency, as it does not require negative samples or introduce new hyperparameters. We apply stop-gradient to the target latent in the prediction loss~\eqref{eq:pred} to prevent the gradients from $\mathcal{L}_{pred}$ from being backpropagated through the target branch. 
+Although a collapsing solution is still possible in theory, stop-grad has been shown to be effective in self-supervised vision learning~\citep{chen2020simsiam}, and also effective in our experiments.
+
+\begin{figure}[t]
+\center
+    \begin{subfigure}[t]{0.22\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/landscape_baseline.png}
+        \caption{DINOv2}
+        \label{fig:wall}
+    \end{subfigure}
+    \hspace{0.1in}
+    \begin{subfigure}[t]{0.22\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/landscape_ours.png}
+        \caption{Straightened}
+        \label{fig:pointmaze}
+    \end{subfigure}
+\caption{
+Action-Space Loss Landscape. We pick one test sample from PushT with a planning horizon of 25 steps. For each coordinate $(a_x, a_y)$ in the grid, we fix the first action and optimize the remaining actions in the planning horizon to minimize the terminal goal cost. The heatmap represents the minimum attainable loss for each initial action choice, with darker colors indicating lower loss. The loss landscape is closer to being convex after straightening.
+}
+\vspace{-0.1in}
+\label{img:loss_landscape}
+\end{figure}
+
+\section{Planning with Straightened Dynamics}
+\label{sec:theory}
+In this section, we present a theoretical analysis on the effect of straightening in the case of a linear dynamical system and show that straightened latent dynamics lead to better convergence in gradient-based planning.
+
+We consider a goal-reaching task where we optimize an action sequence
+$\mathbf a=(a_0,\dots,a_{K-1})\in\mathbb R^{K\times d_a}$ over a horizon $K$ to reach a target latent goal $z_g$.
+For simplicity, we use the mean-squared terminal error,
+\begin{equation}\label{eq:obj}
+\mathcal L(\mathbf a)=\|z_K-z_g\|_2^2,
+\qquad
+z_K=\Phi(\mathbf a),
+\end{equation}
+where $\Phi$ denotes unrolling the learned latent dynamics from a fixed initial state $z_0$.
+
+\begin{assumption}[Linear latent dynamics]\label{as:linear}
+For analysis, we consider linear latent dynamics 
+\begin{equation}\label{eq:linear}
+f: (z_t, a_t) \to Az_t+Ba_t,
+\qquad
+\text{s.t.} \quad
+z_{t+1}=Az_t+Ba_t,
+\end{equation}
+where $A\in\mathbb R^{d\times d}$ and $B\in\mathbb R^{d\times d_a}$. We first state results for $d_a=d$ and $B$ invertible; see Remark~\ref{rem:lowdim} for $d_a<d$.
+\end{assumption}
+
+\begin{definition}[$\varepsilon$-straight transition]\label{def:eps}
+Under the linear dynamics, we call $f$ \emph{$\varepsilon$-straight} if
+\begin{equation}\label{eq:eps_def}
+\|A-I\|_2 \leq \varepsilon.
+\end{equation}
+The term ``straight'' reflects that, as $\varepsilon$ tends to $0$, the dynamics of $f$ approach those of the reference function $g: (z_t, a_t) \to z_t+Ba_t$, where the state evolves linearly along a straight trajectory modified only by the control input. We are primarily interested in the regime where $\varepsilon$ is small.
+\end{definition}
+
+\begin{remark}[Cosine similarity as a practical proxy]\label{rem:cos_proxy}
+In practice, we regularize temporal straightness using the cosine similarity between consecutive latent velocities~\eqref{eq:cossim}. Under mild bounded-variation assumptions on velocity magnitudes and smooth actions, a large
+cosine similarity implies that $(A-I)$ is small along visited velocity directions. Detailed proofs are in~\Cref{app:theory_cos}.
+\end{remark}
+
+\begin{theorem}[Conditioning of the planning Hessian]\label{thm:cond}
+Under Assumption~\ref{as:linear} with $d_a=d$ and $B$ invertible, unrolling~\eqref{eq:linear} yields
+\[
+z_K=A^{K}z_0+\sum_{t=0}^{K-1}A^{K-1-t}Ba_t,
+\]
+so $z_K$ is affine in $\mathbf a$ and the planning Hessian is
+\[
+H:=\nabla_{\mathbf a}^2\mathcal L(\mathbf a)=2J_\Phi^\top J_\Phi\succeq 0,
+\]
+where
+$J_\Phi=\bigl[\,A^{K-1}B,\; A^{K-2}B,\; \cdots,\; B\,\bigr]
+\in\mathbb R^{d\times Kd}.
+$
+Let $\mathcal W_K:=J_\Phi J_\Phi^\top=\sum_{k=0}^{K-1}A^kBB^\top(A^\top)^k$ be the finite-horizon
+controllability Gramian~\citep{kailath1980linear,sontag1998mathematical,chen1999linear}. Then the
+\emph{effective} condition number $\kappa_{\mathrm{eff}}(H):=\sigma_{\max}(H)/\sigma_{\min}^+(H)$ satisfies
+\begin{equation}\label{eq:kappaA}
+\begin{aligned}
+\kappa_{\mathrm{eff}}(H)=\kappa(\mathcal W_K)
+&\le
+\kappa(B)^2\,
+\frac{\sum_{k=0}^{K-1}\sigma_{\max}(A)^{2k}}
+     {\sum_{k=0}^{K-1}\sigma_{\min}(A)^{2k}} \\
+&\le
+\kappa(B)^2\,\kappa(A)^{2(K-1)},
+\end{aligned}
+\end{equation}
+where $\kappa(A):=\sigma_{\max}(A)/\sigma_{\min}(A)$.
+Moreover, if the transition is $\varepsilon$-straight with $\varepsilon=\|A-I\|_2<1$, then
+\begin{equation}\label{eq:eps_bound}
+\kappa_{\mathrm{eff}}(H)
+\;\le\;
+\kappa(B)^2\left(\frac{1+\varepsilon}{1-\varepsilon}\right)^{2(K-1)}.
+\end{equation}
+For $\varepsilon\le\tfrac12$, this gives $
+\kappa_{\mathrm{eff}}(H)
+\;\le\;
+\kappa(B)^2 e^{6\varepsilon K}$.
+
+Proofs are in~\Cref{app:theory_hessian}.
+\end{theorem}
+
+\begin{remark}[Low-dimensional actions]\label{rem:lowdim}
+When $d_a<d$, $B$ is not invertible and $\mathcal W_K$ (hence $H$) may be singular outside the controllable subspace.
+Theorem~\ref{thm:cond} holds on $\mathcal S_K=\mathrm{range}(\mathcal W_K)$ when $\kappa_{\mathrm{eff}}$ is computed
+using $\sigma_{\min}^+(\mathcal W_K)$; see~\Cref{app:theory_hessian}.
+\end{remark}
+
+
+Theorem~\ref{thm:cond} shows that $\varepsilon$-straight transitions control the condition number of the planning Hessian: when $\varepsilon=\|A-I\|_2$ is small, the Gramian remains better conditioned, yielding $\kappa_{\mathrm{eff}}(H)$ that grows slowly with the horizon. Since the planning objective is quadratic with Hessian $H\succeq 0$, gradient descent converges linearly at a rate controlled by the condition number, so the improved bounds on $\kappa_{\mathrm{eff}}(H)$ translate to faster optimization in practice. For nonlinear predictors $z_{t+1}=f_\theta(z_t,a_t)$, analogous guarantees require controlling products of state-dependent Jacobians and higher-order terms, which can be an exciting future work direction. 
+
+Empirically, we observe that straightening yields a loss landscape with reduced non-convexity under nonlinear dynamics (\Cref{img:loss_landscape}). In the next section, we show that it improves gradient-based planning.
+
+
+\section{Experiments}
+
+
+To test the effectiveness of the proposed method, we evaluate planning on four environments: Wall~\citep{dinowm, sobal2025learning}, PointMaze UMaze and a more complicated medium maze~\citep{fu2020d4rl}, and PushT~\citep{chi2024pusht}. We compare against the baseline DINO-WM~\citep{dinowm}, which builds on frozen DINOv2 spatial features or CLS tokens. Following DINO-WM's setup, we use a frameskip of 5 for all environments. Details on the environments and experiments are in~\Cref{app:datasets,app:experiments}.
+
+
+\subsection{Architecture details}
+\label{subsec:architecture-details}
+
+Here, we describe the encoder and predictor architectures used to instantiate our world model.
+
+
+\paragraph{Visual encoder.}
+We consider two encoder setups for the visual encoder $\mathcal{E}^s_\phi$:
+\begin{itemize}
+    \item A \textbf{frozen pretrained} visual backbone with a lightweight projector: We use DINOv2~\citep{oquab2024dinov2} as the backbone.\footnote{We choose DINOv2 because it has shown the best empirical performance for latent planning on 2D navigation tasks~\citep{terver2026drivessuccessphysicalplanning}, outperforming DINOv3~\citep{dinov3} and V-JEPA2~\citep{assran2025vjepa2selfsupervisedvideo}.} Given an observation, the backbone produces spatial features $e_t \in \mathbb{R}^{M \times D}$. We add a trainable lightweight CNN projector $\mathcal{P}_\phi$ on top of the backbone, leading to
+    \begin{equation}
+    z_t^v = \mathcal{P}_\phi(e_t) \in \mathbb{R}^{m_v \times d_v},
+    \end{equation}
+    where we usually choose $m_v \le M$ and $d_v \le D$. The projector may reduce spatial resolution (pooling/striding), channel dimension, or both, encouraging abstraction and reducing computation.
+    \item A ResNet~\citep{He2015DeepRL} trained \textbf{from scratch}, producing features $z_t^v \in \mathbb{R}^{m_v \times d_v}$ directly.
+ \end{itemize}
+
+\paragraph{Predictor.}
+We use a ViT~\citep{dosovitskiy2021vit} as the dynamics predictor $f_\theta$. When available, proprioceptive states $p_t \in \mathbb{R}^{n_p}$ are encoded via $\mathcal{E}^p_\xi: \mathbb{R}^{n_p} \to \mathbb{R}^{d_{p}}$ and concatenated with each visual spatial feature. To condition on actions, we concatenate the action embeddings $z_t^a=\mathcal{E}^a_\psi(a_t)\in\mathbb{R}^{d_a}$ with the visual and proprioceptive embeddings before passing them to the predictor. We apply a temporal causal attention mask so tokens at time $t$ attend only to frames $\{t-K,\dots,t-1\}$, enabling frame-level autoregressive prediction.
+
+\paragraph{Cosine similarity computation.}
+The straightening loss (Eq.~\eqref{eq:cossim}) is only applied on visual latents $z_t^v$. Different implementations depend on whether latent representations preserve spatial structure:
+\begin{itemize}
+\item \textbf{Global features} ($n_v = 1$): Compute the cosine similarity directly between vectors.
+\item \textbf{Spatial features} ($n_v > 1$): We consider four variants: (i) compute the cosine similarity per-patch and average across patches; (ii) flatten all spatial features and then compute the cosine similarity; (iii) average-pool the spatial features before cosine similarity; (iv) use a learnable aggregation head to aggregate spatial features before cosine similarity. We use (iv) in the main experiments and ablate these choices in~\Cref{app:straightening}.
+\end{itemize}
+
+
+\begin{figure*}[t]
+\center
+\centering
+\includegraphics[width=\linewidth]{images/curvature_bars_scatter_hw14.pdf}
+\caption{Latent Curvature and Open-Loop GD Success Rate for Different Encoders. Higher cosine similarity indicates lower curvature. Here, we compare models with spatial features and report the average patch-wise cosine similarity. Given the same type of encoder, reduced curvature generally leads to higher success rates. 
+}
+\label{img:cos}
+\end{figure*}
+
+\begin{figure*}[t]
+\center
+    \begin{subfigure}[t]{0.46\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/heatmap/umaze_dino_cls.pdf}
+        \caption{DINOv2 CLS embedding}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.46\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/heatmap/resnet/umaze_aggmlpcos1e-1_resnetplus_dim8_hw14/20_agg.pdf}
+        \caption{Straightened (agg head)}
+        \label{img:heatmap_umaze_proj_agg}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.46\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/heatmap/resnet/umaze_aggmlpcos1e-1_resnetplus_dim8_hw14/20_patch.pdf}
+        \caption{Straightened (spatial features)}
+        \label{img:heatmap_umaze_proj_patch}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.46\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/heatmap/umaze_geo8_gt.pdf}
+        \caption{Ground-Truth using A-star}
+    \end{subfigure}
+\caption{Distance heatmaps of PointMaze (blue indicates small values, and red indicates large values). The yellow star represents the target, and we compute the Euclidean distance between its embedding and those of all other states in the maze. \Cref{img:heatmap_umaze_proj_agg,img:heatmap_umaze_proj_patch} use ResNet with output features $z \in \mathbb{R}^{14\times14\times8}$, trained with straightening regularization. After straightening, the latent distance accurately reflects the minimum number of steps required to reach the target. 
+}
+\label{img:heatmap}
+\end{figure*}
+
+\subsection{How good is the embedding space?}
+\label{sec:analysis_emb}
+
+We first inspect the learned embedding space before comparing the downstream planning performance. We measure latent trajectory curvatures and latent Euclidean distances to understand the impact of straightening. For interpretability, we train a VAE~\citep{kingma2013vae,Oord2017NeuralDR} decoder with a reconstruction loss, detaching latents to stop gradients from the encoder and predictor. 
+
+We find that (i) \emph{implicit straightening} can happen in JEPA world models when training the encoder using the prediction loss alone; (ii) adding explicit curvature regularization further strengthens and stabilizes the straightening effect; (iii) straightening encourages the latent Euclidean distance to better align with the geodesic distance; (iv) near-perfect reconstruction can be attained with a very low feature dimensionality.
+
+\begin{figure*}
+    \centering
+    \begin{subfigure}[t]{0.15\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/gd_exp_wall_dino.png}
+        \caption{Wall: DINO}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.15\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/gd_exp_wall_ours.png}
+        \caption{Wall: Ours}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.15\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/gd_exp_umaze_dino.png}
+        \caption{UMaze: DINO}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.15\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/gd_exp_umaze_ours.png}
+        \caption{UMaze: Ours}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.15\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/gd_exp_medium_dino.png}
+        \caption{Medium: DINO}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.15\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/gd_exp_medium_ours.png}
+        \caption{Medium: Ours}
+    \end{subfigure}
+\vspace{-0.05in}
+\caption{Comparison of Open-loop GD Planning. The star denotes the target. For each subfigure, the upper row shows the overlaid rendered images from the simulator by executing the actions, and the bottom shows imaginary rollouts (with a frameskip of 5) decoded using a trained decoder. GD planners can easily get stuck with pretrained DINOv2 features, while straightening significantly increases success. More examples of open-loop planning are in~\Cref{app:traj}.}
+\label{img:example_rollout}
+\vspace{-0.15in}
+\end{figure*}
+
+
+\paragraph{Reduced curvature.} In~\Cref{img:cos}, we compare the curvature of test latent trajectories by computing the cosine similarity of the difference in adjacent frames as in~\Cref{eq:curvature}. We also visualize the latent trajectories using PCA as shown in~\Cref{img:pca_mse,app:pca}. 
+
+The pretrained DINOv2 embedding space is highly curved as shown in the PCA plots and reflected by the low cosine similarities. The embedding space generally becomes straighter after training even without explicit straightening regularization. We attribute this \emph{implicit straightening} to the JEPA objective: it favors representations whose temporal evolution is easy to predict, so training pressure reduces abrupt directional changes in the latent trajectory. With the \emph{explicit straightening} regularization, the curvature of the embedding space is effectively reduced further. We observe that training a ResNet encoder from scratch generally yields lower curvatures than training a projector on top of a frozen pretrained backbone, likely because it offers greater representational flexibility to adapt the geometry to the dynamics.
+
+When straightening is applied to the aggregation head, the curvature of the aggregated features is significantly reduced while the underlying spatial features are not forced to be overly straightened. For example, PushT has more complex object motions and the patch-wise cosine similarity is unable to faithfully capture the global state changes. The introduction of an aggregation head increases the flexibility of representation learning and generally leads to better planning performance (see \Cref{app:straightening}). We thus use this implementation for the main experiments.
+
+\paragraph{Faithful distance.} Although DINOv2 is a strong visual encoder for various downstream vision tasks, it is not optimized for planning and control. As shown in~\Cref{img:pca_mse}, MSE (which is equal to the squared Euclidean distance) between pretrained DINOv2 features does not reflect the progress of moving towards the target. To better understand the limitation of DINOv2, we visualize the Euclidean distance between the embedding of a target state and all other states in the maze in~\Cref{img:heatmap}. We also compare with ground-truth geodesic distance maps, computed using the A-star search algorithm on the grid of the maze. More heatmaps from different environments and encoders are in~\Cref{app:heatmap}. 
+
+Straightening results in a distance heatmap that closely aligns with the geodesic distance. Notably, the model is only trained on suboptimal, non-expert trajectories. Yet, it does not simply memorize the inefficient paths from the training data; instead, it learns to approximate the minimum number of steps required to transition between states. We also find that the spatial features and aggregated global features capture different levels of distance information. The spatial features preserve local geometry and thus yield fine-grained, locally discriminative distance variations, whereas global features provide a smoother, more coherent long-range signal that better reflects long-horizon distance-to-goal trends.
+
+\vspace{-0.1in}
+\paragraph{Sufficient information.} To examine whether or not these projected features preserve sufficient information for planning, we train a decoder to reconstruct images from latents. The decoder is solely for interpretability purposes and is detached from the world model via stop-gradient. Note that perfect reconstruction is not required, since planning only depends on task-relevant information. However, in our visually simple environments, even aggressively compressed features reconstruct the observations with high fidelity, as shown in~\Cref{img:example_rollout}. This indicates that the resulting features retain sufficient planning-relevant information.
+
+\begin{table*}[t]
+  \centering
+  \caption{Goal-reaching Success Rate of 50 Test Samples (\%) using the GD planner. Values are mean $\pm$ std over three data sampling seeds. The best values are \textbf{bold}. The shaded rows are ours while the rest is DINO-WM~\cite{dinowm}.}
+  \label{tab:main_results}
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \resizebox{\linewidth}{!}{%
+  \begin{tabular}{lcc@{\hspace{8pt}}|@{\hspace{8pt}}cc@{\hspace{10pt}}cc@{\hspace{10pt}}cc@{\hspace{10pt}}cc}
+    \toprule
+    \multirow{2}{*}{Encoder} & \multicolumn{2}{c}{Config} &
+    \multicolumn{2}{c}{Wall} &
+    \multicolumn{2}{c}{PointMaze -- UMaze} &
+    \multicolumn{2}{c}{PointMaze -- Medium} &
+    \multicolumn{2}{c}{PushT} \\
+    \cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+     & dim & $\mathcal{L}_{curv}$ 
+     & Open-loop & MPC & Open-loop & MPC & Open-loop & MPC & Open-loop & MPC \\
+    \midrule
+    DINOv2 (CLS) & $1 \times 384$ & \xmark & \pmstat{28.67}{12.68} & \pmstat{66.67}{10.50} & \pmstat{25.33}{0.94} & \pmstat{82.67}{9.98} & \pmstat{20.00}{8.16} & \pmstat{67.50}{3.54} & \pmstat{19.33}{8.22} & \pmstat{28.00}{1.63} \\
+    \rowcolor{Blue!5} DINOv2 (patch) + proj & $1 \times 384$ & \xmark & \pmstat{28.67}{0.94} & \pmstat{76.00}{4.90} & \pmstat{34.67}{1.89} & \pmstat{79.33}{2.49} & \pmstat{18.00}{1.63} & \pmstat{46.00}{3.27} & \pmstat{2.00}{1.63} & \pmstat{11.33}{3.40} \\
+    \rowcolor{Blue!5} DINOv2 (patch) + proj & $1 \times 384$ & \cmark & \pmstat{42.00}{3.27} & \pmstat{56.67}{4.11} & \pmstat{38.67}{3.40} & \pmstat{96.00}{0.00} & \pmstat{22.67}{5.73} & \pmstat{78.00}{2.83} & \pmstat{5.33}{3.40} & \pmstat{14.67}{0.94} \\
+    \rowcolor{Blue!5} ResNet (from scratch) & $1 \times 384$ & \xmark & \pmstat{4.67}{3.40} & \pmstat{10.00}{1.63} & \pmstat{82.00}{8.49} & \pmstat{96.00}{2.83} & \pmstat{66.00}{2.83} & \pmstat{91.33}{0.94} & \pmstat{2.00}{2.83} & \pmstat{29.33}{3.40} \\
+    \rowcolor{Blue!5} ResNet (from scratch) & $1 \times 384$ & \cmark & \pmstat{84.00}{7.12} & \pmstat{\textbf{100.00}}{0.00} & \pmstat{52.00}{6.53} & \pmstat{86.67}{0.94} & \pmstat{54.00}{7.12} & \pmstat{98.00}{0.00} & \pmstat{19.33}{3.40} & \pmstat{48.67}{4.99} \\
+    DINOv2 (patch) & $14 \times 14 \times 384$ & \xmark & \pmstat{52.67}{5.73} & \pmstat{76.67}{6.18} & \pmstat{35.33}{4.11} & \pmstat{80.67}{6.18} & \pmstat{40.83}{10.07} & \pmstat{76.67}{5.14} & \pmstat{56.00}{4.32} & \pmstat{66.00}{4.90} \\
+    \rowcolor{Blue!5} DINOv2 (patch) + proj & $14 \times 14 \times 8$ & \xmark & \pmstat{80.00}{7.12} & \pmstat{90.67}{3.77} & \pmstat{44.00}{7.12} & \pmstat{81.33}{6.80} & \pmstat{72.00}{4.32} & \pmstat{96.67}{0.94} & \pmstat{70.00}{1.63} & \pmstat{78.67}{0.94} \\
+    \rowcolor{Blue!5} DINOv2 (patch) + proj & $14 \times 14 \times 8$ & \cmark & \pmstat{\textbf{90.67}}{0.94} & \pmstat{\textbf{100.00}}{0.00} & \pmstat{\textbf{94.00}}{1.63} & \pmstat{\textbf{100.00}}{0.00} & \pmstat{\textbf{82.67}}{3.77} & \pmstat{98.67}{0.94} & \pmstat{\textbf{77.33}}{6.18} & \pmstat{85.33}{4.99} \\
+    \rowcolor{Blue!5} ResNet (from scratch) & $14 \times 14 \times 8$ & \xmark & \pmstat{1.33}{1.89} & \pmstat{6.67}{1.89} & \pmstat{14.67}{4.99} & \pmstat{66.00}{9.09} & \pmstat{18.67}{4.11} & \pmstat{57.33}{4.71} & \pmstat{71.33}{7.36} & \pmstat{70.67}{10.50} \\
+    \rowcolor{Blue!5} ResNet (from scratch) & $14 \times 14 \times 8$ & \cmark & \pmstat{84.67}{2.49} & \pmstat{\textbf{100.00}}{0.00} & \pmstat{64.67}{8.38} & \pmstat{98.67}{1.89} & \pmstat{80.67}{0.94} & \pmstat{\textbf{99.33}}{0.94} & \pmstat{70.67}{0.94} & \pmstat{\textbf{91.33}}{2.49} \\
+    \bottomrule
+  \end{tabular}%
+  }
+  \vspace{-0.1in}
+\end{table*}
+
+\begin{figure*}[t]
+\center
+    \begin{subfigure}[t]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/wall_dim8_hw14_mpc.pdf}
+        \vspace{-0.25in}
+        \caption{Wall}
+        \label{fig:mpc_wall}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/umaze_dim8_hw14_mpc.pdf}
+        \vspace{-0.25in}
+        \caption{PointMaze-UMaze}
+        \label{fig:mpc_umaze}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/medium_dim8_hw14_mpc.pdf}
+        \vspace{-0.25in}
+        \caption{PointMaze-Medium}
+        \label{fig:mpc_medium}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.24\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/pusht_dim8_hw14_mpc.pdf}
+        \vspace{-0.25in}
+        \caption{PushT}
+        \label{fig:mpc_pusht}
+    \end{subfigure}
+\vspace{-0.05in}
+\caption{Success Rate over MPC Steps. The dashed black lines represent DINO-WM with frozen DINOv2 patch features. The solid lines represent frozen DINOv2 patch features with a trainable channel projector (with resulting features $z \in \mathbb{R}^{14\times14\times 8}$) with different strengths of straightening. Our model reaches 100\% success rates very quickly as shown in~\Cref{fig:mpc_wall,fig:mpc_umaze}.
+}
+\vspace{-0.1in}
+\label{img:mpc}
+\end{figure*}
+
+\subsection{Planning} 
+
+We show that straightening can significantly improve the planning success rates across models and environments.
+
+\paragraph{Setup.} The start states and goals are sampled from test trajectories to guarantee that goals can be reached within 25 steps. We follow DINO-WM~\citep{dinowm} in using a frameskip of five, so we only need to roll out the world model for $H=5$ times. During test time, an action sequence is optimized using gradient descent through the learned dynamics model ($f_\theta$) to minimize a goal cost. For PushT, we assume we have both target images and proprioceptions; for other environments, we only use target images to increase the task difficulty. 
+
+We evaluate performance in both open-loop and closed-loop settings. Open-loop planning optimizes a length-$H$ action sequence using the MSE between the terminal embedding and the target embedding as the planning cost. Closed-loop MPC replans at every step: it optimizes a length-$H$ action sequence, executes only the first action, and then replans, using a weighted objective that encourages the predicted trajectory to approach the target (see~\Cref{appendix:planning}). For PushT specifically, we use only the terminal loss within horizon $H$ because regime-switching dynamics make intermediate-state loss misleading, so we apply the weighted intermediate loss only beyond $H$ where it is more stable.
+
+\paragraph{Results.}  As shown in~\Cref{tab:main_results},  we observe a significant improvement across all models and environments. When training the projectors or encoders, we observe an improvement in performance even without the straightening regularization. We attribute this improvement to the \emph{implicit straightening} during training as discussed in~\Cref{sec:analysis_emb}. For ResNet with spatial features, we observe abnormally low success rates for Wall, PointMaze-UMaze and PointMaze-Medium, which could be explained by the extremely high curvature in~\Cref{img:cos}, suggesting a degradation of features. We also notice that the implicit straightening is the weakest for the UMaze when using the projector, which also results in the lowest improvement in planning. 
+
+Applying explicit straightening further strengthens the straightness in the embedding space, resulting in more than 10\% boost in open-loop and MPC success rates for almost all setups. For example, UMaze's open-loop success rate is improved from 44\% to 94\% with the projector, and 14.67\% to 64.67\% when training a ResNet from scratch. Note that we use weighted loss on intermediate states which enables reaching the target before consuming the full horizon $H=5$. It is impressive that our model reaches 100\% success with MPC on Wall and UMaze within only a few steps (\Cref{img:mpc}), suggesting it discovers more direct trajectories than the randomly generated test trajectories. The PushT success increases more slowly because we apply only the terminal loss within the horizon $H=5$, yet straightening still yields substantial final gains. We also compare with other widely used temporal regularization, namely smoothness and temporal contrastiveness, in~\Cref{app:smooth_tc}, but find temporal straightening significantly more effective. 
+
+\begin{figure*}[t]
+\centering
+\noindent
+\makebox[\linewidth][c]{%
+\begin{minipage}[c]{0.04\linewidth}
+    \makebox[\linewidth][r]{\rotatebox[origin=c]{90}{\footnotesize (a) Success}}
+\end{minipage}%
+\hspace{3pt}%
+\begin{minipage}[c]{0.86\linewidth}
+    \includegraphics[width=\linewidth]{images/pusht_long_good.pdf}
+\end{minipage}%
+}
+
+\vspace{2mm}
+
+\makebox[\linewidth][c]{%
+\begin{minipage}[c]{0.04\linewidth}
+    \makebox[\linewidth][r]{\rotatebox[origin=c]{90}{\footnotesize (b) Failure}}
+\end{minipage}%
+\hspace{3pt}%
+\begin{minipage}[c]{0.86\linewidth}
+    \includegraphics[width=\linewidth]{images/pusht_long_bad.pdf}
+\end{minipage}%
+}
+\caption{Examples of Long-Horizon Open-Loop GD Planning on PushT. For each example, the top row shows simulator-rendered images and the bottom row shows decoded images, with the last column being the target. The failure example shows a case where the long-horizon imagined rollout does not match the real dynamics.}
+\label{img:long}
+\vspace{-0.15in}
+\end{figure*}
+
+
+\paragraph{Comparison of CEM and GD.} We compare the open-loop performance of gradient descent (GD) and the
+cross-entropy method (CEM) in~\Cref{app:ablations_subplanner}. Straightening regularization consistently improves the success rate of both planners. For example, on Wall and PushT, it improves the projector baseline by roughly 10\% for both GD and CEM. Overall, CEM achieves higher success rates but requires substantially longer planning time than GD. With straightening, GD achieves a better success--latency trade-off.
+\vspace{-0.1in}
+\paragraph{Effect of feature dimensions.} We find that preserving spatial structure generally matters more than retaining channels. When we keep all patch tokens, we can aggressively reduce the channel dimension of DINOv2 features from 384 down to 8 without degrading performance. Increasing the channel dimension to $d\in\{32, 128\}$ does not improve performance and can even lead to a drop for some environments (\Cref{app:ablations_dim}), which is not surprising as lower dimensions can simplify both dynamics prediction and downstream optimization. In contrast, collapsing patch features into a single global vector makes precise dynamics prediction harder. The predictor produces less accurate rollouts, which in turn reduces planning success. Notably, training a ResNet from scratch produces significantly better global features than training a global projector on frozen DINO patch features.
+
+\paragraph{Long horizon.} To further stress test our method, we also evaluate a longer-horizon setting where the target is 50 steps away. We leave out UMaze and Wall, because in those environments, a target picked via random 50-step rollouts can end up surprisingly close in terms of shortest-path distance, which does not reflect true long-horizon difficulty. We summarize the results in~\Cref{tab:long_horizon} and show success and failure examples in~\Cref{img:long}. As expected, success rates drop substantially compared to the short-horizon setting, but our method consistently outperforms the baseline across all settings. More broadly, long-horizon rollouts remain a well-known challenge for latent planning where prediction errors compound over steps and lead to substantial trajectory drift. This is visible in failure cases where decoded rollouts become blurry or misaligned with the simulator.
+
+Motivated by~\Cref{img:heatmap}, where the aggregation head produces a smoother long-range distance signal than spatial features alone, we add a global goal cost for long-horizon planning. Specifically, we keep the spatial goal cost and add a goal cost computed in the aggregated feature space: $\mathcal{L}_{\mathrm{plan}}=\mathcal{L}_{\mathrm{spatial}}+0.1\mathcal{L}_{\mathrm{agg}}$. Here, $\mathcal{L}_{\mathrm{spatial}}$ measures squared goal distance over spatial features, while $\mathcal{L}_{\mathrm{agg}}$ measures squared goal distance after applying the aggregation head. As shown in the last two rows of~\Cref{tab:long_horizon}, this combined cost improves over using the spatial cost alone across all models under MPC. These results suggest that long-horizon planning may benefit from objectives that combine fine-grained local costs with global distance geometry.
+
+\vspace{-0.1in}
+\paragraph{Teleported-PointMaze.}
+Pretrained visual embeddings primarily reflect visual similarity, whereas our straightening objective is designed to align the latent space with temporal dynamics. To test whether straightening truly captures dynamics rather than exploiting appearance cues, we introduce \emph{Teleported-PointMaze} with modified transitions: touching the right wall instantly teleports the agent to the left side (see~\Cref{appendix:teleportation}). This creates states that are far in the pixel space but have small temporal distance. We visualize a representative success case in~\Cref{img:teleport_str_comp}, where the straightened model plans to reach the target by leveraging teleportation. 
+
+
+\paragraph{Limitations and future directions.}
+Our current formulation focuses on continuous goal-conditioned latent planning with a symmetric Euclidean goal cost, which may be suboptimal under asymmetric or irreversible dynamics. While our curvature regularizer straightens observed latent transitions and does not itself assume reversibility, such settings may require directional planning costs such as quasimetrics. Furthermore, the gains from using an aggregation head for long-horizon planning suggest that regularization and planning objectives do not necessarily operate in the prediction latent space: the world model can learn dynamics in one space, while the planner optimizes a task- and geometry-aware objective in a projected space. 
+
+
+
+\begin{table}
+  \centering
+  \caption{Longer-Horizon Success Rate (\%) w/ Spatial Features.}
+  \label{tab:long_horizon}
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \resizebox{\linewidth}{!}{%
+  \begin{tabular}{lc|cc|cc}
+    \toprule
+    \multirow{2}{*}{Model} & \multirow{2}{*}{$\mathcal{L}_{curv}$} &
+    \multicolumn{2}{c|}{PushT} &
+    \multicolumn{2}{c}{PointMaze -- Medium} \\
+    \cmidrule(lr){3-4}\cmidrule(lr){5-6}
+     & & Open-loop & MPC & Open-loop & MPC \\
+    \midrule
+    DINO-WM & -- & 3.33 $\pm$ {\tiny 2.36} & 27.33 $\pm$ {\tiny 6.66} & 35.00 $\pm$ {\tiny 2.35} & 65.33 $\pm$ {\tiny 3.13} \\
+    + Proj & \xmark & 6.67 $\pm$ {\tiny 3.77} & 26.67 $\pm$ {\tiny 9.98} & 60.00 $\pm$ {\tiny 3.27} & 72.00 $\pm$ {\tiny 0.00} \\
+    + Proj & \cmark & 13.33 $\pm$ {\tiny 3.77} & 24.00 $\pm$ {\tiny 6.53} & 68.00 $\pm$ {\tiny 8.64} & 88.00 $\pm$ {\tiny 3.27} \\
+    ResNet & \xmark & 13.33 $\pm$ {\tiny 3.77} & 29.33 $\pm$ {\tiny 9.43} & 14.67 $\pm$ {\tiny 6.80} & 48.00 $\pm$ {\tiny 9.80} \\
+    ResNet & \cmark & 10.67 $\pm$ {\tiny 4.99} & 33.33 $\pm$ {\tiny 4.99} & 76.00 $\pm$ {\tiny 6.53} & 98.67 $\pm$ {\tiny 1.89} \\
+    \midrule
+    \multicolumn{6}{l}{\emph{Combined planning cost:} $\mathcal{L}_{\mathrm{plan}}=\mathcal{L}_{\mathrm{spatial}}+0.1\mathcal{L}_{\mathrm{agg}}$} \\
+    \midrule
+     + Proj \, & \cmark & 20.00 $\pm$ {\tiny 0.00} & 33.33 $\pm$ {\tiny 4.16} & 66.67 $\pm$ {\tiny 7.57} & 92.00 $\pm$ {\tiny 5.29} \\
+    ResNet   & \cmark & 13.33 $\pm$ {\tiny 4.62} & 36.00 $\pm$ {\tiny 5.29} & 68.67 $\pm$ {\tiny 4.16} & 98.67 $\pm$ {\tiny 1.15} \\
+
+    \bottomrule
+  \end{tabular}%
+  }
+  \vspace{-0.1in}
+\end{table}
+
+\section{Conclusion}
+In this work, we show that temporal straightening yields an embedding space that effectively facilitates latent planning. In this straightened representation space, the Euclidean distance provides a more reliable proxy for the geodesic distance and gradient-based planning is better conditioned. Across a range of 2D goal-reaching tasks, this leads to significant and consistent gains over baselines. More broadly, our findings highlight that representation geometry plays an important role in latent planning and show that straightening latent trajectories is a simple yet effective way to improve it. We believe this opens a promising path toward more efficient latent planning in more challenging environments.

@@ -1,0 +1,20 @@
+# Test-only dependencies for the CCR property/unit test suite (tests/).
+#
+# These are NOT part of the training or planning images. Do not add anything from
+# this file to requirements-train.txt or requirements-plan.txt: the whole point of
+# the default-off contract is that the training/planning environments stay
+# byte-for-byte the environments that produced the reference runs.
+#
+# Install on the pod only when running tests:
+#   pip install -r requirements-dev.txt
+#
+# The suite runs on CPU in float32 against the tiny stub encoder in
+# tests/conftest.py -- no GPU, no dataset, no network. torch and numpy are
+# deliberately absent here: torch 2.7.0+cu128 comes from the Blackwell wheel
+# index (setup_b200.sh) and numpy from the NGC container, and re-pinning either
+# from a dev requirements file is how those constraints get broken.
+#
+# Exact pins, both compatible with the pod's Python 3.10 interpreter.
+
+pytest==8.3.3
+hypothesis==6.112.1
