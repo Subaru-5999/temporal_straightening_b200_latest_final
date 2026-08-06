@@ -109,11 +109,19 @@ PROJECTORS = ("channel", "none")
 DISTINCT_WEIGHTS = (0.0, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 10.0)
 ACTION_SOURCES = ("synthetic", "logged")
 
+#: ``DISTINCT_WEIGHTS`` without 0.0, i.e. the regime where CCR is actually switched on
+#: (``VWorldModel`` sets ``self.ccr = self.lambda_cf > 0``). Defined locally from
+#: ``DISTINCT_WEIGHTS`` rather than imported from tests/conftest.py so this module keeps
+#: owning its own strategies. Used only for ``lambda_cf``; see
+#: ``test_action_source_alone_separates_two_arms`` for why.
+POSITIVE_DISTINCT_WEIGHTS = tuple(w for w in DISTINCT_WEIGHTS if w != 0.0)
+
 weight_strategy = st.one_of(
     st.sampled_from(DISTINCT_WEIGHTS),
     st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
 )
 distinct_weight_strategy = st.sampled_from(DISTINCT_WEIGHTS)
+positive_distinct_weight_strategy = st.sampled_from(POSITIVE_DISTINCT_WEIGHTS)
 action_source_strategy = st.sampled_from(ACTION_SOURCES)
 
 ccr_tuple_strategy = st.tuples(
@@ -259,7 +267,7 @@ def test_tags_are_injective_in_the_formatted_tuple(left, right):
 
 
 @given(
-    lambda_cf=distinct_weight_strategy,
+    lambda_cf=positive_distinct_weight_strategy,
     rho=distinct_weight_strategy,
     mca=distinct_weight_strategy,
 )
@@ -269,13 +277,53 @@ def test_action_source_alone_separates_two_arms(lambda_cf, rho, mca):
     The `logged` and `synthetic` arms differ in nothing else, so the action source has to
     be in the tag rather than only in the loss-signature guard.
 
+    WHY ``lambda_cf > 0`` (and only ``lambda_cf``): the tag is required to be *empty* at
+    the default tuple ``(0.0, 0.0, "synthetic", 0.0) == CCR_TAG_DEFAULTS``, because that is
+    the byte-identical-legacy-run-directory contract of Requirement 6.5 / 3.4 --- the same
+    contract ``test_legacy_pusht_run_dir_is_byte_identical_through_hydra_compose`` checks
+    through Hydra. So ``"srcsynthetic" in ""`` cannot hold there, and demanding it would be
+    demanding a regression, not catching one. Excluding that point is also not an exception
+    carved out to make a test pass: at ``lambda_cf == 0`` the CCR path is switched off
+    entirely (``VWorldModel`` sets ``self.ccr = self.lambda_cf > 0``), so there are no two
+    arms to separate in the first place. The excluded point is still covered explicitly, and
+    still shown to be collision-free, by
+    ``test_default_tuple_yields_empty_synthetic_tag_but_still_separates`` below.
+
+    ``rho`` and ``mca`` stay free to take 0.0: ``(0.1, 0.0, "synthetic", 0.0)`` is the real
+    rho=0 perturbation control arm and it must still be separated from its ``logged``
+    counterpart.
+
     Validates: Requirements 6.4, 6.5
     """
+    assert lambda_cf > 0.0  # the regime where CCR runs; see the docstring.
     synthetic = ccr_tag(lambda_cf, rho, "synthetic", mca)
     logged = ccr_tag(lambda_cf, rho, "logged", mca)
     assert synthetic != logged
     assert "srcsynthetic" in synthetic
     assert "srclogged" in logged
+
+
+def test_default_tuple_yields_empty_synthetic_tag_but_still_separates():
+    """The default tuple, the one point excluded from the property above (Requirement 6.5).
+
+    At ``CCR_TAG_DEFAULTS`` the synthetic tag is empty --- that *is* the byte-identical
+    legacy run directory --- while the ``logged`` counterpart is non-empty. The two still
+    differ, so the run-directory collision the property above guards against does not exist
+    at the default tuple either; the arm-separation guarantee holds there for a different
+    reason (empty vs non-empty) than in the ``lambda_cf > 0`` regime.
+
+    Validates: Requirements 6.4, 6.5
+    """
+    lambda_cf, rho, source, mca = CCR_TAG_DEFAULTS
+    assert (lambda_cf, source) == (0.0, "synthetic")
+
+    synthetic = ccr_tag(lambda_cf, rho, "synthetic", mca)
+    logged = ccr_tag(lambda_cf, rho, "logged", mca)
+
+    assert synthetic == ""
+    assert logged != ""
+    assert "srclogged" in logged
+    assert synthetic != logged
 
 
 @given(tuples=st.lists(distinct_ccr_tuple_strategy, min_size=2, max_size=12))

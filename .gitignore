@@ -1,5 +1,15 @@
 __pycache__
 *.pyc
+# test-runtime artifacts, created by `pytest tests/` (hypothesis example database and
+# pytest's own cache). Same class of generated file as __pycache__ above: never source.
+.hypothesis/
+.pytest_cache/
+# driver pid file written by run_ccr_pilot.sh (`ccr_<mode>_<timestamp>.pid`); its companion
+# `ccr_<mode>_<timestamp>.log` is already covered by the `*.log` rule below. The EXIT trap
+# removes it, but a killed driver leaves it behind.
+ccr_*.pid
+# NOTE: probe_ccr_curvature.py writes its reports to `probe_outputs/`, which the `*outputs*`
+# rule below already ignores; no separate rule needed.
 figures
 *outputs*
 data
