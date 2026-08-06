@@ -57,6 +57,10 @@ ALLOWED_FILES = frozenset(
         # adding a `!run_ccr_pilot.sh` line. That single line is enabling infrastructure for a file the
         # design mandates, and it touches no training, planning or dataset behaviour.
         ".gitignore",
+        # Mandated project artifact: `SHORT_BUDGET_PILOTS.md` section 10 requires results to be recorded
+        # together with their caveats in a `PROGRESS_*.md`, so this file is required rather than an ad-hoc
+        # addition. It is prose only and contains no training, planning or dataset code.
+        "PROGRESS_CCR.md",
     }
 )
 
