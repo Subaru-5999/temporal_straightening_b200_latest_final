@@ -386,7 +386,7 @@ The startup log lines (Requirement 3.6) are emitted from `__init__`, after `acce
 the submodules, so the device they report is the device the terms will actually compute on:
 
 ```
-CCR enabled: term=ccr, weight(lambda_cf)=0.1, rho=0.05, rollout_len=5, action_source=synthetic,
+CCR enabled: term=ccr, weight(lambda_cf)=0.04, rho=0.5, rollout_len=5, action_source=synthetic,
              synthesized_action_frames=3, curvature_mode=aggcos, device=cuda:0
 MCA enabled: term=mca, weight(mca_weight)=0.01, rho=n/a, device=cuda:0
 CCR disabled (lambda_cf=0.0); MCA disabled (mca_weight=0.0)
@@ -433,10 +433,11 @@ expression, the resolved path at defaults is character-for-character the legacy 
 | configuration | resolved run directory (under `./checkpoints/test/`) |
 |---|---|
 | defaults (`0.0, 0.0, synthetic, 0.0`) | `pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05` |
-| `lambda_cf=0.1 ccr_rho=0.05` (treatment, `L=5`) | `..._sgTrue_lr1e-05_cf0p1_rho0p05_srcsynthetic_mca0` |
-| `lambda_cf=0.1 ccr_rho=0.05 ccr_action_source=logged ccr_rollout_len=2` | `..._sgTrue_lr1e-05_cf0p1_rho0p05_srclogged_mca0` |
-| `lambda_cf=0.1 ccr_rho=0` (control) | `..._sgTrue_lr1e-05_cf0p1_rho0_srcsynthetic_mca0` |
-| `lambda_cf=0.1 mca_weight=0.01` | `..._sgTrue_lr1e-05_cf0p1_rho0p05_srcsynthetic_mca0p01` |
+| `lambda_cf=0.04 ccr_rho=0.5` (treatment, `L=5`) | `..._sgTrue_lr1e-05_cf0p04_rho0p5_srcsynthetic_mca0` |
+| `lambda_cf=0.04 ccr_rho=0.5 ccr_action_source=logged ccr_rollout_len=2` | `..._sgTrue_lr1e-05_cf0p04_rho0p5_srclogged_mca0` |
+| `lambda_cf=0.04 ccr_rho=0` (control) | `..._sgTrue_lr1e-05_cf0p04_rho0_srcsynthetic_mca0` |
+| `lambda_cf=0.08 ccr_rho=0.5` (weight variation) | `..._sgTrue_lr1e-05_cf0p08_rho0p5_srcsynthetic_mca0` |
+| `lambda_cf=0.04 mca_weight=0.01` | `..._sgTrue_lr1e-05_cf0p04_rho0p5_srcsynthetic_mca0p01` |
 
 All four values appear as soon as any one of them is non-default, so the control arm (`rho = 0`), the
 `logged` arm and the `synthetic` treatment arm can never resolve to the same directory and silently
@@ -572,9 +573,38 @@ actions do? If the gap is ~0 there is nothing for CCR to fix.
 python probe_ccr_curvature.py \
   --ckpt   checkpoints/test/pusht_aggmlpcos1e-1_.../checkpoints/model_2.pth \
   --train-cfg checkpoints/test/pusht_aggmlpcos1e-1_.../hydra.yaml \
-  --rho 0.05 --rollout-len 5 --action-source synthetic --num-windows 64 --draws 4 \
+  --rho 0.5 --rollout-len 5 --action-source synthetic --num-windows 64 --draws 4 \
   --reference pristine --max-minutes 30 --out probe_outputs/ccr_pusht.json
 ```
+
+**`rho` is swept, not guessed (recorded after the first probe run).** The originally specified `rho = 0.05`
+failed the probe gate outright: aggregate `curvature_gap` `-0.001259` against an unperturbed magnitude of
+`0.155470`, i.e. `-0.8%`, with 0 of 5 dimensions passing. That was a calibration error in the design, not
+evidence against the mechanism. `normalize_action: True` makes actions unit-variance per dimension, and
+`GDPlanner` takes 100 Adam steps at `lr = 0.1` from a zero initialisation, so its iterates reach `O(0.5-1.0)`
+in normalized action units. `rho = 0.05` is 10-20x smaller than the region the planner actually explores, so
+it probed a neighbourhood where the imagined trajectory is locally linear by construction. A widened
+criterion was declared before re-running, and the probe costs ~78 s per arm, so the sweep is free:
+
+| `rho` | dimensions passing | gap / unperturbed magnitude range |
+|---|---|---|
+| 0.05 | 0 of 5 | -0.018 to 0.009 |
+| 0.25 | 1 of 5 | — |
+| **0.50** | **5 of 5** | 0.276 - 0.733 |
+| 1.00 | 5 of 5 | 0.944 - 1.474 |
+| 2.00 | 5 of 5 | 1.961 - 2.704 |
+
+**`rho = 0.5` is selected**: the smallest value clearing all five dimensions, hence the least extrapolation
+away from the recorded action distribution while still sitting inside the planner's own operating range. The
+premise is therefore **confirmed** — off-log trajectories are measurably more curved than on-log ones once
+the perturbation is scaled to the planner.
+
+**Independent finding from the same probe: `state_readout_r2`.** Ridge readout R² per dimension is
+`block_x 0.800`, `block_y 0.735`, `agent_x 0.728`, `agent_y 0.502`, **`block_angle 0.183`**. PushT success is
+an orientation-sensitive criterion, and block orientation is simultaneously the worst-encoded dimension and
+the one with the weakest `curvature_gap` ratio at every `rho`. Whatever CCR does to the latent geometry, it
+does not obviously fix the dimension the task is scored on. Recorded here because it is the strongest single
+piece of evidence *against* the direction, and it came free.
 
 Flow:
 
@@ -955,20 +985,32 @@ prediction >= 11.75% (half of 23.493) -> X <= 0.05614
 
 The 30% cap binds; the prediction floor is slack by more than 2x. Viable window: **`X in [0.0011, 0.0241]`**.
 
-**The `lambda_cf` rule.** Let `g` be the probe's perturbed/unperturbed curvature ratio, so the pilot's raw
-CCR term is `g * 0.41421` and `X = lambda_cf * g * 0.41421`:
+**The `lambda_cf` rule.** The pilot's raw CCR term is `c`, the probe's **perturbed imagined** curvature —
+*not* `g * 0.41421`, where `g` is the perturbed/unperturbed ratio and `0.41421` the on-log curvature. That
+earlier form was wrong on both factors: CCR is evaluated on the imagined off-log rollout, whose unperturbed
+curvature (`0.1555` aggregate) is already well below the on-log value, and the term's magnitude is the
+perturbed *level*, not the ratio. With `X = lambda_cf * c`:
 
 ```
-lambda_cf = 0.024 / g   ->  ~15% CCR share (target)
-lambda_cf = 0.058 / g   ->  30% CCR share (hard ceiling)
+lambda_cf = 0.00994 / c   ->  ~15% CCR share (target)
+lambda_cf = 0.02407 / c   ->  30% CCR share (hard ceiling)
 ```
 
-| `g` | `lambda_cf` at the ~15% target | `lambda_cf` at the 30% ceiling |
+The probe measured `c` directly at the selected `rho = 0.5`: unperturbed `0.155470` plus a gap of `0.073174`,
+so **`c = 0.228644`** — `0.55x` the value the `g * 0.41421` form assumed.
+
+| `c` | `lambda_cf` at the ~15% target | `lambda_cf` at the 30% ceiling |
 |---|---|---|
-| 1.0 | 0.024 | 0.058 |
-| 1.5 | 0.016 | 0.039 |
-| 2.0 | 0.012 | 0.029 |
-| 3.0 | 0.008 | 0.019 |
+| 0.10 | 0.099 | 0.241 |
+| 0.15 | 0.066 | 0.160 |
+| **0.2286** (measured, `rho = 0.5`) | **0.043** | **0.105** |
+| 0.40 | 0.025 | 0.060 |
+
+Resolved shares at the measured `c`: `lambda_cf = 0.02` → 7.5% (below the 2% floor? no — above it, but too
+weak to be an informative arm), `0.04` → **14.0%** (the target), `0.08` → 24.6%, `0.10` → 28.9% (inside the
+ceiling, though with no headroom for the upward share drift of §"Watch the drift"). The earlier claim that
+`lambda_cf = 0.1` was "4-15x too strong" was therefore **wrong**: at the measured `c` it lands at 29% and is
+admissible, just at the ceiling.
 
 **Escalation ladder** (Requirement 11.3), each rung gated on the previous one's written threshold:
 
@@ -1017,7 +1059,7 @@ approval (Requirement 11.6).
 ```bash
 python train.py --config-name train.yaml env=pusht encoder=dino_channel \
   training.straighten=aggcos1e-1 training.encoder_lr=1e-5 training.stop_grad=True \
-  training.lambda_cf=0.02 training.ccr_rho=0.05 \
+  training.lambda_cf=0.04 training.ccr_rho=0.5 \
   training.ccr_action_source=synthetic training.ccr_rollout_len=5 \
   training.mca_weight=0 training.max_iterations=8000 training.epochs=3
 ```
@@ -1026,25 +1068,27 @@ python train.py --config-name train.yaml env=pusht encoder=dino_channel \
 defaults, so the command recorded in the progress log identifies its arm without a reader having to know the
 defaults of the day.
 
-**The `lambda_cf` sweep, corrected against the measured reference.** The value recorded earlier in this
-design, `lambda_cf = 0.1` with a `{0.1, 0.3}` sweep, is wrong and is replaced by **`lambda_cf in
-{0.02, 0.05}`** for the `g ≈ 1-1.5` range, with the final pair taken from the `lambda_cf` rule above once the
-probe reports `g`. The recorded values are 4-15x too strong: against the measured step-8,000 total of
-0.056171 with raw CCR `g * 0.41421`, at `g ≈ 1` a weight of 0.1 puts CCR at ≈42% of the objective and 0.3 at
-≈69%, both already past the 30% ceiling, and at the `g ≈ 2-3` the probe may plausibly report the pair lands
-at 82-87%. At `lambda_cf = 0.3, g = 1` the prediction share falls to ≈7.3%, below the 11.75% floor of gate
-check 3 — CCR would be starving the very prediction loss that planning depends on, which is the failure the
-measured window exists to prevent. `0.02` sits at the ~15% target for `g ≈ 1`, and `0.05` probes toward the
-ceiling without crossing it for `g ≈ 1`.
+**The `lambda_cf` sweep, resolved against the measured `c`.** This design has now carried three values, and
+only the last is measured:
+
+| recorded | pair | basis | verdict |
+|---|---|---|---|
+| original | `{0.1, 0.3}` | none | 0.3 drives the prediction share to ≈7.3%, below the 11.75% floor — out |
+| first correction | `{0.02, 0.05}` | assumed `raw_ccr = g * 0.41421` | wrong denominator; `0.02` lands at 7.5%, too weak to be informative |
+| **measured** | **`{0.04, 0.08}`** | probe's `c = 0.228644` at `rho = 0.5` | `0.04` → 14.0% (target), `0.08` → 24.6% (below the 30% ceiling with headroom for share drift) |
+
+`0.04` is the treatment weight; `0.08` is the variation arm, chosen to roughly double the share while leaving
+room for the upward drift the baseline exhibited (curvature share 73.7% @8k → 82.7% @123.8k at fixed scale).
+`0.1` would also be admissible at 28.9% but has no drift headroom, so it is not the pair.
 
 Arms, each resolving to its own run directory via `ccr_tag`:
 
 | arm | override delta from the block above | isolates |
 |---|---|---|
-| treatment | — (`synthetic`, `L=5`, `rho=0.05`) | the full-horizon off-log penalty |
+| treatment | — (`synthetic`, `L=5`, `rho=0.5`, `lambda_cf=0.04`) | the full-horizon off-log penalty |
 | horizon control | `ccr_action_source=logged ccr_rollout_len=2` | whether the gain needs the horizon past the window edge, or only the first two off-log steps; it is also the control for the extrapolation risk `synthetic` takes on |
 | perturbation control | `ccr_rho=0` | "rollout space vs encoder space" separated from "off-log vs on-log" |
-| weight variation | `lambda_cf in {0.02, 0.05}` (from the rule above once `g` is known) | sensitivity of the result to the term's share of the objective |
+| weight variation | `lambda_cf=0.08` (14.0% → 24.6% share) | sensitivity of the result to the term's share of the objective |
 
 **No matched-budget control arm.** A fifth arm — CCR off, capped at the same 8,000 steps — is not needed. The
 baseline's own telemetry over its first 8,000 steps is already on disk and is exactly that control, at zero

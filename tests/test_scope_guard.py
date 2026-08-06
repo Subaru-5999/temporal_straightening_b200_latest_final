@@ -61,6 +61,9 @@ ALLOWED_FILES = frozenset(
         # together with their caveats in a `PROGRESS_*.md`, so this file is required rather than an ad-hoc
         # addition. It is prose only and contains no training, planning or dataset code.
         "PROGRESS_CCR.md",
+        # Contingency plan documenting the alternative routes to take if Plan A fails its acceptance gate.
+        # Same rationale as `PROGRESS_CCR.md` above: prose only, no training, planning or dataset code.
+        "PLAN_B_ALTERNATIVES.md",
     }
 )
 

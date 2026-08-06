@@ -355,18 +355,28 @@ Task labels:
     No run of any kind launches before this checkpoint.
 
 - [ ] 13. Offline probe execution and probe gate (rung 1 of the ladder)
-  - [ ] 13.1 [CPU RUN] Run `probe_ccr_curvature.py` on the target PushT checkpoint
-    - `--rho 0.05 --rollout-len 5 --action-source synthetic --num-windows 64 --draws 4
+  - [x] 13.1 [CPU RUN] Run `probe_ccr_curvature.py` on the target PushT checkpoint
+    - `--rho 0.5 --rollout-len 5 --action-source synthetic --num-windows 64 --draws 4
       --reference pristine --max-minutes 30 --out probe_outputs/ccr_pusht.json`
-    - The `curvature_gap` readout is what fixes `g`, the perturbed/unperturbed curvature ratio, and therefore
-      `lambda_cf` for tasks 15.1 and 15.5 via the design's rule `lambda_cf = 0.024 / g`. That is the
-      dependency linking the probe to the pilot configuration: the pilot λ is not final until this reports
+    - The probe fixes **two** numbers, not one: the selected `rho`, and `c` — the raw *perturbed imagined*
+      curvature — which sets `lambda_cf` for tasks 15.1 and 15.5 via the corrected rule
+      `lambda_cf = 0.00994 / c`. The earlier `0.024 / g` form used the wrong quantity (on-log curvature times
+      a ratio) and is superseded. The pilot λ is not final until this reports
+    - **Run and complete.** `rho = 0.05` as originally specified FAILED (aggregate gap `-0.001259`, 0 of 5
+      dimensions) because it is 10-20x below the action scale `GDPlanner` explores. A widened criterion was
+      declared before re-running, and a sweep at ~78 s per arm gave 0.25 → 1 of 5, **0.50 → 5 of 5**,
+      1.0 → 5 of 5, 2.0 → 5 of 5. `rho = 0.5` selected; `c = 0.155470 + 0.073174 = 0.228644`
     - ~30 minutes, CPU, read-only. Not agent-executable: needs the real checkpoint and dataset
     - _Requirements: 7.1, 7.6, 11.3_
 
-  - [ ] 13.2 [HUMAN] Record the probe gate verdict
+  - [x] 13.2 [HUMAN] Record the probe gate verdict
     - Written gate: aggregate `curvature_gap` positive **and** at least 20% of the unperturbed curvature
       magnitude on at least 3 of the 5 disaggregated dimensions. If it fails, **no Pilot_Run is launched**
+    - **Verdict: PASS at `rho = 0.5`** (5 of 5 dimensions, ratios 0.276-0.733). Caveats recorded in
+      `PROGRESS_CCR.md` §5: (a) the pass required re-calibrating `rho`, so it is a pass on the widened
+      criterion declared before the sweep, not on the originally recorded value; (b) `state_readout_r2` for
+      `block_angle` is 0.183, the worst of the five, and `block_angle` also has the weakest gap ratio at every
+      `rho` — the dimension PushT is scored on is the one CCR has least purchase over
     - Human judgement call; record the verdict and its caveats in the project progress log
     - _Requirements: 8.1, 8.2, 11.3, 7.2, 7.3_
 
@@ -393,14 +403,14 @@ Task labels:
     needed: the baseline's own first-8,000-step telemetry is already on disk and is exactly that control at
     zero cost, per `SHORT_BUDGET_PILOTS.md` §4. Every gate comparison below is against the recorded
     step-8,000 row rather than against a run we pay for
-  - [ ] 15.1 [GPU RUN] Treatment arm: `synthetic`, `L = 5`, `rho = 0.05`
+  - [ ] 15.1 [GPU RUN] Treatment arm: `synthetic`, `L = 5`, `rho = 0.5`
     - `run_ccr_pilot.sh` wrapping `python train.py --config-name train.yaml env=pusht encoder=dino_channel
       training.straighten=aggcos1e-1 training.encoder_lr=1e-5 training.stop_grad=True
-      training.lambda_cf=0.02 training.ccr_rho=0.05 training.ccr_action_source=synthetic
+      training.lambda_cf=0.04 training.ccr_rho=0.5 training.ccr_action_source=synthetic
       training.ccr_rollout_len=5 training.mca_weight=0 training.max_iterations=8000 training.epochs=3`
-    - λ comes from the design's rule `lambda_cf = 0.024 / g`, where `g` is the probe's perturbed/unperturbed
-      curvature ratio, so the final value is fixed once task 13.1 reports `g`. `0.02` is the value for
-      `g ≈ 1`
+    - λ comes from the design's corrected rule `lambda_cf = 0.00994 / c`, where `c` is the probe's raw
+      perturbed imagined curvature. Task 13.1 reported `c = 0.228644` at `rho = 0.5`, giving `0.043`; **`0.04`
+      is the value to launch** (14.0% CCR share against the recorded step-8,000 total)
     - Two-minute smoke check: the `CCR enabled:` line names the right weight, `rho`, `action_source`,
       `synthesized_action_frames=3` and device, and a checkpoint exists on disk. A `synthetic` arm reporting
       `synthesized_action_frames=0` is silently a `logged` arm and the launch is wrong
@@ -430,13 +440,16 @@ Task labels:
       arm by construction. ~75-85 min, serial after 15.3
     - _Requirements: 2.1, 2.2, 2.3, 9.7_
 
-  - [ ] 15.5 [GPU RUN] Weight variation arm: `lambda_cf in {0.02, 0.05}` for `g ≈ 1-1.5`
-    - Sensitivity of the result to the term's share of the objective. The final pair comes from the design's
-      `lambda_cf = 0.024 / g` rule once task 13.1 reports `g`
-    - The previously recorded `{0.1, 0.3}` was 4-15x too strong: against the measured step-8,000 total of
-      0.056171 with raw CCR `g * 0.41421`, at `g ≈ 1` a weight of 0.1 puts CCR at ≈42% of the objective and
-      0.3 at ≈69%, both past the 30% share cap, and at `lambda_cf=0.3` the prediction share falls to ≈7.3%,
-      below the 11.75% gate floor
+  - [ ] 15.5 [GPU RUN] Weight variation arm: `lambda_cf=0.08` at `rho = 0.5`
+    - Sensitivity of the result to the term's share of the objective: `0.04` → 14.0%, `0.08` → 24.6%, both
+      inside the `[2%, 30%]` window, with `0.08` still leaving headroom for the upward share drift the
+      baseline exhibited (73.7% @8k → 82.7% @123.8k at fixed scale)
+    - Two earlier pairs are superseded. `{0.1, 0.3}` is out because `0.3` drives the prediction share to
+      ≈7.3%, below the 11.75% gate floor. `{0.02, 0.05}` is out because it was derived from
+      `raw_ccr = g * 0.41421`, the wrong quantity: CCR is evaluated on the imagined off-log rollout, whose
+      perturbed curvature the probe measures directly as `c = 0.228644` (`0.55x` the assumed value). At the
+      measured `c`, `0.02` lands at only 7.5% — too weak to be an informative arm. Note that `lambda_cf = 0.1`
+      lands at 28.9% and **is** admissible; the earlier "4-15x too strong" claim was wrong
     - ~75-85 min, serial after 15.4. **This is the arm to drop if the 14.1 compute overrun is refused**
     - _Requirements: 8.2, 8.3, 9.7, 11.5_
 

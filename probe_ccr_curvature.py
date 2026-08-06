@@ -340,12 +340,45 @@ def _instantiate_world_model(train_cfg, parts):
     return _freeze_for_probe(model)
 
 
+def _plain_tensor_attrs_to_cpu(model):
+    """
+    Move plain (non-parameter, non-buffer) tensor attributes onto the CPU.
+
+    `models/vit.py` builds its causal attention mask as
+    `self.bias = generate_mask_matrix(...).to('cuda')` -- a bare attribute, not a
+    registered buffer, so `nn.Module.to()` and `.cpu()` both leave it behind. A model
+    rebuilt from a checkpoint never trips over this, because the predictor is pickled
+    whole and `map_location="cpu"` rewrites the attribute on the way in. A *freshly
+    instantiated* predictor (the `pristine` reference) does: its mask lands on cuda:0
+    while every parameter is on the CPU, and the first `masked_fill` raises
+    "expected self and mask to be on the same device".
+
+    Fixed here rather than in `models/vit.py` because that file is outside the
+    Requirement 5.6 changed-file allowlist and its `cuda` default is what every
+    training and planning run relies on. Read-only with respect to numerics: only the
+    device changes, and this probe is CPU-only by construction (Requirement 7.1).
+    """
+    import torch
+
+    moved = []
+    for name, module in model.named_modules():
+        for attr, value in list(module.__dict__.items()):
+            if isinstance(value, torch.Tensor) and value.device.type != "cpu":
+                setattr(module, attr, value.to("cpu"))
+                moved.append(f"{name or '<root>'}.{attr}")
+    if moved:
+        log.info("Moved %d non-buffer tensor attribute(s) to CPU (e.g. %s).",
+                 len(moved), ", ".join(moved[:3]))
+    return model
+
+
 def _freeze_for_probe(model):
     """
     eval() + requires_grad(False). Belt and braces: every measurement already runs
     under `torch.no_grad()`, so this only makes "no populated gradient" true by
     construction rather than by discipline (Property 14).
     """
+    _plain_tensor_attrs_to_cpu(model)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
