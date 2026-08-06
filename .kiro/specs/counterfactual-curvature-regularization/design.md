@@ -973,8 +973,14 @@ Arms, each resolving to its own run directory via `ccr_tag`:
 
 1. Within two minutes: the `CCR enabled:` line names the right weight, `rho`, `action_source`,
    `synthesized_action_frames` and device, and a checkpoint exists on disk. An empty checkpoint directory a
-   minute in means the run crashed. A `synthetic` arm reporting `synthesized_action_frames=0` is silently a
-   `logged` arm and the launch is wrong.
+   minute in means the run crashed. The primary confirmation that CCR is actually running is the `ccr` term
+   appearing in the telemetry record's `enabled_terms` (equivalently `enabled: true` in the record's `ccr`
+   block), because that is derived from the model's own gate firing rather than from config. `rho`,
+   `rollout_len`, `action_source` and `synthesized_action_frames` are read only **after** CCR is confirmed
+   enabled; then, as a secondary check, a `synthetic` arm reporting `synthesized_action_frames=0` is silently
+   a `logged` arm and the launch is wrong.
+   *Corrected after the pod smoke test: on a CCR-disabled baseline (`lambda_cf=0`) the old field still read
+   `synthesized_action_frames=3`, so it never confirmed CCR was running.*
 2. `it_per_s >= 1.93` (no more than a 50% step-time regression against the ~2.9 it/s reference), and the
    step-200 telemetry row matches the reference run's step-200 row for the shared terms (Requirement 8.4).
    This check is applied to the `synthetic` `L = 5` arm first, since it has the least headroom; a failure

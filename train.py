@@ -84,6 +84,11 @@ TELEMETRY_TERMS = (
     ("decoder_loss_reconstructed", "decoder"),
 )
 
+# The `loss_components` key that decides whether the CCR term contributed to this
+# iteration's objective. Single source of truth for both the `ccr` entry in `terms`
+# and the `enabled` flag of the `ccr` block, so the two can never disagree.
+TELEMETRY_CCR_KEY = "ccr_loss_scaled"
+
 
 def _cfg_value(cfg_node, key, default):
     """
@@ -603,8 +608,35 @@ class Trainer:
         """
         Self-describing CCR block: reading a pilot's telemetry six weeks later must
         not require reconstructing which arm it was from the directory name.
+
+        `enabled` comes first and is derived exactly like the `terms` block: from the
+        presence of the CCR key in `loss_components`, i.e. the model's own gate
+        actually fired this iteration. It is NOT re-read from config, because config
+        says what was asked for and `loss_components` says what ran. When the term
+        did not run, the arm fields (`rho`, `rollout_len`, `action_source`,
+        `synthesized_action_frames`) describe nothing, so they are omitted; only
+        `lambda_cf` is kept, because it says *why* the arm is off.
         """
         training_cfg = self.cfg.training
+        lambda_cf = _cfg_float(training_cfg, "lambda_cf", 0.0)
+        # Ground truth: the same key `terms`/`enabled_terms` are built from.
+        enabled = TELEMETRY_CCR_KEY in components
+        if enabled != (lambda_cf > 0.0):
+            # Config and the model's gate disagree. Report what ran; flag the rest.
+            log.warning(
+                "CCR telemetry: training.lambda_cf=%s but %s is %s in loss_components; "
+                "reporting enabled=%s (what actually ran, not what config asked for).",
+                lambda_cf,
+                TELEMETRY_CCR_KEY,
+                "present" if enabled else "absent",
+                enabled,
+            )
+        if not enabled:
+            block = OrderedDict()
+            block["enabled"] = False
+            block["lambda_cf"] = lambda_cf
+            return block
+
         rollout_len = _cfg_int(training_cfg, "ccr_rollout_len", 5)
         action_source = str(_cfg_value(training_cfg, "ccr_action_source", "synthetic"))
         num_hist = int(self.cfg.num_hist)
@@ -619,10 +651,11 @@ class Trainer:
             else 0
         )
         block = OrderedDict()
+        block["enabled"] = True
         raw = _as_plain_float(components.get("ccr_loss"))
         if raw is not None:
             block["raw"] = _rounded(raw)
-        block["lambda_cf"] = _cfg_float(training_cfg, "lambda_cf", 0.0)
+        block["lambda_cf"] = lambda_cf
         block["rho"] = _cfg_float(training_cfg, "ccr_rho", 0.0)
         block["rollout_len"] = rollout_len
         block["action_source"] = action_source

@@ -19,8 +19,14 @@ Record schema (one JSON object per line, see design.md section 9):
      "it_per_s": 1.81, "loss": 0.2166,
      "terms": {"prediction": {"scaled": 0.0118, "share": 0.0545}, ...},
      "enabled_terms": ["prediction", "curvature", "ccr", "decoder"],
-     "ccr": {"raw": 0.412, "lambda_cf": 0.1, "rho": 0.05, "rollout_len": 5,
-             "action_source": "synthetic", "synthesized_action_frames": 3}}
+     "ccr": {"enabled": true, "raw": 0.412, "lambda_cf": 0.1, "rho": 0.05,
+             "rollout_len": 5, "action_source": "synthetic",
+             "synthesized_action_frames": 3}}
+
+The `ccr` block's `enabled` flag says whether the CCR term actually contributed to
+that iteration; when it is false the block carries only {"enabled": false,
+"lambda_cf": ...}. Records written before that flag existed have no `enabled` key --
+they are read as "unknown", never as enabled.
 
 Stdlib only (json, argparse, pathlib, statistics) so it runs on the pod and on a
 dev box with no torch. Read-only: it never writes into the run directory.
@@ -258,21 +264,66 @@ def print_term_table(rec, label):
               f"a term is missing from the record or `loss` includes something untracked")
 
 
+CCR_KEY_ORDER = ("enabled", "raw", "lambda_cf", "rho", "rollout_len", "action_source",
+                 "synthesized_action_frames")
+
+
+def ccr_enabled(block):
+    """
+    True / False from the block's own `enabled` flag, or None when the key is absent.
+
+    None means "unknown, this record predates the flag" -- not "enabled". Records
+    written before the flag existed are still being appended to by an in-flight run,
+    so they must stay readable.
+    """
+    if not isinstance(block, dict) or "enabled" not in block:
+        return None
+    value = block["enabled"]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "yes", "1"):
+            return True
+        if low in ("false", "no", "0"):
+            return False
+        return None
+    num = as_float(value)
+    return None if num is None else num != 0.0
+
+
 def print_ccr_block(rec):
     block = rec.get("ccr")
     if not isinstance(block, dict):
         return
+    enabled = ccr_enabled(block)
     print()
     print("CCR ARM (self-describing block)")
     print(THIN)
-    for key in ("raw", "lambda_cf", "rho", "rollout_len", "action_source",
-                "synthesized_action_frames"):
+
+    if enabled is False:
+        # Nothing ran, so there is no arm to table: rho / rollout_len /
+        # action_source / synthesized_action_frames would describe a rollout that
+        # never happened. lambda_cf is the reason it is off.
+        lam = block.get("lambda_cf", "n/a")
+        print(f"  CCR disabled (lambda_cf={lam}) -- no CCR term contributed to this "
+              f"iteration; arm fields are not reported")
+        return
+
+    for key in CCR_KEY_ORDER:
         if key in block:
             print(f"  {key:<26}{block[key]}")
-    for key in sorted(k for k in block if k not in
-                      ("raw", "lambda_cf", "rho", "rollout_len", "action_source",
-                       "synthesized_action_frames")):
+    for key in sorted(k for k in block if k not in CCR_KEY_ORDER):
         print(f"  {key:<26}{block[key]}")
+
+    if enabled is None:
+        print("  NOTE: this record predates the `enabled` field, so whether the CCR "
+              "term actually ran cannot be confirmed from this block")
+        print("        use `enabled_terms` (a `ccr` entry) as the authoritative signal")
+        return
+
+    # enabled is True: the arm fields describe something that really ran, so the
+    # synthetic-vs-logged distinction is meaningful here and only here.
     if block.get("action_source") == "synthetic" and \
             as_int(block.get("synthesized_action_frames")) == 0:
         print("  WARNING: action_source=synthetic with synthesized_action_frames=0 is "

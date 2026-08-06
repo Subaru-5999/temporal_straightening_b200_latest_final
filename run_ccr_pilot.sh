@@ -204,6 +204,31 @@ add_default() {
   _user_overrides_key "${kv%%=*}" || CMD+=("$kv")
 }
 
+# The training.lambda_cf this launch will actually resolve to: the caller's
+# override if they passed one, otherwise the shipped pilot default. Used only to
+# print the right verification guidance -- a baseline launch (lambda_cf=0) has no
+# CCR arm to verify, so telling the reader to check arm fields is misleading.
+CCR_DEFAULT_LAMBDA_CF=0.1
+
+resolved_lambda_cf() {
+  local arg bare
+  for arg in ${USER_ARGS[@]+"${USER_ARGS[@]}"}; do
+    bare="${arg#[+~]}"; bare="${bare#+}"
+    if [[ "${bare%%=*}" == "training.lambda_cf" ]]; then
+      printf '%s\n' "${bare#*=}"
+      return 0
+    fi
+  done
+  printf '%s\n' "$CCR_DEFAULT_LAMBDA_CF"
+}
+
+# True when the resolved lambda_cf is non-zero. awk does the numeric compare so
+# 0, 0.0 and 0e0 all read as off; a non-numeric value reads as off too, which is
+# the safe side for printed guidance.
+ccr_launch_enabled() {
+  awk -v v="$1" 'BEGIN { exit !(v + 0 != 0) }'
+}
+
 build_train_cmd() {
   local mode="$1"
   CMD=(python train.py --config-name train.yaml)
@@ -379,7 +404,8 @@ resolve_run_dir_from_log() {
 }
 
 report_launch() {
-  local run_dir rc
+  local run_dir rc lam
+  lam="$(resolved_lambda_cf)"
   echo
   echo "Resolving the run directory from the log (not from a hardcoded path)..."
   set +e
@@ -391,10 +417,21 @@ report_launch() {
       echo "run dir = ${run_dir}"
       echo
       echo "Two-minute smoke check (pilot gate check 1):"
-      echo "  grep -aE 'CCR enabled|MCA enabled|Iteration budget|Model saved dir' '${CCR_LOG}'"
+      echo "  grep -aE 'CCR enabled|CCR disabled|MCA enabled|Iteration budget|Model saved dir' '${CCR_LOG}'"
       echo "  ls -l '${run_dir}/checkpoints/'      # model_latest.pth exists within seconds"
-      echo "A 'synthetic' arm reporting synthesized_action_frames=0 is silently a"
-      echo "'logged' arm and the launch is wrong."
+      if ccr_launch_enabled "$lam"; then
+        echo "This launch enables CCR (training.lambda_cf=${lam}), so confirm the term"
+        echo "really ran: a 'ccr' entry in the telemetry record's enabled_terms (the ccr"
+        echo "block reads enabled: true). ONLY THEN does the arm field matter -- a"
+        echo "'synthetic' arm reporting synthesized_action_frames=0 is silently a"
+        echo "'logged' arm and the launch is wrong."
+      else
+        echo "This launch does NOT enable CCR (training.lambda_cf=${lam}), so the check is"
+        echo "the opposite: expect 'CCR disabled (lambda_cf=0.0)' in the log and NO 'ccr'"
+        echo "term in the telemetry (the ccr block reads enabled: false). The arm fields"
+        echo "(action_source / synthesized_action_frames) describe nothing on a CCR-off"
+        echo "run and are not reported."
+      fi
       echo
       echo "Telemetry:"
       echo "  python summarize_training_log.py '${run_dir}'"
