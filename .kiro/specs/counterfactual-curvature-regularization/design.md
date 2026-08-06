@@ -553,9 +553,9 @@ self-describing: reading a pilot's telemetry six weeks later must not require re
 from the directory name alone.
 
 `it_per_s` is `iterations_since_last_record / elapsed_seconds` from `time.perf_counter()`, which makes the
-step-rate comparison against the ~2.9 it/s PushT reference (`REPRODUCTION.md`) a lookup rather than a
-stopwatch exercise. A drop below ~1.93 it/s is the >50% step-time regression that Requirement 11.7 requires
-be reported before the Full_Run.
+step-rate comparison against the measured 2.863 it/s PushT baseline median (~2.9 it/s in `REPRODUCTION.md`) a
+lookup rather than a stopwatch exercise. A drop below 1.91 it/s is the >50% step-time regression that
+Requirement 11.7 requires be reported before the Full_Run.
 
 `summarize_training_log.py <run_dir>` reads the JSONL and prints the term/scaled/share table, the step rate,
 the step-200 row, and with `--compare <reference_run_dir>` the row-by-row delta against a reference run
@@ -913,6 +913,63 @@ driver's PID, never on the absence of its children, and run one at a time (Requi
 
 ## Pilot and acceptance protocol
 
+### Measured baseline reference (recorded before the pilots)
+
+Written down per Requirement 8.1 **before** the Offline_Probe was run and before any Pilot_Run was launched.
+Source: the completed PushT baseline in
+`checkpoints/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05` (`dino_channel`,
+`straighten=aggcos1e-1`, `encoder_lr=1e-5`, CCR and MCA off, the full 123,858-step budget, `nvidiadgx` B200
+MIG pod). Its own telemetry over its first 8,000 steps is the free matched-budget control of
+`SHORT_BUDGET_PILOTS.md` §4, i.e. the `early_telemetry` reference source of §10 step 7.
+
+**Step rate.** Median **2.863 it/s** over 54 telemetry records (min 2.360, max 2.879). That is +1.3% step
+time against the ~2.9 it/s figure in `REPRODUCTION.md`, so the documented figure is valid on this pod, and
+the 50% step-time floor of Requirement 11.7 is **1.91 it/s** (2.863 / 1.5).
+
+**Matched-budget row at `global_iter` 8000** — the row pilot gate check 3 is evaluated against:
+
+| term | scaled | share |
+|---|---|---|
+| curvature | 0.041421 | 73.741% |
+| prediction | 0.013196 | 23.493% |
+| decoder | 0.001554 | 2.767% |
+| **total** | **0.056171** | 100% |
+
+Raw on-log aggregated curvature is `0.041421 / 0.1 = ` **0.41421** (`straighten=aggcos1e-1`, so the scale is
+0.1).
+
+**Why the reference is read at 8,000 and nowhere else.** The curvature share moves fast and then settles:
+31.4% @200 → 65.4% @3000 → 64.7% @4200 → 73.7% @8000 → 74.0% @10400. The mover is the prediction term
+falling 0.1585 → 0.0132 while curvature stays roughly flat, so a share read at 200 or 3,000 steps describes a
+different objective mix than the one a pilot capped at 8,000 steps will be judged in. The reference is
+therefore taken at the pilot's own budget.
+
+**The `lambda_cf` window that follows from that row.** Writing `X` for the pilot's *scaled* CCR
+contribution, adding CCR raises the total to `0.056171 + X`, so:
+
+```
+CCR share >= 2%   ->  X >= 0.02 * 0.056171 / 0.98 = 0.00115
+CCR share <= 30%  ->  X <= 0.30 * 0.056171 / 0.70 = 0.02407
+prediction >= 11.75% (half of 23.493) -> X <= 0.05614
+```
+
+The 30% cap binds; the prediction floor is slack by more than 2x. Viable window: **`X in [0.0011, 0.0241]`**.
+
+**The `lambda_cf` rule.** Let `g` be the probe's perturbed/unperturbed curvature ratio, so the pilot's raw
+CCR term is `g * 0.41421` and `X = lambda_cf * g * 0.41421`:
+
+```
+lambda_cf = 0.024 / g   ->  ~15% CCR share (target)
+lambda_cf = 0.058 / g   ->  30% CCR share (hard ceiling)
+```
+
+| `g` | `lambda_cf` at the ~15% target | `lambda_cf` at the 30% ceiling |
+|---|---|---|
+| 1.0 | 0.024 | 0.058 |
+| 1.5 | 0.016 | 0.039 |
+| 2.0 | 0.012 | 0.029 |
+| 3.0 | 0.008 | 0.019 |
+
 **Escalation ladder** (Requirement 11.3), each rung gated on the previous one's written threshold:
 
 | rung | command | cost | gate |
@@ -931,19 +988,28 @@ of `2`, and **still zero additional encoder forward passes** — the encoder pas
 shared with the baseline term and is the dominant cost of a step, so the extra three predictor calls over
 `num_hist` frames of tokens are a small fraction of it. The `synthetic` arm is nonetheless the one with the
 least headroom against the Requirement 11.7 regression clause, so its `it_per_s` is checked first and against
-the same floor: `>= 1.93 it/s` versus the ~2.9 it/s PushT reference. Revised arithmetic:
+the measured floor: `>= 1.91 it/s` versus the baseline's own 2.863 it/s median.
+
+The recorded plan also omitted the baseline itself, because it assumed an already-trained checkpoint was on
+disk. There was none, so the baseline was trained as part of this work and has to be counted. At the measured
+2.863 it/s, a full-budget PushT run is `123,858 / 2.863 = 43,260 s ≈ 12.0 h`, so the baseline train just
+completed is ≈12.0 h and its 3-seed evaluation ≈1.5 h. The same arithmetic also confirms the ≈17 h Full_Run
+line, which already carries the CCR step-time overhead: `12.0 h x 1.3-1.5 = 15.6-18.0 h`. Revised arithmetic:
 
 | item | recorded plan | revised |
 |---|---|---|
+| Baseline train (123,858 steps @ 2.863 it/s) | not budgeted (assumed on disk) | ≈12.0 h |
+| Baseline 3-seed eval | not budgeted | ≈1.5 h |
 | Pilot subtotal | 3 arms, ≈3.75-4.25 h | 4 arms, ≈5.2-5.8 h |
 | Everything else (probe, triage, Full_Run, 3-seed eval) | ≈19.3 h | ≈19.3 h (unchanged) |
-| **Total** | **≈23 GPU-hours** | **≈24.5-25 GPU-hours** |
+| **Total** | **≈23 GPU-hours** | **≈37 GPU-hours** (≈36.5 h on the recorded plan's own basis, ≈38-38.5 h including the four-arm pilot overrun) |
 
-The ≈1.5-2 GPU-hour overrun is reported rather than absorbed silently, since Requirement 11.5 records a
-specific allocation. If the overrun is not approved, the arm to drop is the `lambda_cf` variation, not the
-`logged` control: the control is what makes the `synthetic` extrapolation risk measurable. Additional
-training seeds under Requirement 10.5 still cost a further ≈26 GPU-hours and require separate approval
-(Requirement 11.6).
+The ≈14 GPU-hour overrun is reported rather than absorbed silently, since Requirement 11.5 records a specific
+allocation; ≈13.5 h of it is the unbudgeted baseline, which is already spent and not recoverable, and
+≈1.5-2 h is the fourth pilot arm. If the overrun is not approved, the arm to drop is the `lambda_cf`
+variation, not the `logged` control: the control is what makes the `synthetic` extrapolation risk measurable.
+Additional training seeds under Requirement 10.5 still cost a further ≈26 GPU-hours and require separate
+approval (Requirement 11.6).
 
 **Pilot configuration** (primary claim; note `mca_weight=0` per Requirement 4.5, and that at the default
 `ccr_action_source=synthetic` no `ccr_rollout_len` override is needed — `L = 5` equals Planner_Horizon):
@@ -951,7 +1017,7 @@ training seeds under Requirement 10.5 still cost a further ≈26 GPU-hours and r
 ```bash
 python train.py --config-name train.yaml env=pusht encoder=dino_channel \
   training.straighten=aggcos1e-1 training.encoder_lr=1e-5 training.stop_grad=True \
-  training.lambda_cf=0.1 training.ccr_rho=0.05 \
+  training.lambda_cf=0.02 training.ccr_rho=0.05 \
   training.ccr_action_source=synthetic training.ccr_rollout_len=5 \
   training.mca_weight=0 training.max_iterations=8000 training.epochs=3
 ```
@@ -960,6 +1026,17 @@ python train.py --config-name train.yaml env=pusht encoder=dino_channel \
 defaults, so the command recorded in the progress log identifies its arm without a reader having to know the
 defaults of the day.
 
+**The `lambda_cf` sweep, corrected against the measured reference.** The value recorded earlier in this
+design, `lambda_cf = 0.1` with a `{0.1, 0.3}` sweep, is wrong and is replaced by **`lambda_cf in
+{0.02, 0.05}`** for the `g ≈ 1-1.5` range, with the final pair taken from the `lambda_cf` rule above once the
+probe reports `g`. The recorded values are 4-15x too strong: against the measured step-8,000 total of
+0.056171 with raw CCR `g * 0.41421`, at `g ≈ 1` a weight of 0.1 puts CCR at ≈42% of the objective and 0.3 at
+≈69%, both already past the 30% ceiling, and at the `g ≈ 2-3` the probe may plausibly report the pair lands
+at 82-87%. At `lambda_cf = 0.3, g = 1` the prediction share falls to ≈7.3%, below the 11.75% floor of gate
+check 3 — CCR would be starving the very prediction loss that planning depends on, which is the failure the
+measured window exists to prevent. `0.02` sits at the ~15% target for `g ≈ 1`, and `0.05` probes toward the
+ceiling without crossing it for `g ≈ 1`.
+
 Arms, each resolving to its own run directory via `ccr_tag`:
 
 | arm | override delta from the block above | isolates |
@@ -967,7 +1044,13 @@ Arms, each resolving to its own run directory via `ccr_tag`:
 | treatment | — (`synthetic`, `L=5`, `rho=0.05`) | the full-horizon off-log penalty |
 | horizon control | `ccr_action_source=logged ccr_rollout_len=2` | whether the gain needs the horizon past the window edge, or only the first two off-log steps; it is also the control for the extrapolation risk `synthetic` takes on |
 | perturbation control | `ccr_rho=0` | "rollout space vs encoder space" separated from "off-log vs on-log" |
-| weight variation | `lambda_cf` varied | sensitivity of the result to the term's share of the objective |
+| weight variation | `lambda_cf in {0.02, 0.05}` (from the rule above once `g` is known) | sensitivity of the result to the term's share of the objective |
+
+**No matched-budget control arm.** A fifth arm — CCR off, capped at the same 8,000 steps — is not needed. The
+baseline's own telemetry over its first 8,000 steps is already on disk and is exactly that control, at zero
+cost, which is the free matched-budget control of `SHORT_BUDGET_PILOTS.md` §4. The sweep is therefore three
+arms (treatment, the `logged` horizon control, the `rho = 0` control) plus the `lambda_cf` variation, and
+every gate comparison is made against the recorded step-8,000 row above rather than against a run we pay for.
 
 **Pilot gate, written before launching** (Requirement 8.1):
 
@@ -981,12 +1064,19 @@ Arms, each resolving to its own run directory via `ccr_tag`:
    a `logged` arm and the launch is wrong.
    *Corrected after the pod smoke test: on a CCR-disabled baseline (`lambda_cf=0`) the old field still read
    `synthesized_action_frames=3`, so it never confirmed CCR was running.*
-2. `it_per_s >= 1.93` (no more than a 50% step-time regression against the ~2.9 it/s reference), and the
-   step-200 telemetry row matches the reference run's step-200 row for the shared terms (Requirement 8.4).
-   This check is applied to the `synthetic` `L = 5` arm first, since it has the least headroom; a failure
-   there triggers Requirement 11.7 reporting before the Full_Run rather than after.
-3. At step 4,000 the CCR **share** is in `[0.02, 0.30]` and the prediction share is at least half its
-   reference share. Shares, never raw loss values (Requirement 8.3).
+2. `it_per_s >= 1.91` — the measured floor, `2.863 / 1.5`, from the baseline's own 54-record median rather
+   than the rounded ~2.9 it/s of `REPRODUCTION.md` (which the measurement confirms to within 1.3% step time)
+   — and the step-200 telemetry row matches the reference run's step-200 row for the shared terms
+   (Requirement 8.4). Checked on the `synthetic` `L = 5` arm first, since it has the least headroom. Note that
+   the floor and the estimated cost of a CCR arm nearly coincide: +30-50% step time puts a CCR arm at
+   `2.863 / 1.3 = 2.20` down to `2.863 / 1.5 = 1.91` it/s, so the upper end of the estimate grazes the floor
+   rather than clearing it. Under Requirement 11.7 that is a **reporting event before the Full_Run** — write
+   the regression report and revise the compute plan — not an abort.
+3. At `global_iter` 8,000, the same step as the recorded reference row: the CCR **share** is in
+   `[0.02, 0.30]` and the prediction share is at least **11.75%** (half of the reference's 23.493%). Against
+   the recorded step-8,000 total of 0.056171 that is a scaled CCR contribution `X in [0.0011, 0.0241]`; the
+   30% cap binds and the prediction floor is slack by more than 2x (on its own it would permit
+   `X <= 0.0561`). Shares, never raw loss values (Requirement 8.3).
 4. The raw CCR term does not fall below 1e-3 within the first 1,000 iterations. If it does, the term has
    absorbed the task without pressuring the encoder and the pilot is recorded as **not** a success
    (Requirement 8.6).

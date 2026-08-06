@@ -62,7 +62,7 @@ Task labels:
       `_rollout_latents` refactor** — otherwise there is nothing to compare the refactor against
     - _Requirements: 3.2, 3.3, 5.2_
 
-- [ ] 2. Rollout body extraction (pure refactor, behaviour preserved)
+- [x] 2. Rollout body extraction (pure refactor, behaviour preserved)
   - [x] 2.1 [CODE] Extract `_rollout_latents` from `rollout` in `models/visual_world_model.py`
     - Move the predictor loop verbatim (identical tensor ops in identical order) into
       `_rollout_latents(self, z, action)`; `rollout(obs_0, act)` delegates to it and keeps its signature,
@@ -70,14 +70,14 @@ Task labels:
     - No CCR code in this task — this is a pure refactor
     - _Requirements: 1.2, 1.7, 5.2_
 
-  - [ ] 2.2 [CODE] Write property test for the rollout refactor (`tests/test_rollout_refactor.py`)
+  - [x] 2.2 [CODE] Write property test for the rollout refactor (`tests/test_rollout_refactor.py`)
     - **Property 7: The rollout refactor preserves rollout**
     - **Validates: Requirements 1.2, 1.7, 5.2**
     - Compares `rollout(obs_0, act)` element-for-element against the frozen loop in `tests/reference_impl.py`
     - **Gate, deliberately not optional:** this test must pass before any CCR code is written on top of
       `_rollout_latents`
 
-- [ ] 3. Configuration surface and run naming
+- [x] 3. Configuration surface and run naming
   - [x] 3.1 [CODE] Add the CCR/MCA/pilot Hydra keys to `conf/train.yaml`
     - Under `training`: `lambda_cf: 0.0`, `ccr_rho: 0.0`, `ccr_rollout_len: 5`,
       `ccr_action_source: synthetic`, `mca_weight: 0.0`, `max_iterations: 0`,
@@ -96,7 +96,7 @@ Task labels:
       the tag (it lives in `LOSS_SIGNATURE_KEYS` instead)
     - _Requirements: 3.4, 6.4, 6.5_
 
-  - [ ] 3.3 [CODE] Write property test for run naming (`tests/test_run_naming.py`)
+  - [x] 3.3 [CODE] Write property test for run naming (`tests/test_run_naming.py`)
     - **Property 2: Run naming is empty at defaults, complete otherwise, and injective**
     - **Validates: Requirements 3.4, 6.4, 6.5**
     - Includes the byte-identical legacy assertion: defaults resolve to
@@ -264,8 +264,8 @@ Task labels:
       a term that decays below 0.1% before iteration 1,000
     - _Requirements: 8.3, 8.4, 8.6_
 
-- [ ] 8. Scope containment, protocol invariance and generality
-  - [ ] 8.1 [CODE] Write the changed-file guard test (`tests/test_scope_guard.py`)
+- [x] 8. Scope containment, protocol invariance and generality
+  - [x] 8.1 [CODE] Write the changed-file guard test (`tests/test_scope_guard.py`)
     - Assert the feature branch's changed-file set is a subset of the Requirement 5.6 allowlist
       (`models/visual_world_model.py`, `conf/train.yaml`, `train.py`, `custom_resolvers.py`, new standalone
       scripts, `tests/`)
@@ -292,8 +292,8 @@ Task labels:
       target-cell shapes, while `ccr_action_source=logged` raises the Requirement 1.10 `ValueError`
     - _Requirements: 11.4, 1.8, 1.10_
 
-- [ ] 9. Offline probe
-  - [ ] 9.1 [CODE] Create `probe_ccr_curvature.py` (standalone, read-only, CPU-only)
+- [x] 9. Offline probe
+  - [x] 9.1 [CODE] Create `probe_ccr_curvature.py` (standalone, read-only, CPU-only)
     - Validate `--ckpt` / `--train-cfg` paths first and `sys.exit(1)` with the absolute missing path before
       constructing any model; hash (`sha256`), size and mtime the checkpoint; load with
       `map_location="cpu"`, `model.eval()`, everything under `torch.no_grad()`, no optimizer anywhere
@@ -358,6 +358,9 @@ Task labels:
   - [ ] 13.1 [CPU RUN] Run `probe_ccr_curvature.py` on the target PushT checkpoint
     - `--rho 0.05 --rollout-len 5 --action-source synthetic --num-windows 64 --draws 4
       --reference pristine --max-minutes 30 --out probe_outputs/ccr_pusht.json`
+    - The `curvature_gap` readout is what fixes `g`, the perturbed/unperturbed curvature ratio, and therefore
+      `lambda_cf` for tasks 15.1 and 15.5 via the design's rule `lambda_cf = 0.024 / g`. That is the
+      dependency linking the probe to the pilot configuration: the pilot λ is not final until this reports
     - ~30 minutes, CPU, read-only. Not agent-executable: needs the real checkpoint and dataset
     - _Requirements: 7.1, 7.6, 11.3_
 
@@ -369,11 +372,16 @@ Task labels:
 
 - [ ] 14. Compute allocation reconciliation
   - [ ] 14.1 [HUMAN] Surface the compute overrun and request approval
-    - The recorded allocation (Requirement 11.5) is ≈23 GPU-hours around **three** pilot arms. The design
-      revises this to **≈24.5-25 GPU-hours**, because the sweep is now **four** arms and the treatment arm
-      runs `L = 5` rather than `L = 2`: pilot subtotal ≈5.2-5.8 h instead of ≈3.75-4.25 h, everything else
-      (probe, triage, Full_Run, 3-seed eval) unchanged at ≈19.3 h
-    - The ≈1.5-2 GPU-hour overrun is reported, not absorbed. **If it is refused, the arm to drop is the
+    - The recorded allocation (Requirement 11.5) is ≈23 GPU-hours around **three** pilot arms. Two things
+      revise it. The sweep is now **four** arms and the treatment arm runs `L = 5` rather than `L = 2`: pilot
+      subtotal ≈5.2-5.8 h instead of ≈3.75-4.25 h, everything else (probe, triage, Full_Run, 3-seed eval)
+      unchanged at ≈19.3 h. And the recorded plan omitted the baseline train entirely, because it assumed a
+      checkpoint was already on disk; there was none, so the baseline was trained as part of this work and has
+      to be counted. At the measured 2.863 it/s a full-budget PushT run is `123,858 / 2.863 = 43,260 s
+      ≈ 12.0 h`, so the baseline train is ≈12.0 h and its 3-seed eval ≈1.5 h. **Revised total ≈37
+      GPU-hours**
+    - The ≈14 GPU-hour overrun is reported, not absorbed: ≈13.5 h of it is the already-spent baseline, which
+      is not recoverable, and ≈1.5-2 h is the fourth pilot arm. **If it is refused, the arm to drop is the
       `lambda_cf` variation (15.5), not the `logged` control (15.3)** — the control is what makes the
       `synthetic` extrapolation risk measurable
     - Note separately that additional training seeds under Requirement 10.5 would cost a further ≈26
@@ -381,11 +389,18 @@ Task labels:
     - _Requirements: 11.5, 11.6_
 
 - [ ] 15. Pilot arms (rung 2; strictly serial - one job on the MIG slice at a time)
+  - **No matched-budget control arm.** A fifth arm with CCR off, capped at the same 8,000 steps, is not
+    needed: the baseline's own first-8,000-step telemetry is already on disk and is exactly that control at
+    zero cost, per `SHORT_BUDGET_PILOTS.md` §4. Every gate comparison below is against the recorded
+    step-8,000 row rather than against a run we pay for
   - [ ] 15.1 [GPU RUN] Treatment arm: `synthetic`, `L = 5`, `rho = 0.05`
     - `run_ccr_pilot.sh` wrapping `python train.py --config-name train.yaml env=pusht encoder=dino_channel
       training.straighten=aggcos1e-1 training.encoder_lr=1e-5 training.stop_grad=True
-      training.lambda_cf=0.1 training.ccr_rho=0.05 training.ccr_action_source=synthetic
+      training.lambda_cf=0.02 training.ccr_rho=0.05 training.ccr_action_source=synthetic
       training.ccr_rollout_len=5 training.mca_weight=0 training.max_iterations=8000 training.epochs=3`
+    - λ comes from the design's rule `lambda_cf = 0.024 / g`, where `g` is the probe's perturbed/unperturbed
+      curvature ratio, so the final value is fixed once task 13.1 reports `g`. `0.02` is the value for
+      `g ≈ 1`
     - Two-minute smoke check: the `CCR enabled:` line names the right weight, `rho`, `action_source`,
       `synthesized_action_frames=3` and device, and a checkpoint exists on disk. A `synthetic` arm reporting
       `synthesized_action_frames=0` is silently a `logged` arm and the launch is wrong
@@ -393,9 +408,14 @@ Task labels:
     - _Requirements: 8.1, 8.2, 9.1-9.7, 11.3, 4.5, 6.1_
 
   - [ ] 15.2 [HUMAN] Step-rate and step-200 check, plus the Requirement 11.7 regression report
-    - `summarize_training_log.py <run_dir> --compare <reference_run_dir>`: `it_per_s >= 1.93` against the
-      ~2.9 it/s PushT reference, and the step-200 row matching the reference for shared terms. Checked on
-      this arm **first**, since `L = 5` has the least headroom
+    - `summarize_training_log.py <run_dir> --compare <reference_run_dir>`: `it_per_s >= 1.91` — derived from
+      the baseline's measured median of 2.863 it/s over 54 telemetry records (`2.863 / 1.5`), not from the
+      rounded ~2.9 it/s of `REPRODUCTION.md`, which the measurement confirms to within 1.3% step time — and
+      the step-200 row matching the reference for shared terms. Checked on this arm **first**, since `L = 5`
+      has the least headroom
+    - A CCR arm at the upper end of the estimated +30-50% step-time cost lands at `2.863 / 1.5 = 1.91` it/s
+      and therefore grazes the floor rather than clearing it. Under Requirement 11.7 that is a **reporting
+      event before the Full_Run, not an abort**
     - If step time regressed by more than 50%, write the regression report and revise the compute plan
       **before** the Full_Run, not after
     - _Requirements: 8.4, 11.7, 6.8_
@@ -410,17 +430,30 @@ Task labels:
       arm by construction. ~75-85 min, serial after 15.3
     - _Requirements: 2.1, 2.2, 2.3, 9.7_
 
-  - [ ] 15.5 [GPU RUN] Weight variation arm: `lambda_cf` varied
-    - Sensitivity of the result to the term's share of the objective. ~75-85 min, serial after 15.4.
-      **This is the arm to drop if the 14.1 compute overrun is refused**
+  - [ ] 15.5 [GPU RUN] Weight variation arm: `lambda_cf in {0.02, 0.05}` for `g ≈ 1-1.5`
+    - Sensitivity of the result to the term's share of the objective. The final pair comes from the design's
+      `lambda_cf = 0.024 / g` rule once task 13.1 reports `g`
+    - The previously recorded `{0.1, 0.3}` was 4-15x too strong: against the measured step-8,000 total of
+      0.056171 with raw CCR `g * 0.41421`, at `g ≈ 1` a weight of 0.1 puts CCR at ≈42% of the objective and
+      0.3 at ≈69%, both past the 30% share cap, and at `lambda_cf=0.3` the prediction share falls to ≈7.3%,
+      below the 11.75% gate floor
+    - ~75-85 min, serial after 15.4. **This is the arm to drop if the 14.1 compute overrun is refused**
     - _Requirements: 8.2, 8.3, 9.7, 11.5_
 
   - [ ] 15.6 [HUMAN] Record the pilot gate verdict
-    - Written gate, all four checks: (1) startup line and checkpoint present within two minutes;
-      (2) `it_per_s >= 1.93` and step-200 row matches the reference; (3) at step 4,000 the CCR **share** is
-      in `[0.02, 0.30]` and the prediction share is at least half its reference share — shares, never raw
-      losses; (4) the raw CCR term does not fall below 1e-3 within the first 1,000 iterations, and if it does
-      the pilot is recorded as **not** a success
+    - Written gate, all four checks: (1) startup line and checkpoint present within two minutes, with the
+      primary confirmation that CCR is running being the `ccr` term appearing in the telemetry record's
+      `enabled_terms` (equivalently `enabled: true` in the record's `ccr` block), since that is derived from
+      the model's own gate firing rather than from config — `synthesized_action_frames == 3` is a **secondary**
+      synthetic-vs-logged check, read only after CCR is confirmed enabled, because on the CCR-disabled
+      baseline the old field still read 3 and so never confirmed CCR was running;
+      (2) `it_per_s >= 1.91` and step-200 row matches the reference; (3) at `global_iter` 8,000 — the pilots'
+      own budget and the step the recorded reference row was read at — the CCR **share** is in `[0.02, 0.30]`
+      and the prediction share is at least **11.75%** (half of the reference's 23.493%), equivalently a scaled
+      CCR contribution `X in [0.0011, 0.0241]` against the recorded total of 0.056171, with the 30% cap
+      binding and the prediction floor slack by more than 2x — shares, never raw losses; (4) the raw CCR term
+      does not fall below 1e-3 within the first 1,000 iterations, and if it does the pilot is recorded as
+      **not** a success
     - Mid-run representation readouts are catastrophic-failure detectors only, never trends. If the MCA
       pilot was run and failed its own gate, MCA is excluded from the Full_Run. Append each arm's outcome and
       caveats to the project progress log
