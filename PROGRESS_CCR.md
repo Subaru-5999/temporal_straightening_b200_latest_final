@@ -33,8 +33,8 @@ dual acceptance gate, and the iteration cap accepted as in-scope infrastructure.
 | Test suite | **16/16 passing on the pod** |
 | Baseline train (paper's method, CCR off) | **COMPLETE** — 123,858 steps, 12.04 h |
 | Offline probe (rung 1) | **COMPLETE — gate PASS at `rho = 0.5`** |
-| Baseline 3-seed eval (task 18.1) | not started |
-| Pilot arms (rung 2) | **not started — this is the next GPU action** |
+| Baseline 3-seed eval (task 18.1) | **not started — this is the next GPU action, ahead of the pilots** |
+| Pilot arms (rung 2) | not started — queue behind the baseline eval |
 | Full CCR run | not started — blocked on pilot gate |
 | Acceptance gate verdict | not started |
 
@@ -229,14 +229,45 @@ inconclusive. Use `python ccr_acceptance_gate.py`.
 
 ## 7. Next actions, in order
 
-### Step 1 — launch the treatment pilot arm (task 15.1, ~85-95 min GPU)
+Common preamble for every command below:
 ```bash
 cd /workspace/arun/ccr && git pull origin main
-bash run_ccr_pilot.sh pilot \
+export DATASET_DIR=/workspace/arun/data          # run_ccr_pilot.sh dies without it
+RUN_DIR=$PWD/checkpoints/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05
+```
+
+### Step 1 — baseline 3-seed eval FIRST (task 18.1, ~1.5 h GPU)
+**This goes before the pilots**, even though the spec numbers it with the acceptance-gate
+group. It depends on nothing but the baseline checkpoint, which is on disk, and it is the only
+check that the whole `plan.py` evaluation path produces a number in the paper's band. Run
+early it costs 1.5 h and de-risks everything downstream; run late it is a number that arrives
+after ~24 GPU-h have already been staked on comparisons against it.
+
+```bash
+LOG=ccr_eval_baseline.log bash run_ccr_pilot.sh eval "$RUN_DIR"
+BASE_PID=$(cat ccr_eval_baseline.pid)
+```
+
+One command, six jobs, serial in one driver: open-loop (`plan_gd.yaml`, `mode=last`,
+`alpha=1`) for seeds 100/200/300, then MPC (`plan_gd_mpc.yaml`, `mode=staged`, `alpha=1`) for
+the same three. `PLAN_SERIAL_ENV=1` is applied automatically in `eval` mode.
+
+```bash
+grep -ah success_rate ccr_eval_baseline.log | tail -n 20
+python aggregate_results.py
+```
+
+Expect **~75-78 OL / ~82-85 MPC**. Outside ~72-82 open-loop is **stop-and-investigate in
+either direction** — a number well above the paper's mean is as much a sign of a protocol
+discrepancy as one below it. Report the ~5.7 pt binomial SE alongside.
+
+### Step 2 — treatment pilot arm, chained behind the eval (task 15.1, ~85-95 min GPU)
+```bash
+CHAIN_ON_PID=$BASE_PID bash run_ccr_pilot.sh pilot \
   training.lambda_cf=0.04 training.ccr_rho=0.5 \
   training.ccr_action_source=synthetic training.ccr_rollout_len=5 \
   training.mca_weight=0
-PID=$(cat ccr_pilot_*.pid | tail -1)
+PILOT_PID=$(cat ccr_pilot_*.pid | tail -1)
 ```
 Expected run dir:
 `checkpoints/test/pusht_..._sgTrue_lr1e-05_cf0p04_rho0p5_srcsynthetic_mca0`
@@ -245,10 +276,10 @@ Expected run dir:
 (secondary), a checkpoint on disk. A `synthetic` arm reporting `synthesized_action_frames=0`
 is silently a `logged` arm and the launch is wrong.
 
-### Step 2 — remaining pilot arms, serial, chained on the driver PID
+### Step 3 — remaining pilot arms, serial, chained on the driver PID
 ```bash
 # horizon control — does the gain need the steps past the window edge?
-CHAIN_ON_PID=$PID bash run_ccr_pilot.sh pilot training.lambda_cf=0.04 training.ccr_rho=0.5 \
+CHAIN_ON_PID=$PILOT_PID bash run_ccr_pilot.sh pilot training.lambda_cf=0.04 training.ccr_rho=0.5 \
   training.ccr_action_source=logged training.ccr_rollout_len=2
 
 # perturbation control — rollout-space vs encoder-space, isolated from off-log vs on-log
@@ -262,13 +293,6 @@ Judge each with:
 python summarize_training_log.py <arm_dir> --compare "$RUN_DIR" --collapse-check \
   --reference-it-per-s 2.862 --iter 8000
 ```
-
-### Step 3 — baseline 3-seed eval (task 18.1, ~1.5 h GPU)
-Can be chained anywhere in the queue; it is independent of the pilots.
-```bash
-bash run_ccr_pilot.sh eval "$RUN_DIR"
-```
-Expect ~75-78 OL / ~82-85 MPC. Outside that band is stop-and-investigate.
 
 ### Step 4 — triage eval (1 seed, ~20 min)
 Sanity only. A pilot predictor is ~7× worse on `z_loss`, so **a low number is not evidence

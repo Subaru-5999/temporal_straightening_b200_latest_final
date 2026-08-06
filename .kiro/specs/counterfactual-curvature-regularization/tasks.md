@@ -399,6 +399,12 @@ Task labels:
     - _Requirements: 11.5, 11.6_
 
 - [ ] 15. Pilot arms (rung 2; strictly serial - one job on the MIG slice at a time)
+  - **Run task 18.1 (the baseline 3-seed evaluation) before this section**, not after. It is numbered with
+    the acceptance-gate group because that is what consumes it, but it has no dependency on any pilot: the
+    baseline checkpoint is already on disk. Executing it first turns it into the cheap stop-and-investigate
+    check (~1.5 h) that validates the whole `plan.py` evaluation path *before* ~5.5 h of pilots and ~17 h of
+    Full_Run are spent against a reference that has never been measured. If it lands outside ~72-82 open-loop,
+    stop: there is no point comparing CCR to a baseline number that is itself wrong
   - **No matched-budget control arm.** A fifth arm with CCR off, capped at the same 8,000 steps, is not
     needed: the baseline's own first-8,000-step telemetry is already on disk and is exactly that control at
     zero cost, per `SHORT_BUDGET_PILOTS.md` §4. Every gate comparison below is against the recorded
@@ -492,6 +498,15 @@ Task labels:
       50 samples per seed, seeds 100/200/300, open-loop `mode=last, alpha=1`, MPC `mode=staged, alpha=1`.
       **Measured, not assumed from the recorded ~75.3 / ~82.0** — the recorded number is a cross-check, not
       the gate input
+    - One command covers all six jobs: `bash run_ccr_pilot.sh eval <baseline_run_dir>` runs the three
+      open-loop seeds then the three MPC seeds, serially in one driver, with `PLAN_SERIAL_ENV=1`. ~1.5 h
+    - **Execute this FIRST, ahead of the section-15 pilots.** It is listed here because the Acceptance_Gate is
+      what consumes it, but it depends on nothing except the baseline checkpoint, which is already on disk.
+      Run early it is a ~1.5 h validation of the entire evaluation path; run late it is a number arriving
+      after ~24 GPU-hours have already been committed to comparisons against it. Expected band ~75-78
+      open-loop / ~82-85 MPC (paper 77.33±6.18 / 85.33±4.99; prior B200 reproduction ~75.3 / ~82.0). Outside
+      ~72-82 open-loop is stop-and-investigate, in **either** direction — a number well above the paper's mean
+      is as much a sign of a protocol discrepancy as one below it
     - _Requirements: 10.2, 10.3, 5.5, 9.4, 9.7_
 
   - [ ] 18.2 [GPU RUN] Three-seed evaluation of the Full_Run candidate
@@ -528,6 +543,10 @@ Task labels:
   are tasks 11.2, 7.6 (Property 10) and 7.7's `--collapse-check`; the rest are the **[HUMAN]** tasks above.
 - Serialization is real, not stylistic: the `1g.45gb` MIG slice holds one job, so 15.1, 15.3, 15.4, 15.5,
   16.1, 17.1, 18.1 and 18.2 each occupy their own wave.
+- **18.1 is scheduled ahead of 15.1** in the wave graph even though it is numbered with the acceptance-gate
+  group. It has no upstream dependency beyond the baseline checkpoint, and running it first makes it a ~1.5 h
+  validation of the evaluation path rather than a number that arrives after ~24 GPU-hours of work has been
+  staked on it. 18.2 (the candidate's 3-seed evaluation) stays late, because it needs the Full_Run.
 
 ## Task Dependency Graph
 
@@ -551,15 +570,15 @@ Task labels:
     { "id": 14, "tasks": ["13.1"] },
     { "id": 15, "tasks": ["13.2"] },
     { "id": 16, "tasks": ["14.1"] },
-    { "id": 17, "tasks": ["15.1"] },
-    { "id": 18, "tasks": ["15.2"] },
-    { "id": 19, "tasks": ["15.3"] },
-    { "id": 20, "tasks": ["15.4"] },
-    { "id": 21, "tasks": ["15.5"] },
-    { "id": 22, "tasks": ["15.6"] },
-    { "id": 23, "tasks": ["16.1"] },
-    { "id": 24, "tasks": ["17.1"] },
-    { "id": 25, "tasks": ["18.1"] },
+    { "id": 17, "tasks": ["18.1"] },
+    { "id": 18, "tasks": ["15.1"] },
+    { "id": 19, "tasks": ["15.2"] },
+    { "id": 20, "tasks": ["15.3"] },
+    { "id": 21, "tasks": ["15.4"] },
+    { "id": 22, "tasks": ["15.5"] },
+    { "id": 23, "tasks": ["15.6"] },
+    { "id": 24, "tasks": ["16.1"] },
+    { "id": 25, "tasks": ["17.1"] },
     { "id": 26, "tasks": ["18.2"] },
     { "id": 27, "tasks": ["18.3"] }
   ]
