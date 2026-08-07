@@ -535,6 +535,27 @@ conditioning intervention aimed at the cell where conditioning matters least.
 well inside its own noise. If (b) is an artifact, the mechanism argument survives and the estimate
 returns to ~15%. The paper's data cannot distinguish these.
 
+**(c) PushT is the ONLY cell where the dual gate is achievable — decision confirmed by the user
+2026-08-07, and it corrects a bad suggestion of mine.** I proposed retargeting to PointMaze Medium
+because the GD-versus-CEM split there (+10.67 / −6.00) shows the conditioning mechanism working
+where PushT's does not. That proposal was wrong, because the `L_curv` ✓ MPC rates are:
+
+| cell | MPC ✓ | headroom to 100 | can clear a +6 pt margin? |
+|---|---|---|---|
+| Wall | 100.00 | 0.00 | **no** |
+| PointMaze UMaze | 100.00 | 0.00 | **no** |
+| PointMaze Medium | 98.67 | 1.33 | **no** |
+| **PushT** | **85.33** | **14.67** | **yes** |
+
+The Acceptance_Gate requires beating the paper on **both** open-loop and MPC by more than 6 points.
+Three of four cells are saturated on MPC, so retargeting to Medium would silently have downgraded
+the claim to open-loop only. PushT is **forced** by the gate structure, not merely preferred.
+
+The two findings therefore coexist rather than conflict: PushT is the only cell where a win is
+possible *and* the cell where conditioning looks least operative. ~10% is low because the only
+worthwhile target is the hardest one, not because the direction is incoherent. Requirement 5.7
+stands unchanged.
+
 **Counter-evidence that is real and not dismissed:** the probe confirmed off-log trajectories are
 measurably more curved (5/5 dimensions at `rho=0.5`), and the pilot shows CCR is genuinely
 learnable — raw 0.339 → 0.199 while its share rose, so the encoder straightens rather than gaming
