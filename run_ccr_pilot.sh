@@ -562,7 +562,12 @@ main() {
     echo
     echo "  watch:        tail -f ${CCR_LOG}"
     echo "  alive?:       ps -p ${driver_pid} -o pid,stat,etime,cmd"
-    echo "  stop:         kill ${driver_pid}"
+    # `kill ${driver_pid}` is WRONG and this script used to print it: setsid puts the
+    # driver, train.py and its ~16 dataloader workers in one process group, and killing
+    # only the driver ORPHANS the python child, which keeps running and keeps holding the
+    # whole MIG slice. The negative-pid form signals the entire group.
+    echo "  stop:         kill -- -${driver_pid}       # whole process group, not just the driver"
+    echo "  verify stop:  ps -eo pid,stat,etime,cmd | grep '[p]ython train' || echo clear"
     echo "  queue next:   CHAIN_ON_PID=${driver_pid} bash run_ccr_pilot.sh ${mode} <overrides>"
   else
     echo "WARNING: ${CCR_PIDFILE} was not written. Check ${CCR_LOG}." >&2

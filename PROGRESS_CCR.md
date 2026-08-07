@@ -558,6 +558,14 @@ which is the point, but also the risk.
 - **`nvidia-smi` does not enumerate processes on MIG.** Use `ps`. Kill stopped (`T`/`Tl`)
   pythons — a suspended job keeps its CUDA context and its memory.
 - **Never Ctrl-Z a GPU job.**
+- **`kill <driver_pid>` does NOT stop a run.** `setsid` puts the driver, `train.py` and its
+  ~16 dataloader workers in one process group; killing the driver orphans the python child,
+  which keeps running and keeps the whole MIG slice. Use `kill -- -<driver_pid>` and then
+  verify with `ps -eo pid,stat,etime,cmd | grep '[p]ython train'`. The script printed the
+  wrong form until commit after `b4055a1`.
+- **The scope guard flags runtime artifacts as violations.** `*.out`, `results_per_seed.csv`
+  and `results_cells.csv` are generated on the pod; they are gitignored now. A scope test that
+  cries wolf is worse than no scope test.
 - `run_ccr_pilot.sh` applies the whole Blackwell/MIG env recipe and refuses to start if the
   slice is busy.
 - **Read loss shares, not loss values** (`SHORT_BUDGET_PILOTS.md` §6).

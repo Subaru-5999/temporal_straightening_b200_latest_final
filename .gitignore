@@ -32,3 +32,11 @@ _paper.txt
 *.log
 .ipynb_checkpoints/
 .train_pid
+# Run artifacts, same class as *.log above -- generated on the pod, never source.
+# `*.out` is `... 2>&1 | tee probe_ccr_pusht.out`; the CSVs are written into the CWD by
+# aggregate_results.py on every invocation. Without these rules the Requirement 5.6 scope
+# guard reports them as out-of-scope source changes, which is a false positive that trains
+# the reader to ignore a test that exists to catch real violations.
+*.out
+results_per_seed.csv
+results_cells.csv
