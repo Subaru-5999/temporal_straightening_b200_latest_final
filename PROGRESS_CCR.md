@@ -251,6 +251,37 @@ in at 85, the MPC target would have been 91.00. Use `python ccr_acceptance_gate.
 
 ---
 
+## 6a. Go/no-go rule for the Full_Run — PRE-REGISTERED 2026-08-07 04:15, before the iter-8000 row
+
+**The 8,000-step row can veto but cannot endorse.** It is a safety check, not an efficacy check: a
+pilot predictor is ~7x worse on `z_loss` than a finished one, so nothing here predicts the final
+success rate. A clean pass leaves the estimate at ~10-12%. Written down before the data to stop a
+story being fitted to it afterwards.
+
+The informative quantity is the **prediction loss against the baseline's own row at the same step**
+(0.013196), because that is the causal channel by which CCR would hurt: planning descends on latent
+distance, so a degraded predictor loses success rate whatever the geometry does.
+
+| condition at `global_iter` 8000 | verdict |
+|---|---|
+| prediction ≤ **0.014516** (within 10%), CCR share in [2%, 30%], prediction share ≥ 11.75%, no collapse | **GO** — controls + Full_Run; estimate stays ~10-12% |
+| prediction > **0.016495** (>25% worse) | **STOP** — CCR is materially degrading the predictor; switch to B1 |
+| in between, or any criterion marginal | **PROBE, then decide** (below) |
+
+**Tiebreaker: re-probe the pilot checkpoint** (~78 s, CPU, read-only). Baseline reference is gap
+ratios 0.276-0.733 and `block_x 0.800, block_y 0.735, agent_x 0.728, agent_y 0.502,
+block_angle 0.183`.
+
+| probe outcome | meaning | estimate |
+|---|---|---|
+| off-log curvature gap materially reduced | the term does what it was built to do | supports GO |
+| `block_angle` still last by a wide margin (~0.18) | the §8(b)/§5c objection stands | ~10%, argue for B1 |
+| `block_angle` improved **relative to the other four** | CCR is touching the dimension PushT is scored on | ~20%, argue for the Full_Run |
+
+Caveat that must be applied to the last two rows: the pilot has seen 8,000 steps against the
+baseline's 123,858, so a lower absolute R² is uninformative. **Only the ranking among the five
+dimensions is comparable.**
+
 ## 7. Next actions, in order
 
 Common preamble for every command below:
