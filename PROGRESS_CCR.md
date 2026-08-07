@@ -493,16 +493,53 @@ python ccr_acceptance_gate.py --cand-ol-seeds ... --cand-mpc-seeds ... \
 
 | bar | probability |
 |---|---|
-| beat same-platform baseline on open-loop (point estimate) | ~50% |
-| beat it on MPC | ~33% |
-| beat it on both | ~25% |
-| beat the paper's 77.33 / 85.33 on both | ~18% |
-| **full dual gate** (both, plus >6 pt margin) | **~15%** |
+| beat same-platform baseline on open-loop (point estimate) | ~45% |
+| beat it on MPC | ~28% |
+| beat it on both | ~20% |
+| beat the paper's 77.33 / 85.33 on both | ~13% |
+| **full dual gate** (both, plus >6 pt margin) | **~10%** |
 
-Revised up from ~10% by the probe: the mechanism the whole direction rests on is confirmed
-present, and it took a 10× `rho` correction rather than a change of premise. Held back from
-higher by §5c — the confirmed gap is weakest exactly on `block_angle`, the dimension PushT is
-scored on and the one the encoder represents worst (R² 0.183).
+**Revised DOWN from ~15% on 2026-08-07 by two readings of the paper's own Table 1 that should
+have been made at proposal time.**
+
+**(a) The gate asks CCR for as much as straightening itself delivered.** Target cell
+`DINOv2 patch + proj, 14x14x8`, PushT:
+
+| `L_curv` | open-loop | MPC |
+|---|---|---|
+| ✗ | 70.00 ± 1.63 | 78.67 ± 0.94 |
+| ✓ | 77.33 ± 6.18 | 85.33 ± 4.99 |
+| **delta** | **+7.33** | **+6.66** |
+
+The dual gate requires +6.0 on both. A refinement of straightening must therefore add nearly
+what straightening itself added.
+
+**(b) PushT is the cell where the conditioning mechanism appears NOT to operate.** CCR exists to
+improve *gradient* conditioning, so straightening should help GD more than CEM, which uses no
+gradients. From the appendix GD/CEM table, delta from ✗ to ✓:
+
+| env | GD | CEM |
+|---|---|---|
+| PointMaze UMaze | **+50.00** | +18.67 |
+| PointMaze Medium | **+10.67** | −6.00 |
+| Wall | +10.67 | +8.00 |
+| **PushT** | **+7.33** | **+8.67** |
+
+UMaze and Medium show a large GD-specific advantage — the conditioning story working. On PushT
+CEM gains *more* than GD, i.e. the effect is planner-agnostic there. Coherent with §5c: PushT's
+bottleneck looks like **representation quality on block orientation** (readout R² 0.183, worst of
+five, and the weakest curvature gap at every `rho`), not trajectory straightness. CCR is a pure
+conditioning intervention aimed at the cell where conditioning matters least.
+
+**What would move it back up:** PushT's GD std is 6.18, so the 1.34-point GD/CEM difference sits
+well inside its own noise. If (b) is an artifact, the mechanism argument survives and the estimate
+returns to ~15%. The paper's data cannot distinguish these.
+
+**Counter-evidence that is real and not dismissed:** the probe confirmed off-log trajectories are
+measurably more curved (5/5 dimensions at `rho=0.5`), and the pilot shows CCR is genuinely
+learnable — raw 0.339 → 0.199 while its share rose, so the encoder straightens rather than gaming
+the scale-invariance. That eliminates one of three failure modes. It establishes that CCR does
+something, not that the something is what PushT needs.
 
 Belief about the **true** effect: ~20% meaningfully positive, ~45% approximately zero,
 **~35% negative (CCR makes it worse)**. If the true effect is zero, P(observed beat) = 50%,
