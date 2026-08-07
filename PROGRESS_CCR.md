@@ -394,6 +394,66 @@ Why the second branch would matter: "better representation → better planning" 
 chain than "better conditioning → better gradient descent → better planning", and it would sidestep
 the §8(b) objection entirely, since it does not depend on PushT's conditioning being the bottleneck.
 
+## 6e. MATCHED 8k CONTROL — the decisive result. RECOMMENDATION: STOP.
+
+Control: `checkpoints_ctrl8k/test/pusht_..._lr1e-05` (legacy name, all knobs default), 8,000 steps in
+46:47 at 2.85-2.88 it/s — confirming the CCR arm's 2.4x slowdown (2.87 → 1.198). Probes
+`probe_outputs/ctrl8k.json` and `ccr_pilot8k.json`, identical flags, seed, and 64 windows.
+
+### CCR works, confirmed causally
+
+| | control @8k | CCR @8k | change |
+|---|---|---|---|
+| off-log curvature | 0.196010 | 0.032888 | **−83%** |
+| perturbation gap | 0.068658 | 0.005352 | **−92%** |
+| gate | 5/5 PASS | 1/5 | target eliminated |
+
+Matched on everything but CCR, so this is caused by the term, not by training length.
+
+### And it degrades the dimension PushT is scored on
+
+| dimension | control @8k | CCR @8k | delta |
+|---|---|---|---|
+| aggregate | 0.701269 | 0.733137 | +0.032 |
+| agent_x | 0.746992 | 0.769019 | +0.022 |
+| agent_y | 0.534881 | 0.618116 | +0.083 |
+| block_x | 0.868711 | 0.837943 | −0.031 |
+| block_y | 0.712489 | 0.741352 | +0.029 |
+| **block_angle** | **0.278188** | **0.200866** | **−0.077 (−28%)** |
+
+The §6a decider was `block_angle` against a matched control. **CCR makes it worse.**
+
+## 6f. The finding worth keeping: curvature regularization suppresses rotational state
+
+**Rotation *is* curvature.** A rotating object traces an arc in feature space; its latent velocity
+direction changes continuously by construction. `L_curv` minimizes `1 − cos(v_t, v_{t+1})`, which is
+zero only when consecutive velocities are parallel. Rotation cannot be straight, so a curvature
+penalty is in direct tension with encoding orientation.
+
+Four independent pieces of evidence:
+
+1. `block_angle` is the worst-encoded dimension in the paper's own trained model — 0.183 against
+   0.50-0.80 for the four positional dimensions — and the paper's method *is* a curvature penalty.
+2. It **degrades with training**: 0.278 @8k → 0.183 @124k in CCR-off runs. The longer the penalty is
+   applied, the more orientation information is lost.
+3. CCR, a second curvature penalty, reaches 0.201 by step 8,000 — most of the baseline's final
+   degradation, in 6.5% of the budget.
+4. Table 1's GD improvements from straightening: **+50.00** UMaze, **+10.67** Medium, **+10.67** Wall
+   — all pure-position state — versus **+7.33** PushT, the only task with rotational state and the
+   smallest gain of the four.
+
+This explains a pattern in the paper's own results that the paper does not address, and it is a
+sharper contribution than "we beat Table 1" would have been. Cost: ~24 GPU-h, not ~52.
+
+**Estimate: ~5%.** No longer inferred from the paper's numbers — measured against a matched control
+on the quantity the task is scored on. **Recommendation: do not launch the Full_Run.**
+
+### Robustness check before writing it up (~8 min, CPU)
+
+Single probes with 22 windows per per-dimension subset. Re-probe both checkpoints at
+`--num-windows 192` (subsets grow 22 → 64). If `block_angle` is still clearly lower under CCR, the
+finding holds.
+
 ## 7. Next actions, in order
 
 Common preamble for every command below:
