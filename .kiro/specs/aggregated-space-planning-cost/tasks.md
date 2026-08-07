@@ -21,12 +21,20 @@ feature (`agg_objectives.py`, `plan_agg.py`); nothing under `planning/`, nothing
    and `aggregate_results.py` would silently average seven weights into one number. Task 3.1 resolves the
    override template through Hydra compose and asserts seven distinct directories. Its own early task, its
    own gate.
-5. **The paired zero-weight check gates the sweep.** One ~15 min pod job pair: `plan.py` versus
-   `plan_agg.py --agg_weight=0` at seed 400, open-loop, identical per-episode success vectors
-   (Requirement 3.3). This is the end-to-end confirmation that the design's bitwise-zero argument survives a
-   real run.
-6. **Sweep → selection → confirmation → verdict.** 7 open-loop arms at the Tuning_Seed (~40 min) gate weight
-   selection; selection gates the 12-run confirmation (~1.5 h); confirmation gates the Acceptance_Gate.
+5. **The paired zero-weight check gates the sweep, and it is also the sweep's zero arm.** One ~15 min pod job
+   pair: `plan.py` versus `plan_agg.py --agg_weight=0` at seed 400, open-loop, identical per-episode success
+   vectors (Requirement 3.3). This is the end-to-end confirmation that the design's bitwise-zero argument
+   survives a real run. The `plan_agg.py` leg *is* the Baseline_Arm reference point the sweep curve is read
+   against (Requirement 6.3), so it is not run twice. The `plan.py` leg carries a hazard: the shipped
+   `hydra.run.dir` template carries neither seed nor weight, so without an explicit override it resolves to
+   the very directory holding the already-recorded 75.33 +/- 6.11 open-loop Platform_Baseline and would append
+   a seed-400 line, turning the Acceptance_Gate's own reference cell into a 4-seed mean. **Both** legs
+   therefore pass an explicit `hydra.run.dir`; the `plan.py` leg goes to a scratch prefix.
+6. **Sweep → selection → confirmation → verdict.** 6 non-zero open-loop arms at the Tuning_Seed (~35 min, plus
+   the zero arm already run in task 11.1, so ~40 min against Requirement 9.4) gate weight selection; selection
+   gates the 12-run confirmation (~3 h: `REPRODUCTION.md` records ~25 min per MPC seed on this eval path, and
+   task 14 runs two arms of 6 runs each); confirmation gates the Acceptance_Gate. Total GPU across the plan is
+   ~4 h.
 7. **Runs are strictly serial.** The `1g.45gb` MIG slice holds exactly one job (Requirement 9.2), so the
    dependency graph gives every arm its own wave.
 
@@ -212,7 +220,21 @@ Task labels:
     - Emit `agg_instrumentation.json` with a `headline` block for `plan_call == 0` plus every record
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
 
-  - [ ]* 5.2 [CODE] Write property test for instrumentation (`tests/test_agg_instrumentation.py`)
+  - [ ] 5.2 [CODE] Pin the step-counting scheme against the real planner (`tests/test_agg_step_counting.py`)
+    - The whole instrumentation index rests on a **read of frozen code**: `planning/gd.py` calls the objective
+      exactly once per inner iteration, `eval_every` is `-1` so the early `break` is unreachable, and nothing
+      calls the objective outside the loop. Nothing in the plan currently pins that read, and the recorder's
+      own `step` self-check cannot detect desync in the open-loop setting, where `step` is always `None`
+    - Drive the **real** `planning.gd.GDPlanner` on CPU against a stub world model and a counting objective:
+      assert the objective is invoked exactly `opt_steps` times per `plan()` call, in order, with no call
+      before the first update and none after the last, across generated `opt_steps` and horizons
+    - **Gate, deliberately not optional:** if this read is wrong the Instrumentation_Record silently
+      mislabels which optimizer step it describes, and the term-magnitude interpretation that Requirement 5
+      exists to support — and that decides whether the Sweep_Grid brackets anything useful — is read off the
+      wrong step. A frozen-code read that no test pins is the failure mode this closes
+    - _Requirements: 5.1, 5.2, 5.3_
+
+  - [ ]* 5.3 [CODE] Write property test for instrumentation (`tests/test_agg_instrumentation.py`)
     - **Property 7: Instrumentation is complete, correctly indexed, and round-trips**
     - **Validates: Requirements 5.1, 5.2, 5.3, 5.4, 5.6**
     - Includes the write/read round trip, since the sweep curve and the term-magnitude interpretation are
@@ -274,8 +296,8 @@ Task labels:
       `n_taken_actions 25`; MPC (`plan_gd_mpc`) expects `max_iter 20` and `n_taken_actions 5`. `n_evals 50`,
       `objective.mode` (`last` / `staged`), `objective.alpha 1`, `sub_planner.horizon 25`,
       `sub_planner.lr 0.1`, `sub_planner.sample_type zero`, `sub_planner.action_noise 0` and
-      `sub_planner.opt_steps 100` are common. See task 13.1 for why this per-setting reading is adopted over
-      the literal reading of Requirement 8.4
+      `sub_planner.opt_steps 100` are common. Task 13.1 settles this per-setting reading of the
+      Evaluation_Protocol **before** this task is written, which is why it sits in wave 0
     - Deviation aborts before any load, naming the field, the expected value and the resolved value
       (Requirement 8.7). All ten resolved values go into the manifest either way (Requirement 8.6), so if the
       literal reading of 8.4 turns out to be intended, the record shows exactly which two fields differ
@@ -337,15 +359,28 @@ Task labels:
 
 - [ ] 10. Checkpoint - all local code and tests green before any pod job
   - Ensure all tests pass, ask the user if questions arise.
-  - Four gates must be green before anything is launched: 1.1 (scope guard, including the `plan.py`
-    byte-freeze), 3.1 (run-directory separation), 4.2 (Property 1, bitwise zero) and 4.3 (Property 3, staged
-    coefficient equality). No pod job of any kind starts before this checkpoint.
+  - Five gates must be green before anything is launched: 1.1 (scope guard, including the `plan.py`
+    byte-freeze), 3.1 (run-directory separation), 4.2 (Property 1, bitwise zero), 4.3 (Property 3, staged
+    coefficient equality) and 5.2 (the step-counting scheme against the real `GDPlanner`). Task 13.1's
+    interpretation is settled at wave 0, before task 8.1 encodes it. No pod job of any kind starts before this
+    checkpoint.
 
-- [ ] 11. Paired zero-weight end-to-end check (gates the sweep)
+- [ ] 11. Paired zero-weight end-to-end check (gates the sweep; also the sweep's zero arm)
   - [ ] 11.1 [GPU RUN] Run `plan.py` and `plan_agg.py --agg_weight=0` at seed 400, open-loop
     - Both through the Job_Launcher (`bash run_ccr_pilot.sh eval <ckpt>`, `SETTINGS=ol SEEDS=400`), serially,
       one job at a time on the `1g.45gb` MIG slice; the second with `PLAN_ENTRY=plan_agg.py
-      "+agg_weight=0"` and the open-loop `hydra.run.dir` override. ~15 min for the pair
+      "+agg_weight=0"`. ~15 min for the pair
+    - **Both legs pass an explicit `hydra.run.dir`. This is the hazard, stated here so it is not silently
+      reintroduced:** the shipped template carries neither the seed nor the weight, so a `plan.py` leg without
+      an override resolves to the *same* directory that already holds the recorded 75.33 +/- 6.11 open-loop
+      Platform_Baseline. It would append a seed-400 line to that `logs.json` and `aggregate_results.py` would
+      turn the cell into a 4-seed mean — and that cell is the reference the entire Acceptance_Gate is measured
+      against. The `plan.py` leg therefore goes to a scratch prefix that cannot collide with any reported
+      cell, e.g. a `plan_outputs_gd/..._paircheck/` component
+    - **The `plan_agg.py` leg does NOT go to scratch.** It writes to the real `aggw0` cell from
+      `RUN_DIR_TEMPLATES`, because this leg is also the Baseline_Arm the sweep curve is read against
+      (Requirement 6.3), so it must land where task 12.7's aggregation reads it. Scratch for the frozen-entry
+      leg, the real weight-keyed cell for the wrapper leg
     - Compare the two `output_final` per-episode success vectors element for element. `plan.py` writes only a
       mean, so the comparison is against the wrapper's `agg_episode_outcomes.jsonl` on one side and the
       frozen `logs.json` success rate plus the run's own per-episode record on the other; if `plan.py`'s
@@ -353,8 +388,11 @@ Task labels:
       is what gets recorded
     - Also confirm `agg_instrumentation.json` carries a raw L_agg magnitude at both recorded steps with
       `ratio` `0.0`, which is Requirement 5.5 observed on real tensors rather than synthetic ones
+    - This job pair replaces a separate zero-weight sweep arm: the `plan_agg.py` leg is the same GPU job — 
+      `plan_agg.py` at `agg_weight=0`, seed 400, open-loop, same checkpoint — so it is run once and read twice
+      (Requirement 6.3). Not the recorded Platform_Baseline, which is a different seed set and a mean only
     - Not agent-executable: needs the pod, the dataset and the Target_Cell checkpoint
-    - _Requirements: 3.3, 5.5, 9.1, 9.2, 9.6_
+    - _Requirements: 3.3, 5.5, 6.3, 9.1, 9.2, 9.4, 9.6_
 
   - [ ] 11.2 [HUMAN] Record the paired zero-weight verdict
     - Identical per-episode vectors is the pass condition. Anything else means the bitwise-zero design does
@@ -365,86 +403,110 @@ Task labels:
       scale, which is what decides whether the Sweep_Grid brackets the useful range at all
     - _Requirements: 3.3, 5.1, 5.2, 5.3_
 
-- [ ] 12. Weight sweep on the Tuning_Seed (7 open-loop arms, strictly serial, ~40 min total)
+- [ ] 12. Weight sweep on the Tuning_Seed (6 non-zero open-loop arms, strictly serial, ~35 min total)
   - Every arm: `FOREGROUND=1 PLAN_ENTRY=plan_agg.py SETTINGS=ol SEEDS=400 bash run_ccr_pilot.sh eval "$CKPT"
     "+agg_weight=$W" "$RUNDIR"` with the open-loop `hydra.run.dir` override. Open-loop only, Tuning_Seed
     only, so the Reporting_Seeds contribute nothing to weight selection (Requirements 6.2, 6.6). One arm per
     wave: the MIG slice holds exactly one job
-  - [ ] 12.1 [GPU RUN] Baseline_Arm at the Tuning_Seed, `agg_weight=0`
-    - The same-seed reference point the sweep curve is read against (Requirement 6.3). Not the recorded
-      Platform_Baseline, which is a different seed set and a mean only
-    - _Requirements: 6.3, 9.1, 9.2, 9.4_
-
-  - [ ] 12.2 [GPU RUN] Sweep arm `agg_weight=0.01`
+  - The zero-weight arm is **not** repeated here: it is the `plan_agg.py` leg of task 11.1, the same GPU job at
+    the same seed, setting and checkpoint, writing the real `aggw0` cell (Requirement 6.3). With it the sweep
+    is 7 arms and ~40 min against Requirement 9.4
+  - [ ] 12.1 [GPU RUN] Sweep arm `agg_weight=0.01`
+    - Bottom of the accepted interval; see task 12.8 on a boundary selection
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.3 [GPU RUN] Sweep arm `agg_weight=0.03`
+  - [ ] 12.2 [GPU RUN] Sweep arm `agg_weight=0.03`
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.4 [GPU RUN] Sweep arm `agg_weight=0.1`
+  - [ ] 12.3 [GPU RUN] Sweep arm `agg_weight=0.1`
     - The paper-literal value: `tab:long_horizon` reports exactly `L_spatial + 0.1 * L_agg`. It is one arm of
       seven, not a privileged one, since the paper applies the term only at the 50-step horizon
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.5 [GPU RUN] Sweep arm `agg_weight=0.3`
+  - [ ] 12.4 [GPU RUN] Sweep arm `agg_weight=0.3`
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.6 [GPU RUN] Sweep arm `agg_weight=1`
+  - [ ] 12.5 [GPU RUN] Sweep arm `agg_weight=1`
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.7 [GPU RUN] Sweep arm `agg_weight=3`
-    - Top of the accepted interval (Requirement 3.4); `validate_agg_weight` rejects anything above it
+  - [ ] 12.6 [GPU RUN] Sweep arm `agg_weight=3`
+    - Top of the accepted interval (Requirement 3.4); `validate_agg_weight` rejects anything above it, so the
+      grid cannot be extended upward without a spec change. See task 12.8
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.8 [CPU RUN] Aggregate the sweep and select the weight
-    - `python aggregate_results.py`, then `select_agg_weight` over the seven rows. Confirm the seven arms
-      landed in seven distinct directories on disk — task 3.1 checks the template, this checks the outcome
+  - [ ] 12.7 [CPU RUN] Aggregate the sweep and select the weight
+    - `python aggregate_results.py`, then `select_agg_weight` over the seven rows — the six arms above plus the
+      `aggw0` row written by task 11.1's `plan_agg.py` leg. Confirm the seven arms landed in seven distinct
+      directories on disk — task 3.1 checks the template, this checks the outcome
     - Assemble the sweep curve: open-loop success rate at the Tuning_Seed plus the Instrumentation_Record for
       every Sweep_Grid value and for the Baseline_Arm (Requirement 6.7)
     - _Requirements: 6.4, 6.5, 6.7_
 
-  - [ ] 12.9 [HUMAN] Record the sweep curve and the selected weight
+  - [ ] 12.8 [HUMAN] Record the sweep curve, the selected weight, and any boundary selection
     - Record `W_STAR`, any tie and how it was broken (smallest tied weight), and the effective ratio
       `Agg_Weight * L_agg / L_spatial` at steps 0 and 100 for each arm. A curve that is flat within the ~5.7
       point binomial standard error at n=50 is itself a finding and belongs in the record
+    - **Boundary selection has a defined branch, decided here rather than improvised on the pod.** If
+      `select_agg_weight` returns `0.01` or `3.0`, the optimum is **unbracketed** — the sweep cannot tell an
+      interior peak from a curve still rising at the edge of the grid. The decision: record the selection *as a
+      boundary selection*, carry it into the confirmation run **as-is**, and report it as-is. Do not extend the
+      grid on the spot. Downward is outside Sweep_Grid and upward is refused by `validate_agg_weight`, which
+      rejects anything above `3` (Requirement 3.4), so **any grid extension is a spec change and requires the
+      Requirement 11.7 recorded approval before a further job is launched**
     - Note explicitly that `W_STAR` was chosen on seed 400 alone, so the confirmation run is the first time
       the Reporting_Seeds see this weight
-    - _Requirements: 6.4, 6.5, 6.6, 6.7_
+    - _Requirements: 6.4, 6.5, 6.6, 6.7, 3.4, 11.7_
 
-- [ ] 13. The Requirement 8.4 reading (interpretation, confirm before the MPC run)
+- [ ] 13. The Requirement 8.4 reading (interpretation; settle it first, at wave 0)
   - [ ] 13.1 [HUMAN] Confirm the per-setting protocol reading against `conf/plan_gd_mpc.yaml`
+    - **Sequenced at wave 0, before any code.** This is a zero-cost human judgement, and it governs the
+      per-setting expected table that task 8.1 writes at wave 6. Settling it afterwards would mean confirming
+      an interpretation the code already encodes
     - Requirement 8.4's field list — `max_iter 1`, `n_taken_actions 25`, `sub_planner.horizon 25`,
       `sub_planner.lr 0.1`, `sub_planner.sample_type zero`, `sub_planner.action_noise 0`,
-      `sub_planner.opt_steps 100` — is exactly the shipped default block of `conf/plan_gd.yaml`.
+      `sub_planner.opt_steps 100` — matches the shipped `planner` block of `conf/plan_gd.yaml` **only**.
       `conf/plan_gd_mpc.yaml`, which Requirement 8.3 mandates for the MPC setting, ships `max_iter: 20` and
       `n_taken_actions: 5` and is otherwise identical in the `sub_planner` block
     - Taken literally for MPC, 8.4 would force `max_iter 1`, which makes the MPC setting
       open-loop-with-a-staged-objective and could not reproduce the 82.00 Platform_Baseline MPC number that
-      Requirement 8's own user story exists to stay comparable with. The design therefore adopts the reading
-      "no override of any protocol field relative to the config file the setting mandates", implemented as
-      the per-setting expected table in task 8.1
+      Requirement 8's own user story exists to stay comparable with
+    - **The framing to use, corrected:** the Evaluation_Protocol is the ten-field per-setting table, which
+      *combines shipped config defaults with the overrides `run_ccr_pilot.sh` already applies*. It is **not**
+      "no override of any protocol field relative to the mandated config file" — that reading is factually
+      wrong. `conf/plan_gd.yaml` ships `objective.alpha: 0` and `conf/plan_gd_mpc.yaml` ships
+      `objective.mode: all`, while `run_ccr_pilot.sh` already overrides both to `alpha=1` and
+      `mode=last`/`staged` per Requirements 8.2 and 8.3. The protocol therefore demonstrably **does** require
+      overrides in the `objective` block; Requirement 8.4's list happens to coincide with `plan_gd.yaml`'s
+      `planner` block alone. Anywhere the old "no override relative to the mandated config file" phrasing
+      survives — here or in the design's section 7 reasoning — it is to be replaced with this framing
+    - The per-setting expected table in task 8.1 is unchanged by this correction. Only the justification changes
     - **This is an interpretation of a requirement, not an implementation detail**, which is why it is a
-      human confirmation rather than a code comment. Confirm or correct it **before** the confirmation run.
-      All ten resolved values are in every manifest, so if the literal reading is intended the record already
-      shows which two fields differ and the re-run is a two-flag change
-    - _Requirements: 8.3, 8.4, 8.6, 8.7_
+      human confirmation rather than a code comment. All ten resolved values are in every manifest, so if the
+      literal reading of 8.4 is intended the record already shows which two fields differ and the re-run is a
+      two-flag change
+    - _Requirements: 8.2, 8.3, 8.4, 8.6, 8.7_
 
-- [ ] 14. Three-seed confirmation run (12 runs, both settings, ~1.5 h, strictly serial)
+- [ ] 14. Three-seed confirmation run (12 runs, both settings, ~3 h, strictly serial)
+  - **Budget, corrected:** `REPRODUCTION.md` records ~25 min per MPC seed on this eval path, so one arm of 3
+    open-loop plus 3 MPC seeds is ~1.5 h. Task 14 runs **two** arms (14.1 baseline, 14.2 candidate), 6 runs
+    each, so the confirmation is **~3 h**, not ~1.5 h. Requirement 9.5 carries the same understatement and
+    should be read as ~3 h for the confirmation
   - Run **once**, for the selected `W_STAR` only (Requirement 7.2). Any later weight is an exploratory
     follow-up and does not replace this as the reported result (Requirement 7.5). The w=0 arm is re-run
     rather than reusing the recorded Platform_Baseline, because the recorded numbers are means and the
     Paired_Comparison needs per-episode vectors from the wrapper's own outcome file
   - [ ] 14.1 [GPU RUN] Baseline_Arm: `agg_weight=0`, seeds 100/200/300, open-loop and MPC
     - `FOREGROUND=1 PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS="100 200 300"` with the per-setting
-      `hydra.run.dir` overrides. 6 runs
+      `hydra.run.dir` overrides. 6 runs, ~1.5 h for this arm alone (3 MPC seeds at ~25 min each dominate)
     - _Requirements: 7.1, 7.4, 8.2, 8.3, 9.1, 9.2, 9.5_
 
   - [ ] 14.2 [GPU RUN] Candidate_Arm: `agg_weight=$W_STAR`, seeds 100/200/300, open-loop and MPC
-    - 6 runs, serial after 14.1. Requires task 4.3 green (Property 3) — the MPC leg runs `objective.mode=staged`,
-      and the staged coefficient reuse is only proved exact by that property — and task 13.1 confirmed
-    - The 12 runs are why the ~1.5 h budget in Requirement 9.5 is tight. **If it overruns, the overrun is
-      recorded, not traded against the protocol**: no reduction of `n_evals`, no dropped seed, no relaxed
-      planner hyperparameter
+    - 6 runs, ~1.5 h, serial after 14.1, for ~3 h across the two arms. Requires task 4.3 green (Property 3) —
+      the MPC leg runs `objective.mode=staged`, and the staged coefficient reuse is only proved exact by that
+      property — and task 13.1 confirmed
+    - The 12 runs are why Requirement 9.5's ~1.5 h figure is roughly 2x understated; read it as ~3 h. **If it
+      overruns, the overrun is recorded, not traded against the protocol**: no reduction of `n_evals`, no
+      dropped seed, no relaxed planner hyperparameter
     - _Requirements: 7.1, 7.2, 7.4, 8.1, 8.2, 8.3, 8.4, 9.5_
 
   - [ ] 14.3 [CPU RUN] Aggregate the confirmation run and compute the Paired_Comparison
@@ -487,16 +549,19 @@ Task labels:
 
 ## Notes
 
-- Tasks marked with `*` are optional and can be skipped for a faster path. **Five test tasks are deliberately
+- Tasks marked with `*` are optional and can be skipped for a faster path. **Six test tasks are deliberately
   not marked optional**, because they are gates rather than checks: 1.1 (the scope guard, including the
   `plan.py` byte-freeze, Property 9, Requirements 4.3-4.6), 3.1 (run-directory separation), 4.2 (Property 1,
   the bitwise-zero guarantee that makes the Baseline_Arm a valid control), 4.3 (Property 3, the only proof
-  that the staged coefficient reuse is exact rather than approximate) and, in the process sense, task 10's
+  that the staged coefficient reuse is exact rather than approximate), 5.2 (the step-counting scheme pinned
+  against the real `GDPlanner`, since the instrumentation index otherwise rests on an unpinned read of frozen
+  code and the recorder's own self-check is blind in open-loop) and, in the process sense, task 10's
   checkpoint. Task 6.2 (Property 11) is marked optional by format convention but is the only automated
   evidence that the `plan.PlanEvaluator` rebind is observational, so skipping it is not recommended.
 - **[CODE]** tasks are agent-executable on CPU with no GPU, dataset, checkpoint or network — the stand-in head
   and stub encoder in `tests/conftest.py` exist exactly for that, and Properties 1-8 and 10-14 all run against
-  small synthetic tensors. **[GPU RUN]**, **[CPU RUN]** and **[HUMAN]** tasks are operator or judgement work,
+  small synthetic tensors. Task 5.2 is CPU-only too: it drives the real `planning.gd.GDPlanner` against a stub
+  world model, which needs no checkpoint and no dataset. **[GPU RUN]**, **[CPU RUN]** and **[HUMAN]** tasks are operator or judgement work,
   listed for sequencing rather than agent execution.
 - `agg_objectives.py` is built across tasks 2.1, 4.1, 5.1, 6.1 and 7.1, and `plan_agg.py` across 8.1 and 8.2.
   Those tasks write the same file, so the dependency graph places each in its own wave. The property tests are
@@ -505,14 +570,23 @@ Task labels:
   **Feature: aggregated-space-planning-cost, Property N: <property text>**, minimum 100 Hypothesis examples.
   Property 1 compares raw bytes rather than using `torch.equal`, which treats `nan` as unequal to itself.
 - Serialization is real, not stylistic: the `1g.45gb` MIG slice holds one job (Requirement 9.2), so 11.1,
-  12.1-12.7, 14.1 and 14.2 each occupy their own wave.
-- Wall-clock budgets carried from Requirement 9 and the design: paired zero-weight check ~15 min; sweep ~40 min
-  across 7 arms; confirmation ~1.5 h across 12 runs. The confirmation budget is tight; an overrun is recorded,
-  not traded against the protocol.
+  12.1-12.6, 14.1 and 14.2 each occupy their own wave.
+- Wall-clock budgets, corrected against `REPRODUCTION.md`'s ~25 min per MPC seed: paired zero-weight check
+  ~15 min (its `plan_agg.py` leg doubles as the sweep's zero arm); sweep ~35 min across the 6 non-zero arms,
+  ~40 min counting the zero arm; confirmation **~3 h** across 12 runs, since task 14 runs two arms of 6 runs
+  each and one arm alone is ~1.5 h. Total GPU across the plan is **~4 h**, not ~2.5 h. Requirement 9.5's
+  ~1.5 h confirmation figure carries the same understatement and should be read as ~3 h. The budget is tight;
+  an overrun is recorded, not traded against the protocol.
+- The zero-weight GPU job exists once, in task 11.1, and is read twice: as the paired-check wrapper leg and as
+  the sweep's Baseline_Arm reference point (Requirement 6.3). Its `plan.py` counterpart is the one job in the
+  plan that must be steered into a scratch run directory, because the shipped template would otherwise append
+  a seed-400 line to the recorded Platform_Baseline cell the Acceptance_Gate is measured against.
 - Two design **decisions** rather than derivations have their own tasks so they are not lost in
   implementation: the `plan.PlanEvaluator` rebind for per-episode outcome capture (task 6.1, guarded by
-  Property 11 in task 6.2) and the Requirement 8.4 versus `conf/plan_gd_mpc.yaml` reading (task 13.1,
-  implemented as the per-setting expected table in task 8.1).
+  Property 11 in task 6.2) and the Requirement 8.4 versus `conf/plan_gd_mpc.yaml` reading (task 13.1, at
+  wave 0, implemented as the per-setting expected table in task 8.1). A third now has one too: the
+  boundary-weight branch, in task 12.8 — a selection of `0.01` or `3.0` is unbracketed, is recorded and
+  reported as such, and any grid extension needs the Requirement 11.7 recorded approval.
 - Requirements 7.2, 7.5, 9.1-9.5, 11.1, 11.6 and 11.7 are process rules recorded in the result document
   rather than automated tests. Their automatable fragments are tasks 9.2, 8.3 (Property 12) and 3.1.
 - The rejected alternatives stay rejected: no monkeypatching of `planning.objectives.create_objective_fn`
@@ -525,11 +599,11 @@ Task labels:
 ```json
 {
   "waves": [
-    { "id": 0, "tasks": ["1.1", "1.2"] },
+    { "id": 0, "tasks": ["1.1", "1.2", "13.1"] },
     { "id": 1, "tasks": ["2.1"] },
     { "id": 2, "tasks": ["2.2", "2.3", "3.1", "4.1"] },
     { "id": 3, "tasks": ["4.2", "4.3", "5.1"] },
-    { "id": 4, "tasks": ["4.4", "4.5", "4.6", "4.7", "5.2", "6.1"] },
+    { "id": 4, "tasks": ["4.4", "4.5", "4.6", "4.7", "5.2", "5.3", "6.1"] },
     { "id": 5, "tasks": ["6.2", "7.1"] },
     { "id": 6, "tasks": ["7.2", "7.3", "8.1"] },
     { "id": 7, "tasks": ["8.2", "9.1"] },
@@ -544,13 +618,11 @@ Task labels:
     { "id": 16, "tasks": ["12.6"] },
     { "id": 17, "tasks": ["12.7"] },
     { "id": 18, "tasks": ["12.8"] },
-    { "id": 19, "tasks": ["12.9"] },
-    { "id": 20, "tasks": ["13.1"] },
-    { "id": 21, "tasks": ["14.1"] },
-    { "id": 22, "tasks": ["14.2"] },
-    { "id": 23, "tasks": ["14.3"] },
-    { "id": 24, "tasks": ["15.1"] },
-    { "id": 25, "tasks": ["16.1"] }
+    { "id": 19, "tasks": ["14.1"] },
+    { "id": 20, "tasks": ["14.2"] },
+    { "id": 21, "tasks": ["14.3"] },
+    { "id": 22, "tasks": ["15.1"] },
+    { "id": 23, "tasks": ["16.1"] }
   ]
 }
 ```
