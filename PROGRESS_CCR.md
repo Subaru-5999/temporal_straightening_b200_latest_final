@@ -260,6 +260,65 @@ export DATASET_DIR=/workspace/arun/data          # run_ccr_pilot.sh dies without
 RUN_DIR=$PWD/checkpoints/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05
 ```
 
+### Step 0c — Requirement 11.7 REGRESSION REPORT (preliminary, step-200 row only)
+
+Pilot `..._cf0p04_rho0p5_srcsynthetic_mca0`, driver 4035595, launched 02:32:20 on 2026-08-07.
+
+**Three of four pilot gate checks pass.** CCR is confirmed running from the model's own gate:
+`enabled True`, `raw 0.339185`, `action_source synthetic`, `synthesized_action_frames 3`,
+`rho 0.5`, `rollout_len 5`, `grad_checkpoint True`. Shared terms match the reference at step 200
+inside `rtol=0.05` (curvature −0.0012, prediction −0.0027, decoder +0.0002), so the arm is a
+clean twin of the baseline apart from CCR. No collapse.
+
+Shares at `global_iter` 200: prediction 61.101%, curvature 29.726%, **ccr 5.322%**, decoder
+3.851%, total 0.254924. The 5.3% is *not* a miss — λ was calibrated against the
+iteration-8,000 total of 0.056171, and the total at step 200 is 4.5x that. Raw CCR is
+**0.339185** against the probe's predicted `c = 0.228644` (1.48x higher), so if raw holds the
+share at 8,000 lands near **19-20%** rather than the 14% target — above target, inside the
+`[2%, 30%]` window, no action needed.
+
+**Check 2 FAILS: 0.573 it/s against the 1.93 floor, +406% step time.**
+
+Fitting `T_step = E + n·p`, with `p` one predictor pass and `E` everything else:
+
+```
+baseline   E +  2p = 0.3925 s     (1 forward + 1 backward of predict)
+CCR L=5    E + 17p = 1.745  s     (+5 calls x 3 passes each under checkpointing)
+        -> p = 0.090 s,  E = 0.212 s
+```
+
+**One predictor forward is 0.090 s — about 30% of an entire baseline step.** The design
+asserted the encoder pass dominates and the extra predictor calls are "a small fraction" of it.
+That is wrong, and it is the *same* unquantified assumption that produced the OOM. Both
+failures come from one gap: the predictor's cost, in time and in memory, was never measured.
+`models/vit.py` runs `depth=6`, `heads=16` over `T = num_hist * num_patches = 588` tokens with
+a materialised `(b, h, T, T)` attention matrix.
+
+Projected Full_Run at 0.573 it/s: `123,858 / 0.573 = 216,157 s` = **60.0 h**, against the 17 h
+in the recorded plan.
+
+**PRELIMINARY — confirm before acting.** This is the *first* telemetry row, which includes
+dataset loading and first-iteration warmup. The reference run's own first row read 2.548 vs its
+2.862 median, i.e. ~11% depressed. Earlier in this project a 50-step smoke test at 1.890 it/s
+was misread as a real regression when the sustained rate was 2.862 — do not repeat that. Read
+the median over rows 400/600/800 before revising the compute plan.
+
+**Options, with modelled rates (pending confirmation).** All of them are decisions for the
+user, not defaults to apply:
+
+| option | rate | Full_Run | cost |
+|---|---|---|---|
+| as-is (`L=5`, checkpointing) | 0.57 | **60 h** | none, but unaffordable |
+| CCR every 4th step | ~1.37 | ~25 h | weaker effective pressure; raise λ to compensate |
+| CCR every 8th step | ~1.78 | ~19 h | weaker still |
+| CCR on 8 of 32 samples | ~1.37 | ~25 h | noisier estimate, same expectation |
+| `L=2` + checkpointing | ~1.07 | ~32 h | loses the horizon argument, and is the `logged` control |
+| `models/vit.py` -> SDPA | fast | ~12-15 h | **out of scope**, changes baseline numerics, invalidates the 12 h baseline train and its measured 75.33/82.00 |
+
+Note the 1.93 it/s floor was itself derived from a wrong cost model: no configuration that adds
+five predictor rollouts can clear a 50%-step-time bound. The floor is doing its job as an alarm,
+but it was never an achievable target for this term.
+
 ### Step 0b — the relaunched pilot OOM'd; fixed with gradient checkpointing
 
 `torch.OutOfMemoryError` inside `F.softmax` in the predictor's attention, ~2 min into the run.
