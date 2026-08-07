@@ -19,6 +19,13 @@
 #   CKPT_BASE=$PWD/checkpoints_cf03 bash run_ccr_pilot.sh pilot training.lambda_cf=0.3
 #   # single-seed triage eval (task 16.1)
 #   SEEDS=100 bash run_ccr_pilot.sh eval checkpoints/test/<run_name>
+#   # aggregated-space sweep arm, open-loop only, held-out tuning seed
+#   PLAN_ENTRY=plan_agg.py SETTINGS=ol SEEDS=400 HYDRA_RUN_DIR=agg \
+#     bash run_ccr_pilot.sh eval checkpoints/test/<run_name> '+agg_weight=0.1'
+#   # the paired zero-weight plan.py leg, steered away from the recorded baseline cell
+#   SETTINGS=ol SEEDS=400 \
+#     HYDRA_RUN_DIR='plan_outputs_gd_scratch/${replace_slash:${model_name}}_seed${seed}' \
+#     bash run_ccr_pilot.sh eval checkpoints/test/<run_name>
 #
 # Environment overrides
 #   DATASET_DIR     REQUIRED. Taken from the environment; unset is a hard error.
@@ -26,6 +33,19 @@
 #   CKPT_BASE       ckpt_base_path          (default $PWD/checkpoints).
 #   SEEDS           eval data seeds, space separated (default "100 200 300").
 #   MODEL_EPOCH     eval checkpoint epoch   (default latest).
+#   PLAN_ENTRY      eval entry script       (default plan.py). plan_agg.py runs the
+#                   aggregated-space objective L_plan = L_spatial + w * L_agg; pass its
+#                   weight as a normal override, e.g. '+agg_weight=0.1'.
+#   SETTINGS        which eval loops run: ol | mpc | both (default both).
+#   HYDRA_RUN_DIR   run-directory control for eval jobs. Unset (default) passes no
+#                   override at all, so the shipped conf/plan_gd*.yaml expression decides
+#                   and the CCR eval path is unchanged. "agg" resolves the per-setting
+#                   template from agg_objectives.RUN_DIR_TEMPLATES, which is what keeps
+#                   each sweep weight in its own logs.json. Any other value is used
+#                   verbatim, for steering a leg into a scratch tree. Quote it in SINGLE
+#                   quotes: a Hydra interpolation left unquoted is expanded by bash, to
+#                   nothing, and the run lands in a truncated directory that
+#                   aggregate_results.py parses as some other cell.
 #   LOG / PIDFILE   log and pid file paths  (default ccr_<mode>_<timestamp>.log/.pid).
 #   CHAIN_ON_PID    wait for this DRIVER pid to exit before launching (see below).
 #   FOREGROUND=1    do not detach; run in this shell (debugging).
@@ -50,7 +70,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 
 # A live train.py / plan.py / probe_*.py python process.  The leading [p] keeps a
-# stale `grep` line in the snapshot from matching itself.
+# stale `grep` line in the snapshot from matching itself.  The trailing
+# [A-Za-z0-9_]* is what makes the guard cover plan_agg.py as well, so a PLAN_ENTRY
+# job holds the slice against the next launch exactly as a plan.py job does.
 JOB_PATTERN='[p]ython[0-9.]*[[:space:]]+(-[^[:space:]]+[[:space:]]+)*(train|plan|probe)[A-Za-z0-9_]*\.py'
 # A STOPPED python (stat T / Tl): it still owns its CUDA context and its GPU
 # memory.  This is how 41.5 GB of the slice leaked once (AGENT_MEMORY_2.0 §2.9).
@@ -62,6 +84,65 @@ usage() {
 }
 
 die() { echo "ERROR: $*" >&2; exit 2; }
+
+# ---------------------------------------------------------------------------
+# Eval entry point and setting selection.
+#
+# Both hooks default to exactly what this launcher already did — plan.py, both settings,
+# no run-directory override — so the CCR evaluation path is unchanged.  plan_agg.py is
+# the aggregated-space wrapper (L_plan = L_spatial + w * L_agg); it takes the same Hydra
+# config names and overrides plan.py takes, plus '+agg_weight=<w>'.
+#
+# Read from the environment here, at the top of the script, so the detached driver — which
+# re-execs this same file — resolves them from the environment it inherited rather than
+# from a value the foreground shell had to pass along.
+# ---------------------------------------------------------------------------
+PLAN_ENTRY="${PLAN_ENTRY:-plan.py}"
+SETTINGS="${SETTINGS:-both}"
+
+# True when SETTINGS selects the named eval loop, "ol" or "mpc".
+setting_selected() {
+  [[ "$SETTINGS" == "both" || "$SETTINGS" == "$1" ]]
+}
+
+validate_eval_hooks() {
+  case "$SETTINGS" in
+    ol|mpc|both) ;;
+    *) die "SETTINGS='${SETTINGS}' is not one of: ol | mpc | both." ;;
+  esac
+  [[ -f "$PLAN_ENTRY" ]] || die "PLAN_ENTRY='${PLAN_ENTRY}' is not a file in ${PWD}.
+       The entry script is resolved relative to the directory the jobs run in, which is
+       this launcher's cwd."
+}
+
+# One eval job's run directory, appended as a Hydra override only when HYDRA_RUN_DIR asks
+# for it — unset means no override at all, which is what keeps the CCR path byte-identical.
+#
+# "agg" resolves the PER-SETTING template through agg_objectives.run_dir_override(), so the
+# open-loop leg lands under plan_outputs_gd and the MPC leg under plan_outputs_gd_mpc; one
+# string for both settings would put MPC results in the open-loop tree.  The template text
+# is never retyped here: agg_objectives.RUN_DIR_TEMPLATES is the single source of truth, and
+# a drifted copy would resolve to a directory aggregate_results.py parses as some other cell.
+#
+# The resolved value is captured into a variable and passed quoted, so bash performs no
+# expansion on the Hydra interpolations it contains (an expanded one arrives empty, silently
+# truncating the directory).
+add_run_dir_default() {
+  local config_name="$1" value="${HYDRA_RUN_DIR:-}" token
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+  if [[ "$value" == "agg" ]]; then
+    token="$(python -c 'import sys, agg_objectives; print(agg_objectives.run_dir_override(sys.argv[1]))' \
+      "$config_name")" || die "HYDRA_RUN_DIR=agg: could not resolve the run-directory template for
+       config name '${config_name}'. agg_objectives.py must be importable from ${PWD}."
+    [[ -n "$token" ]] || \
+      die "HYDRA_RUN_DIR=agg: agg_objectives.run_dir_override('${config_name}') printed nothing."
+    add_default "$token"
+  else
+    add_default "hydra.run.dir=$value"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Blackwell / MIG environment recipe (Requirement 9.1-9.4).
@@ -305,41 +386,52 @@ run_job() {
 # One job at a time, in this one process, in this one session (Requirement 9.7).
 run_eval_jobs() {
   local run_dir="$1" name seeds s
+  validate_eval_hooks
   run_dir="$(readlink -f "$run_dir")"
   [[ -f "${run_dir}/hydra.yaml" ]] || \
     die "${run_dir}/hydra.yaml not found. Pass the run dir that holds hydra.yaml + checkpoints/."
   name="$(basename "$run_dir")"
   read -r -a seeds <<<"${SEEDS:-100 200 300}"
 
+  echo "eval entry     = ${PLAN_ENTRY}"
+  echo "settings       = ${SETTINGS}"
+  echo "hydra run dir  = ${HYDRA_RUN_DIR:-<shipped conf template, no override>}"
+
   # Evaluation_Protocol, unmodified: 50 samples per data seed, seeds 100/200/300,
   # open-loop mode=last alpha=1, MPC mode=staged alpha=1.  decode_for_viz=false
   # does not touch success_rate (computed from env state) and keeps MPC's growing
   # rollout from pressuring the MIG allocator.
-  for s in "${seeds[@]}"; do
-    CMD=(python plan.py --config-name plan_gd.yaml)
-    add_default "ckpt_base_path=${run_dir}"
-    add_default "model_name=${name}"
-    add_default "model_epoch=${MODEL_EPOCH:-latest}"
-    add_default decode_for_viz=false
-    add_default objective.alpha=1
-    add_default objective.mode=last
-    add_default "seed=${s}"
-    CMD+=(${USER_ARGS[@]+"${USER_ARGS[@]}"})
-    run_job "OPEN-LOOP seed=${s}  ${name}" "${CMD[@]}"
-  done
+  if setting_selected ol; then
+    for s in "${seeds[@]}"; do
+      CMD=(python "$PLAN_ENTRY" --config-name plan_gd.yaml)
+      add_default "ckpt_base_path=${run_dir}"
+      add_default "model_name=${name}"
+      add_default "model_epoch=${MODEL_EPOCH:-latest}"
+      add_default decode_for_viz=false
+      add_default objective.alpha=1
+      add_default objective.mode=last
+      add_default "seed=${s}"
+      add_run_dir_default plan_gd
+      CMD+=(${USER_ARGS[@]+"${USER_ARGS[@]}"})
+      run_job "OPEN-LOOP seed=${s}  ${name}" "${CMD[@]}"
+    done
+  fi
 
-  for s in "${seeds[@]}"; do
-    CMD=(python plan.py --config-name plan_gd_mpc.yaml)
-    add_default "ckpt_base_path=${run_dir}"
-    add_default "model_name=${name}"
-    add_default "model_epoch=${MODEL_EPOCH:-latest}"
-    add_default decode_for_viz=false
-    add_default objective.alpha=1
-    add_default objective.mode=staged
-    add_default "seed=${s}"
-    CMD+=(${USER_ARGS[@]+"${USER_ARGS[@]}"})
-    run_job "MPC seed=${s}  ${name}" "${CMD[@]}"
-  done
+  if setting_selected mpc; then
+    for s in "${seeds[@]}"; do
+      CMD=(python "$PLAN_ENTRY" --config-name plan_gd_mpc.yaml)
+      add_default "ckpt_base_path=${run_dir}"
+      add_default "model_name=${name}"
+      add_default "model_epoch=${MODEL_EPOCH:-latest}"
+      add_default decode_for_viz=false
+      add_default objective.alpha=1
+      add_default objective.mode=staged
+      add_default "seed=${s}"
+      add_run_dir_default plan_gd_mpc
+      CMD+=(${USER_ARGS[@]+"${USER_ARGS[@]}"})
+      run_job "MPC seed=${s}  ${name}" "${CMD[@]}"
+    done
+  fi
 
   echo
   echo "Binomial SE at n=50 near p=0.8 is ~5.7 percentage points (Requirement 10.4);"
@@ -515,6 +607,11 @@ main() {
   done
   if [[ "$mode" == "eval" && -z "$run_dir" ]]; then
     die "eval needs a run dir: bash run_ccr_pilot.sh eval <run_dir> [overrides...]"
+  fi
+  # Fail on a typo'd PLAN_ENTRY / SETTINGS here, in the foreground, rather than in a line
+  # buried in a detached log; run_eval_jobs re-checks inside the driver.
+  if [[ "$mode" == "eval" ]]; then
+    validate_eval_hooks
   fi
 
   export CCR_LOG="${LOG:-ccr_${mode}_$(date +%Y%m%d_%H%M%S).log}"

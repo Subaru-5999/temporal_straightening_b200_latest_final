@@ -517,3 +517,451 @@ def target_cell_model():
 def target_cell_batch(target_cell_model):
     """The batch that goes with :func:`target_cell_model`: ``num_frames = num_hist + num_pred``."""
     return make_stub_batch(target_cell_model, batch_size=2, num_frames=4)
+
+# ===========================================================================
+# Aggregated-space planning cost: test doubles, strategies and fixtures
+#
+# Feature: aggregated-space-planning-cost (task 1.2). Strictly ADDITIVE — every
+# name above this banner keeps its identity and its value, because the CCR
+# property tests depend on them.
+#
+# Everything here is CPU float32 and tiny. The stand-in Agg_Head mirrors
+# ``models/dino.py::DinoV2Encoder.agg``'s ``mlp`` branch exactly
+# (``x.contiguous().view(x.shape[0], -1)`` -> ``agg_mlp`` -> ``agg_post_norm``)
+# but with parameterised widths, so a property that passes here is a statement
+# about the real head's shape contract rather than about a 1568-wide fiction.
+#
+# Requirements: 1.1, 1.3, 1.8, 2.4
+# ===========================================================================
+
+# Target_Cell widths, recorded so tests can assert against them without
+# building a ~1M-parameter head. `DinoV2Encoder` hardcodes 196 patches in
+# `_agg_mlp_in_dim = 196 * emb_dim`; conf/encoder/dino_channel.yaml sets
+# emb_dim 8 via the channel projector, agg_out_dim 128, agg_mlp_hidden_dim 512.
+AGG_TARGET_CELL_PATCHES = 196
+AGG_TARGET_CELL_CHANNELS = 8
+AGG_TARGET_CELL_IN_DIM = AGG_TARGET_CELL_PATCHES * AGG_TARGET_CELL_CHANNELS  # 1568
+AGG_TARGET_CELL_HIDDEN_DIM = 512
+AGG_TARGET_CELL_OUT_DIM = 128
+
+# Defaults for the stand-in head: small on purpose, so 100 hypothesis examples
+# stay fast. `in_dim` is a product of a patch count and a channel width, which
+# is the invariant `_apply_head` checks (Requirement 1.9).
+AGG_DEFAULT_PATCHES = 4
+AGG_DEFAULT_CHANNELS = 3
+AGG_DEFAULT_IN_DIM = AGG_DEFAULT_PATCHES * AGG_DEFAULT_CHANNELS  # 12
+AGG_DEFAULT_HIDDEN_DIM = 8
+AGG_DEFAULT_OUT_DIM = 5
+
+
+class AggMlpHead(nn.Module):
+    """Stand-in Agg_Head: the ``mlp`` branch of :meth:`models.dino.DinoV2Encoder.agg`.
+
+    Accepts ``(n, patches, channels)`` — the shape ``_apply_head`` hands over after
+    reshaping ``(b, t, p, d)`` to ``(b * t, p, d)`` — and flattens it with the real
+    encoder's own ``x.contiguous().view(x.shape[0], -1)``. Already-flat
+    ``(n, in_dim)`` input is accepted too, since that view is idempotent.
+
+    Three views of the same parameters are exposed on purpose:
+
+    - ``net``: the flat 6-element ``nn.Sequential(Linear, ReLU, Linear, ReLU,
+      Linear, LayerNorm)`` — the composed form ``extract_agg_head`` returns.
+    - ``agg_mlp`` / ``agg_post_norm``: the checkpoint-shaped pair, named exactly as
+      the real encoder names them.
+
+    ``net`` holds the *same* module objects as ``agg_mlp`` and ``agg_post_norm``, so
+    ``parameters()`` (which dedupes by identity) reports each tensor once.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = AGG_DEFAULT_IN_DIM,
+        hidden_dim: int = AGG_DEFAULT_HIDDEN_DIM,
+        out_dim: int = AGG_DEFAULT_OUT_DIM,
+    ):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        self.agg_type = "mlp"
+
+        self.agg_mlp = nn.Sequential(
+            nn.Linear(self.in_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+        self.agg_post_norm = nn.LayerNorm(self.out_dim)
+        self.net = nn.Sequential(*self.agg_mlp, self.agg_post_norm)
+
+    def forward(self, x):
+        x = x.contiguous().view(x.shape[0], -1)
+        return self.net(x)
+
+
+class IdentityAggHead(nn.Module):
+    """Identity-on-flattened-features Agg_Head variant, which Property 3 needs.
+
+    ``(n, patches, channels) -> (n, patches * channels)`` and nothing else: the
+    same ``x.contiguous().view(x.shape[0], -1)`` the real ``agg`` performs, with the
+    MLP and the LayerNorm removed. With this head and ``alpha = 0`` the
+    aggregated-space loss must equal the frozen ``planning.objectives`` value for the
+    same mode, ``base`` and ``step``, because a mean over ``p * d`` flattened features
+    is the same reduction as a mean over the ``(p, d)`` axes.
+
+    Parameter-free, so ``requires_grad_(False)``, ``eval()`` and ``to(...)`` are all
+    no-ops that still work, and gradients pass straight through to the input.
+    """
+
+    def __init__(self, in_dim: int | None = None):
+        super().__init__()
+        self.in_dim = None if in_dim is None else int(in_dim)
+        self.out_dim = self.in_dim
+        self.agg_type = "flatten"
+
+    def forward(self, x):
+        return x.contiguous().view(x.shape[0], -1)
+
+
+class StubAggEncoder(nn.Module):
+    """Encoder stand-in for :func:`agg_objectives.extract_agg_head`, no checkpoint on disk.
+
+    Exposes exactly the five attributes the extractor reads — ``agg_type``,
+    ``agg_mlp``, ``agg_post_norm``, ``_agg_mlp_in_dim``, ``_agg_out_dim`` — and, like
+    the real :class:`models.dino.DinoV2Encoder`, builds ``agg_mlp`` / ``agg_post_norm``
+    **only** when ``agg_type == "mlp"``. Any other ``agg_type`` therefore reproduces
+    the checkpoint the wrapper has to abort on (Requirement 2.6), including the
+    missing-attribute shape of it.
+    """
+
+    def __init__(
+        self,
+        agg_type: str = "mlp",
+        num_patches: int = AGG_DEFAULT_PATCHES,
+        emb_dim: int = AGG_DEFAULT_CHANNELS,
+        agg_out_dim: int | None = AGG_DEFAULT_OUT_DIM,
+        agg_mlp_hidden_dim: int | None = AGG_DEFAULT_HIDDEN_DIM,
+    ):
+        super().__init__()
+        self.name = "tiny"
+        self.agg_type = agg_type
+        self.num_patches = int(num_patches)
+        self.emb_dim = int(emb_dim)
+        self.agg_out_dim = agg_out_dim
+        self.agg_mlp_hidden_dim = agg_mlp_hidden_dim
+        self.latent_ndim = 2
+        self.feature_key = "x_norm_patchtokens"
+
+        if self.agg_type == "mlp":
+            self._agg_mlp_in_dim = self.num_patches * self.emb_dim
+            self._agg_out_dim = (
+                int(self.agg_out_dim) if self.agg_out_dim is not None else int(self.emb_dim)
+            )
+            self._agg_mlp_hidden_dim = (
+                int(self.agg_mlp_hidden_dim)
+                if self.agg_mlp_hidden_dim is not None
+                else 4 * self._agg_out_dim
+            )
+            head = AggMlpHead(
+                in_dim=self._agg_mlp_in_dim,
+                hidden_dim=self._agg_mlp_hidden_dim,
+                out_dim=self._agg_out_dim,
+            )
+            self.agg_mlp = head.agg_mlp
+            self.agg_post_norm = head.agg_post_norm
+
+    def agg(self, x):
+        """Same ``mean | flatten | mlp`` contract as :meth:`models.dino.DinoV2Encoder.agg`."""
+        if self.agg_type == "mean":
+            return x.mean(dim=1)
+        x = x.contiguous().view(x.shape[0], -1)
+        if self.agg_type == "flatten":
+            return x
+        if self.agg_type == "mlp":
+            return self.agg_post_norm(self.agg_mlp(x))
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Builders
+# ---------------------------------------------------------------------------
+
+
+def make_agg_head(
+    *,
+    in_dim: int = AGG_DEFAULT_IN_DIM,
+    hidden_dim: int = AGG_DEFAULT_HIDDEN_DIM,
+    out_dim: int = AGG_DEFAULT_OUT_DIM,
+    seed: int = 0,
+) -> AggMlpHead:
+    """Deterministic stand-in Agg_Head on CPU in float32.
+
+    Two calls with the same arguments give bitwise-identical parameters, which is
+    what Property 5's before/after byte comparison rests on.
+    """
+    seed_all(seed)
+    head = AggMlpHead(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim)
+    return head.to(device="cpu", dtype=torch.float32)
+
+
+def make_identity_agg_head(*, in_dim: int | None = None) -> IdentityAggHead:
+    """The identity-on-flattened-features head variant (Property 3)."""
+    return IdentityAggHead(in_dim=in_dim)
+
+
+def make_stub_agg_encoder(
+    *,
+    agg_type: str = "mlp",
+    num_patches: int = AGG_DEFAULT_PATCHES,
+    emb_dim: int = AGG_DEFAULT_CHANNELS,
+    agg_out_dim: int | None = AGG_DEFAULT_OUT_DIM,
+    agg_mlp_hidden_dim: int | None = AGG_DEFAULT_HIDDEN_DIM,
+    seed: int = 0,
+) -> StubAggEncoder:
+    """Deterministic :class:`StubAggEncoder` for ``extract_agg_head`` tests."""
+    seed_all(seed)
+    encoder = StubAggEncoder(
+        agg_type=agg_type,
+        num_patches=num_patches,
+        emb_dim=emb_dim,
+        agg_out_dim=agg_out_dim,
+        agg_mlp_hidden_dim=agg_mlp_hidden_dim,
+    )
+    return encoder.to(device="cpu", dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis strategies (aggregated-space)
+# ---------------------------------------------------------------------------
+
+AGG_MODES = ("last", "all", "staged")
+
+# Non-finite and denormal float32 values. Property 1 asserts that Agg_Weight 0 is a
+# *bitwise* identity even when L_agg is inf or nan, so the strategy has to actually
+# generate those rather than merely permit them. The denormals sit below float32's
+# smallest normal (1.1754944e-38) and survive the cast into a float32 tensor.
+AGG_NONFINITE_VALUES = (float("inf"), float("-inf"), float("nan"))
+AGG_DENORMAL_VALUES = (1.4e-45, -1.4e-45, 5.9e-44, -5.9e-44, 5.9e-39, -5.9e-39)
+AGG_SPECIAL_VALUES = AGG_NONFINITE_VALUES + AGG_DENORMAL_VALUES
+
+AGG_MIN_BATCH, AGG_MAX_BATCH = 1, 4
+AGG_MIN_FRAMES, AGG_MAX_FRAMES = 2, 6
+AGG_MIN_PATCHES, AGG_MAX_PATCHES = 1, 6
+AGG_MIN_CHANNELS, AGG_MAX_CHANNELS = 1, 6
+
+agg_batch_size_strategy = st.integers(min_value=AGG_MIN_BATCH, max_value=AGG_MAX_BATCH)
+agg_num_frames_strategy = st.integers(min_value=AGG_MIN_FRAMES, max_value=AGG_MAX_FRAMES)
+agg_patch_count_strategy = st.integers(min_value=AGG_MIN_PATCHES, max_value=AGG_MAX_PATCHES)
+agg_channel_width_strategy = st.integers(min_value=AGG_MIN_CHANNELS, max_value=AGG_MAX_CHANNELS)
+agg_proprio_dim_strategy = st.integers(min_value=1, max_value=3)
+agg_hidden_dim_strategy = st.integers(min_value=2, max_value=8)
+agg_out_dim_strategy = st.integers(min_value=1, max_value=6)
+
+agg_mode_strategy = st.sampled_from(AGG_MODES)
+
+# alpha and agg_weight both include exactly 0: alpha=0 is what pins the proprio term
+# of L_agg to nothing (design section 2), and agg_weight=0 is the Baseline_Arm, so
+# both are the values most worth hitting and plain float ranges hit them rarely.
+agg_alpha_strategy = st.one_of(
+    st.just(0.0),
+    st.floats(min_value=0.0, max_value=2.0, allow_nan=False, allow_infinity=False),
+)
+agg_weight_strategy = st.one_of(
+    st.just(0.0),
+    st.floats(min_value=0.0, max_value=3.0, allow_nan=False, allow_infinity=False),
+)
+positive_agg_weight_strategy = st.floats(
+    min_value=1e-3, max_value=3.0, allow_nan=False, allow_infinity=False
+)
+
+# `base` feeds `coeffs = [base ** i for i in range(T)]` in the frozen objective, so
+# both the integer values the configs ship and arbitrary floats in range are drawn.
+agg_base_strategy = st.one_of(
+    st.sampled_from((1, 2, 3, 4)),
+    st.floats(min_value=1.0, max_value=4.0, allow_nan=False, allow_infinity=False),
+)
+
+agg_nonfinite_value_strategy = st.sampled_from(AGG_SPECIAL_VALUES)
+
+
+def agg_step_strategy(num_frames: int | None = None):
+    """``step`` as the frozen objective receives it: ``None``, or ``0 .. T``.
+
+    ``None`` is what open-loop (`last` mode) passes and what ``objective_fn_staged``
+    treats as "no stage information". The upper bound is ``T`` rather than ``T - 1``
+    so the staged dispatch predicate ``step < T - 1`` is exercised on both sides.
+    """
+    upper = AGG_MAX_FRAMES if num_frames is None else int(num_frames)
+    return st.one_of(st.none(), st.integers(min_value=0, max_value=upper))
+
+
+@st.composite
+def agg_tensors(draw, shape, *, nonfinite: bool = False, max_injections: int = 4):
+    """A CPU float32 tensor of ``shape``, optionally seeded with non-finite values.
+
+    Values come from a torch generator seeded by a drawn integer rather than from a
+    drawn list of floats: the shapes here reach a few hundred elements, and drawing
+    them elementwise would dominate the runtime of every property. Specials are then
+    written into drawn positions, so ``inf``, ``-inf``, ``nan`` and denormals appear
+    inside otherwise ordinary tensors, which is the case that matters.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(draw(st.integers(0, 2**31 - 1)))
+    tensor = torch.randn(tuple(int(s) for s in shape), generator=gen, dtype=torch.float32)
+    if nonfinite:
+        flat = tensor.view(-1)
+        n = flat.numel()
+        count = draw(st.integers(min_value=1, max_value=min(max_injections, n)))
+        for _ in range(count):
+            flat[draw(st.integers(min_value=0, max_value=n - 1))] = draw(
+                agg_nonfinite_value_strategy
+            )
+    return tensor
+
+
+@dataclass
+class AggLatents:
+    """A generated ``(z_obs_pred, z_obs_tgt)`` pair plus the shapes that produced it.
+
+    ``visual`` is ``(b, T, p, d)`` for the prediction and ``(b, 1, p, d)`` for the goal,
+    which is what ``wm.rollout`` and ``encode_obs`` hand the objective; ``in_dim`` is
+    the ``p * d`` width the head must accept (Requirement 1.9).
+    """
+
+    z_pred: dict
+    z_tgt: dict
+    batch_size: int
+    num_frames: int
+    patches: int
+    channels: int
+    proprio_dim: int
+
+    @property
+    def in_dim(self) -> int:
+        return self.patches * self.channels
+
+
+@st.composite
+def agg_latent_dicts(
+    draw,
+    *,
+    batch_size: int | None = None,
+    num_frames: int | None = None,
+    patches: int | None = None,
+    channels: int | None = None,
+    proprio_dim: int | None = None,
+    nonfinite: bool = False,
+) -> AggLatents:
+    """Latent dictionaries in the shapes the planning objective is called with.
+
+    Any dimension can be pinned by the caller; the rest are drawn. ``nonfinite=True``
+    routes both visual tensors through the special-value strategy, which is what
+    Property 1 needs.
+    """
+    b = draw(agg_batch_size_strategy) if batch_size is None else int(batch_size)
+    t = draw(agg_num_frames_strategy) if num_frames is None else int(num_frames)
+    p = draw(agg_patch_count_strategy) if patches is None else int(patches)
+    d = draw(agg_channel_width_strategy) if channels is None else int(channels)
+    pdim = draw(agg_proprio_dim_strategy) if proprio_dim is None else int(proprio_dim)
+
+    z_pred = {
+        "visual": draw(agg_tensors((b, t, p, d), nonfinite=nonfinite)),
+        "proprio": draw(agg_tensors((b, t, pdim), nonfinite=nonfinite)),
+    }
+    z_tgt = {
+        "visual": draw(agg_tensors((b, 1, p, d), nonfinite=nonfinite)),
+        "proprio": draw(agg_tensors((b, 1, pdim), nonfinite=nonfinite)),
+    }
+    event(f"agg latents: T={t}, p={p}, d={d}, nonfinite={nonfinite}")
+    return AggLatents(
+        z_pred=z_pred,
+        z_tgt=z_tgt,
+        batch_size=b,
+        num_frames=t,
+        patches=p,
+        channels=d,
+        proprio_dim=pdim,
+    )
+
+
+@dataclass
+class AggShapeMismatch:
+    """A deliberately mismatched ``(patches, channels)`` against a head width (Property 6)."""
+
+    patches: int
+    channels: int
+    in_dim: int
+
+    @property
+    def flattened(self) -> int:
+        return self.patches * self.channels
+
+
+@st.composite
+def agg_mismatched_shapes(draw) -> AggShapeMismatch:
+    """``p * d != in_dim``, so ``_apply_head`` must raise before ``nn.Linear`` does."""
+    p = draw(agg_patch_count_strategy)
+    d = draw(agg_channel_width_strategy)
+    in_dim = draw(st.integers(min_value=1, max_value=AGG_MAX_PATCHES * AGG_MAX_CHANNELS))
+    assume(p * d != in_dim)
+    return AggShapeMismatch(patches=p, channels=d, in_dim=in_dim)
+
+
+@st.composite
+def agg_head_shapes(draw):
+    """A jointly generated ``(patches, channels, hidden_dim, out_dim)`` for a matching head.
+
+    Drawn together so ``in_dim == patches * channels`` holds by construction: that is
+    the one relation between the latent shape and the head that has to be right for
+    ``_apply_head`` to accept the input at all.
+    """
+    p = draw(agg_patch_count_strategy)
+    d = draw(agg_channel_width_strategy)
+    return {
+        "patches": p,
+        "channels": d,
+        "in_dim": p * d,
+        "hidden_dim": draw(agg_hidden_dim_strategy),
+        "out_dim": draw(agg_out_dim_strategy),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fixtures (aggregated-space)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_head():
+    """Factory fixture wrapping :func:`make_agg_head`."""
+    return make_agg_head
+
+
+@pytest.fixture
+def make_identity_head():
+    """Factory fixture wrapping :func:`make_identity_agg_head`."""
+    return make_identity_agg_head
+
+
+@pytest.fixture
+def make_agg_encoder():
+    """Factory fixture wrapping :func:`make_stub_agg_encoder`."""
+    return make_stub_agg_encoder
+
+
+@pytest.fixture
+def agg_head():
+    """The default small stand-in Agg_Head: ``12 -> 8 -> 8 -> 5`` plus ``LayerNorm(5)``."""
+    return make_agg_head()
+
+
+@pytest.fixture
+def identity_agg_head():
+    """The identity-on-flattened-features head variant."""
+    return make_identity_agg_head(in_dim=AGG_DEFAULT_IN_DIM)
+
+
+@pytest.fixture
+def stub_agg_encoder():
+    """A stub encoder carrying an ``agg_type == "mlp"`` head, for ``extract_agg_head``."""
+    return make_stub_agg_encoder()

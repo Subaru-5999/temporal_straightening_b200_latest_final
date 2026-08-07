@@ -46,8 +46,8 @@ Task labels:
 
 ## Tasks
 
-- [ ] 1. Scope containment and the frozen-source gate
-  - [ ] 1.1 [CODE] Extend `tests/test_scope_guard.py` for this feature
+- [x] 1. Scope containment and the frozen-source gate
+  - [x] 1.1 [CODE] Extend `tests/test_scope_guard.py` for this feature
     - Add exactly two entries to `ALLOWED_FILES`: `agg_objectives.py` and `plan_agg.py`. `tests/` and
       `.kiro/specs/` are already covered by `ALLOWED_PREFIXES` and `run_ccr_pilot.sh` is already an
       allowlist member, so this feature adds no other entry (Requirement 4.5)
@@ -70,7 +70,7 @@ Task labels:
       never reports a violation this feature did not cause
     - _Requirements: 4.3, 4.4, 4.5, 4.6_
 
-  - [ ] 1.2 [CODE] Extend `tests/conftest.py` with the aggregated-space test doubles
+  - [x] 1.2 [CODE] Extend `tests/conftest.py` with the aggregated-space test doubles
     - Stand-in Agg_Head as `nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden),
       nn.ReLU(), nn.Linear(hidden, out_dim), nn.LayerNorm(out_dim))` mirroring `DinoV2Encoder.agg`'s `mlp`
       branch, plus an **identity-on-flattened-features** head variant, which Property 3 needs
@@ -84,8 +84,8 @@ Task labels:
       only: the existing CCR fixtures keep their current names and values
     - _Requirements: 1.1, 1.3, 1.8, 2.4_
 
-- [ ] 2. `agg_objectives.py` foundations: constants, weight validation, head access
-  - [ ] 2.1 [CODE] Create `agg_objectives.py` with the constants, the holder, and the head plumbing
+- [x] 2. `agg_objectives.py` foundations: constants, weight validation, head access
+  - [x] 2.1 [CODE] Create `agg_objectives.py` with the constants, the holder, and the head plumbing
     - Constants: `SWEEP_GRID = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0)`, `TUNING_SEED = 400`,
       `REPORTING_SEEDS = (100, 200, 300)`, `AGG_WEIGHT_MAX = 3.0`, and `RUN_DIR_TEMPLATES`, a dict keyed by
       config name (`plan_gd`, `plan_gd_mpc`) holding the `hydra.run.dir` override strings that substitute
@@ -117,8 +117,8 @@ Task labels:
     - **Property 6: Shape mismatches are reported with both shapes**
     - **Validates: Requirements 1.9**
 
-- [ ] 3. Run-directory separation (early gate, no GPU)
-  - [ ] 3.1 [CODE] Write the run-directory separation check (`tests/test_agg_run_dir_separation.py`)
+- [x] 3. Run-directory separation (early gate, no GPU)
+  - [x] 3.1 [CODE] Write the run-directory separation check (`tests/test_agg_run_dir_separation.py`)
     - Resolve each `RUN_DIR_TEMPLATES` entry through Hydra `compose` against `conf/plan_gd.yaml` and
       `conf/plan_gd_mpc.yaml` (importing `custom_resolvers` so `replace_slash` is registered), once per
       weight in `(0,) + SWEEP_GRID`, and assert the seven resolved directories are **pairwise distinct**
@@ -135,8 +135,8 @@ Task labels:
       there is no reason to discover it on the pod
     - _Requirements: 2.7, 6.7, 7.3_
 
-- [ ] 4. The combined objective `L_plan = L_spatial + w * L_agg`
-  - [ ] 4.1 [CODE] Implement `create_agg_objective_fn` in `agg_objectives.py`
+- [x] 4. The combined objective `L_plan = L_spatial + w * L_agg`
+  - [x] 4.1 [CODE] Implement `create_agg_objective_fn` in `agg_objectives.py`
     - Build **two** callables from the frozen factory:
       `spatial_fn = create_objective_fn(alpha=alpha, base=base, mode=mode)` for L_spatial and
       `agg_fn = create_objective_fn(alpha=0, base=base, mode=mode)` for L_agg. Neither the coefficient
@@ -156,7 +156,7 @@ Task labels:
       and raw L_spatial, no rescaling of either term (Requirements 1.4, 1.8, 1.10)
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.10, 3.2_
 
-  - [ ] 4.2 [CODE] Write property test for the bitwise-zero guarantee (`tests/test_agg_zero_bitwise.py`)
+  - [x] 4.2 [CODE] Write property test for the bitwise-zero guarantee (`tests/test_agg_zero_bitwise.py`)
     - **Property 1: Zero weight is bitwise identity**
     - **Validates: Requirements 1.2, 3.1, 3.2, 5.5**
     - Compares **raw bytes** (`t.detach().cpu().numpy().tobytes()`), not `torch.equal`: `torch.equal` treats
@@ -168,7 +168,7 @@ Task labels:
       same-seed reference point, the Paired_Comparison — rests on it, so it passes before any GPU job
     - _Requirements: 1.2, 3.1, 3.2, 5.5_
 
-  - [ ] 4.3 [CODE] Write property test for stage and coefficient reuse (`tests/test_agg_staged_coeffs.py`)
+  - [x] 4.3 [CODE] Write property test for stage and coefficient reuse (`tests/test_agg_staged_coeffs.py`)
     - **Property 3: Stage selection and coefficients are the frozen module's**
     - **Validates: Requirements 1.2, 1.6**
     - With the identity head on flattened patch features and `alpha = 0`, L_agg must equal the value the
@@ -199,8 +199,8 @@ Task labels:
     - **Property 8: planning.objectives is left untouched**
     - **Validates: Requirements 4.7**
 
-- [ ] 5. Instrumentation of both loss components
-  - [ ] 5.1 [CODE] Implement `AggInstrumentation` in `agg_objectives.py`
+- [x] 5. Instrumentation of both loss components
+  - [x] 5.1 [CODE] Implement `AggInstrumentation` in `agg_objectives.py`
     - Count objective invocations to recover the optimizer step index: `planning/gd.py` calls the objective
       exactly once per inner iteration in order, and `eval_every` is `-1` so the early `break` is
       unreachable, which makes the call index the step index. `should_record()` fires at `step_index == 0`
@@ -220,7 +220,7 @@ Task labels:
     - Emit `agg_instrumentation.json` with a `headline` block for `plan_call == 0` plus every record
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
 
-  - [ ] 5.2 [CODE] Pin the step-counting scheme against the real planner (`tests/test_agg_step_counting.py`)
+  - [x] 5.2 [CODE] Pin the step-counting scheme against the real planner (`tests/test_agg_step_counting.py`)
     - The whole instrumentation index rests on a **read of frozen code**: `planning/gd.py` calls the objective
       exactly once per inner iteration, `eval_every` is `-1` so the early `break` is unreachable, and nothing
       calls the objective outside the loop. Nothing in the plan currently pins that read, and the recorder's
@@ -240,8 +240,8 @@ Task labels:
     - Includes the write/read round trip, since the sweep curve and the term-magnitude interpretation are
       read out of this file
 
-- [ ] 6. Per-episode outcome capture (design decision: the `plan.PlanEvaluator` rebind)
-  - [ ] 6.1 [CODE] Implement `RecordingPlanEvaluator` and the outcome sink in `agg_objectives.py`
+- [x] 6. Per-episode outcome capture (design decision: the `plan.PlanEvaluator` rebind)
+  - [x] 6.1 [CODE] Implement `RecordingPlanEvaluator` and the outcome sink in `agg_objectives.py`
     - This is a **decision the design took, not a derivation**, and it is recorded here so it is not lost:
       `plan.py` persists only means (`PlanEvaluator._compute_rollout_metrics` reduces `successes` into
       `logs["success_rate"]` and the per-episode array is dropped), and the per-episode videos that would
@@ -269,8 +269,8 @@ Task labels:
       append exactly one outcome row whose success vector equals the tuple's success element. Strongly
       recommended despite the `*`, since it is the only automated evidence that the rebind is observational
 
-- [ ] 7. Sweep selection and paired counting
-  - [ ] 7.1 [CODE] Implement `select_agg_weight` and `paired_counts` in `agg_objectives.py`
+- [x] 7. Sweep selection and paired counting
+  - [x] 7.1 [CODE] Implement `select_agg_weight` and `paired_counts` in `agg_objectives.py`
     - `select_agg_weight(rows)`: highest open-loop success rate at the Tuning_Seed wins; on a tie the
       **smallest** tied weight is selected and the tie is recorded; rows at Reporting_Seeds contribute
       nothing, so seeds 100/200/300 cannot influence the choice (Requirements 6.4, 6.5, 6.6)
@@ -286,8 +286,8 @@ Task labels:
     - **Property 14: Paired counts partition the episodes**
     - **Validates: Requirements 11.4**
 
-- [ ] 8. Wrapper entry point `plan_agg.py`
-  - [ ] 8.1 [CODE] Create `plan_agg.py` with the Hydra entry and the protocol checker
+- [x] 8. Wrapper entry point `plan_agg.py`
+  - [x] 8.1 [CODE] Create `plan_agg.py` with the Hydra entry and the protocol checker
     - `@hydra.main(config_path="conf", config_name="plan_gd")`, written **without** `version_base` exactly as
       `plan.main` is, because `plan.planning_main` depends on the cwd being the run directory, which is the
       Hydra-version-dependent `job.chdir` default `plan.main` already relies on
@@ -305,7 +305,7 @@ Task labels:
       rather than a dataset load
     - _Requirements: 3.1, 3.5, 4.2, 8.1, 8.2, 8.3, 8.4, 8.6, 8.7_
 
-  - [ ] 8.2 [CODE] Complete `plan_agg.py`: head load, publication, objective rewrite, delegation
+  - [x] 8.2 [CODE] Complete `plan_agg.py`: head load, publication, objective rewrite, delegation
     - Load Agg_Head with the frozen helper `plan.load_ckpt(model_ckpt, device="cpu")`, take
       `payload["encoder"]`, pass it through `extract_agg_head`, and abort if the `encoder` key is absent
       since Requirement 2.4 cannot then be met. Warn and record both widths if they differ from 1568 / 128
@@ -338,8 +338,8 @@ Task labels:
       (Requirement 8.5)
     - _Requirements: 2.4, 2.7, 8.5_
 
-- [ ] 9. Launcher integration
-  - [ ] 9.1 [CODE] Add the two env-gated hooks to `run_ccr_pilot.sh`
+- [x] 9. Launcher integration
+  - [x] 9.1 [CODE] Add the two env-gated hooks to `run_ccr_pilot.sh`
     - `PLAN_ENTRY="${PLAN_ENTRY:-plan.py}"` replaces the two literal `plan.py` tokens in `run_eval_jobs`;
       `SETTINGS="${SETTINGS:-both}"` (`ol` | `mpc` | `both`) guards the two seed loops. Both default to
       today's behaviour, so the CCR evaluation path stays byte-behaviour-identical
@@ -357,19 +357,53 @@ Task labels:
       recipe are unchanged
     - _Requirements: 9.1, 9.2, 9.3_
 
-- [ ] 10. Checkpoint - all local code and tests green before any pod job
+- [x] 10. Checkpoint - all local code and tests green before any pod job
   - Ensure all tests pass, ask the user if questions arise.
   - Five gates must be green before anything is launched: 1.1 (scope guard, including the `plan.py`
     byte-freeze), 3.1 (run-directory separation), 4.2 (Property 1, bitwise zero), 4.3 (Property 3, staged
     coefficient equality) and 5.2 (the step-counting scheme against the real `GDPlanner`). Task 13.1's
     interpretation is settled at wave 0, before task 8.1 encodes it. No pod job of any kind starts before this
     checkpoint.
+  - **Local result (recorded):** all five gate files green — 1.1 `2 passed`, 3.1 `15 passed, 7 skipped`,
+    4.2 `6 passed`, 4.3 `5 passed`, 5.2 `23 passed`. Full suite `55 passed, 7 skipped, 3 failed, 1 error`; the
+    3 failures are `tests/test_vit_sdpa_equivalence.py` needing CUDA and the error is `tests/test_run_naming.py`
+    needing `omegaconf`, both pre-existing from the CCR work and untouched by this feature. `git status` shows
+    only allowlisted paths
+  - **Gate 3.1 is only half-certified locally, and the missing half runs on the pod FIRST.** The 7 skips are
+    the Hydra-`compose` cases, and they are the load-bearing assertions: seven weights resolving to seven
+    pairwise-distinct directories, the shipped templates collapsing onto one, the aggregator-parsed components
+    surviving, and the two settings landing under different prefixes. What passes on a box without `hydra` is
+    the template *text*. So before task 11.1 — before **any** eval job — run on the pod:
+
+    ```bash
+    cd /workspace/arun/ccr && python -m pytest tests/test_agg_run_dir_separation.py -q
+    ```
+
+    It must report **22 passed, 0 skipped**. A skip means `hydra` was not importable and the gate is still
+    uncertified; a failure means the sweep would collide seven arms into one `logs.json` and
+    `aggregate_results.py` would average seven weights into one number without ever erroring. Task 12.7 checks
+    the same property as an *outcome* on disk, 40 minutes of GPU time later — this is the cheap check
 
 - [ ] 11. Paired zero-weight end-to-end check (gates the sweep; also the sweep's zero arm)
-  - [ ] 11.1 [GPU RUN] Run `plan.py` and `plan_agg.py --agg_weight=0` at seed 400, open-loop
+  - [~] 11.1 [GPU RUN] Run `plan.py` and `plan_agg.py --agg_weight=0` at seed 400, open-loop
     - Both through the Job_Launcher (`bash run_ccr_pilot.sh eval <ckpt>`, `SETTINGS=ol SEEDS=400`), serially,
       one job at a time on the `1g.45gb` MIG slice; the second with `PLAN_ENTRY=plan_agg.py
       "+agg_weight=0"`. ~15 min for the pair
+    - The two legs differ only in the entry script and the run directory, and the run directory travels in the
+      `HYDRA_RUN_DIR` environment variable (never as a positional — see the task-12 header for why):
+
+      ```bash
+      # wrapper leg: the real aggw0 cell, which task 12.7 reads as the Baseline_Arm
+      DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
+        PLAN_ENTRY=plan_agg.py SETTINGS=ol SEEDS=400 HYDRA_RUN_DIR=agg \
+        bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=0"
+
+      # frozen-entry leg: a scratch prefix that cannot collide with any reported cell.
+      # Single-quoted, so ${...} reaches Hydra instead of being expanded to empty by bash.
+      DATASET_DIR=/workspace/arun/data FOREGROUND=1 SETTINGS=ol SEEDS=400 \
+        HYDRA_RUN_DIR='plan_outputs_gd/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/paircheck_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}' \
+        bash run_ccr_pilot.sh eval "$CKPT"
+      ```
     - **Both legs pass an explicit `hydra.run.dir`. This is the hazard, stated here so it is not silently
       reintroduced:** the shipped template carries neither the seed nor the weight, so a `plan.py` leg without
       an override resolves to the *same* directory that already holds the recorded 75.33 +/- 6.11 open-loop
@@ -394,7 +428,7 @@ Task labels:
     - Not agent-executable: needs the pod, the dataset and the Target_Cell checkpoint
     - _Requirements: 3.3, 5.5, 6.3, 9.1, 9.2, 9.4, 9.6_
 
-  - [ ] 11.2 [HUMAN] Record the paired zero-weight verdict
+  - [~] 11.2 [HUMAN] Record the paired zero-weight verdict
     - Identical per-episode vectors is the pass condition. Anything else means the bitwise-zero design does
       not hold through a real run — most likely an RNG perturbation from the wrapper's extra checkpoint load
       or the evaluator rebind — and the **sweep does not launch** until it is explained
@@ -404,37 +438,56 @@ Task labels:
     - _Requirements: 3.3, 5.1, 5.2, 5.3_
 
 - [ ] 12. Weight sweep on the Tuning_Seed (6 non-zero open-loop arms, strictly serial, ~35 min total)
-  - Every arm: `FOREGROUND=1 PLAN_ENTRY=plan_agg.py SETTINGS=ol SEEDS=400 bash run_ccr_pilot.sh eval "$CKPT"
-    "+agg_weight=$W" "$RUNDIR"` with the open-loop `hydra.run.dir` override. Open-loop only, Tuning_Seed
-    only, so the Reporting_Seeds contribute nothing to weight selection (Requirements 6.2, 6.6). One arm per
-    wave: the MIG slice holds exactly one job
+  - Every arm:
+
+    ```bash
+    DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
+      PLAN_ENTRY=plan_agg.py SETTINGS=ol SEEDS=400 HYDRA_RUN_DIR=agg \
+      bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=$W"
+    ```
+
+    **The run-directory override is an environment variable, not a positional argument.** The driver's
+    `add_run_dir_default` reads `HYDRA_RUN_DIR`; `HYDRA_RUN_DIR=agg` resolves the **per-setting** template
+    through `agg_objectives.run_dir_override(<config_name>)`, so the open-loop loop gets `plan_outputs_gd` and
+    the MPC loop `plan_outputs_gd_mpc` with no second variable. The env var is `HYDRA_RUN_DIR` rather than
+    `RUN_DIR` because the launcher already uses `RUN_DIR` for the eval checkpoint directory. A trailing
+    positional would be **wrong twice over**: `eval` assigns the first non-`key=value` positional to the
+    checkpoint dir, which `"$CKPT"` has already taken, so a second one reaches Hydra as an unparseable
+    override and the arm aborts — and it would set no run-directory override at all, landing the arm in the
+    shipped weight-free directory, which is the collision task 3.1 exists to prevent
+  - `+agg_weight=$W` must be passed explicitly on every arm, the zero arm included. `plan_agg.py` defaults the
+    weight to `0.0` when the key is absent (Requirement 3.1), but the run-dir template interpolates
+    `${agg_weight}` from the config root, which exists only if `+agg_weight` was passed. Omitting it fails
+    loudly at run-directory creation, before any load — not silently into a mislabelled cell
+  - Open-loop only, Tuning_Seed only, so the Reporting_Seeds contribute nothing to weight selection
+    (Requirements 6.2, 6.6). One arm per wave: the MIG slice holds exactly one job
   - The zero-weight arm is **not** repeated here: it is the `plan_agg.py` leg of task 11.1, the same GPU job at
     the same seed, setting and checkpoint, writing the real `aggw0` cell (Requirement 6.3). With it the sweep
     is 7 arms and ~40 min against Requirement 9.4
-  - [ ] 12.1 [GPU RUN] Sweep arm `agg_weight=0.01`
+  - [~] 12.1 [GPU RUN] Sweep arm `agg_weight=0.01`
     - Bottom of the accepted interval; see task 12.8 on a boundary selection
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.2 [GPU RUN] Sweep arm `agg_weight=0.03`
+  - [~] 12.2 [GPU RUN] Sweep arm `agg_weight=0.03`
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.3 [GPU RUN] Sweep arm `agg_weight=0.1`
+  - [~] 12.3 [GPU RUN] Sweep arm `agg_weight=0.1`
     - The paper-literal value: `tab:long_horizon` reports exactly `L_spatial + 0.1 * L_agg`. It is one arm of
       seven, not a privileged one, since the paper applies the term only at the 50-step horizon
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.4 [GPU RUN] Sweep arm `agg_weight=0.3`
+  - [~] 12.4 [GPU RUN] Sweep arm `agg_weight=0.3`
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.5 [GPU RUN] Sweep arm `agg_weight=1`
+  - [~] 12.5 [GPU RUN] Sweep arm `agg_weight=1`
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.6 [GPU RUN] Sweep arm `agg_weight=3`
+  - [~] 12.6 [GPU RUN] Sweep arm `agg_weight=3`
     - Top of the accepted interval (Requirement 3.4); `validate_agg_weight` rejects anything above it, so the
       grid cannot be extended upward without a spec change. See task 12.8
     - _Requirements: 6.1, 6.2, 6.7, 9.4_
 
-  - [ ] 12.7 [CPU RUN] Aggregate the sweep and select the weight
+  - [~] 12.7 [CPU RUN] Aggregate the sweep and select the weight
     - `python aggregate_results.py`, then `select_agg_weight` over the seven rows — the six arms above plus the
       `aggw0` row written by task 11.1's `plan_agg.py` leg. Confirm the seven arms landed in seven distinct
       directories on disk — task 3.1 checks the template, this checks the outcome
@@ -442,7 +495,7 @@ Task labels:
       every Sweep_Grid value and for the Baseline_Arm (Requirement 6.7)
     - _Requirements: 6.4, 6.5, 6.7_
 
-  - [ ] 12.8 [HUMAN] Record the sweep curve, the selected weight, and any boundary selection
+  - [~] 12.8 [HUMAN] Record the sweep curve, the selected weight, and any boundary selection
     - Record `W_STAR`, any tie and how it was broken (smallest tied weight), and the effective ratio
       `Agg_Weight * L_agg / L_spatial` at steps 0 and 100 for each arm. A curve that is flat within the ~5.7
       point binomial standard error at n=50 is itself a finding and belongs in the record
@@ -457,8 +510,8 @@ Task labels:
       the Reporting_Seeds see this weight
     - _Requirements: 6.4, 6.5, 6.6, 6.7, 3.4, 11.7_
 
-- [ ] 13. The Requirement 8.4 reading (interpretation; settle it first, at wave 0)
-  - [ ] 13.1 [HUMAN] Confirm the per-setting protocol reading against `conf/plan_gd_mpc.yaml`
+- [x] 13. The Requirement 8.4 reading (interpretation; settle it first, at wave 0)
+  - [x] 13.1 [HUMAN] Confirm the per-setting protocol reading against `conf/plan_gd_mpc.yaml`
     - **Sequenced at wave 0, before any code.** This is a zero-cost human judgement, and it governs the
       per-setting expected table that task 8.1 writes at wave 6. Settling it afterwards would mean confirming
       an interpretation the code already encodes
@@ -496,11 +549,25 @@ Task labels:
     rather than reusing the recorded Platform_Baseline, because the recorded numbers are means and the
     Paired_Comparison needs per-episode vectors from the wrapper's own outcome file
   - [ ] 14.1 [GPU RUN] Baseline_Arm: `agg_weight=0`, seeds 100/200/300, open-loop and MPC
-    - `FOREGROUND=1 PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS="100 200 300"` with the per-setting
-      `hydra.run.dir` overrides. 6 runs, ~1.5 h for this arm alone (3 MPC seeds at ~25 min each dominate)
+    - 6 runs, ~1.5 h for this arm alone (3 MPC seeds at ~25 min each dominate). `HYDRA_RUN_DIR=agg` covers
+      **both** settings: the driver calls `run_dir_override("plan_gd")` in the open-loop loop and
+      `run_dir_override("plan_gd_mpc")` in the MPC loop, so one variable gives each setting its own prefix
+
+      ```bash
+      DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
+        PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS="100 200 300" HYDRA_RUN_DIR=agg \
+        bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=0"
+      ```
     - _Requirements: 7.1, 7.4, 8.2, 8.3, 9.1, 9.2, 9.5_
 
   - [ ] 14.2 [GPU RUN] Candidate_Arm: `agg_weight=$W_STAR`, seeds 100/200/300, open-loop and MPC
+    - Identical to 14.1 but with `"+agg_weight=$W_STAR"`:
+
+      ```bash
+      DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
+        PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS="100 200 300" HYDRA_RUN_DIR=agg \
+        bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=$W_STAR"
+      ```
     - 6 runs, ~1.5 h, serial after 14.1, for ~3 h across the two arms. Requires task 4.3 green (Property 3) —
       the MPC leg runs `objective.mode=staged`, and the staged coefficient reuse is only proved exact by that
       property — and task 13.1 confirmed
@@ -509,7 +576,7 @@ Task labels:
       dropped seed, no relaxed planner hyperparameter
     - _Requirements: 7.1, 7.2, 7.4, 8.1, 8.2, 8.3, 8.4, 9.5_
 
-  - [ ] 14.3 [CPU RUN] Aggregate the confirmation run and compute the Paired_Comparison
+  - [~] 14.3 [CPU RUN] Aggregate the confirmation run and compute the Paired_Comparison
     - `python aggregate_results.py` for open-loop and MPC means and standard deviations over the
       Reporting_Seeds (Requirement 7.3)
     - `paired_counts` per Reporting_Seed over the two `output_final` vectors from
@@ -518,7 +585,7 @@ Task labels:
     - _Requirements: 7.3, 7.4, 9.6, 11.4_
 
 - [ ] 15. Acceptance gate
-  - [ ] 15.1 [HUMAN] Record the Acceptance_Gate verdict
+  - [~] 15.1 [HUMAN] Record the Acceptance_Gate verdict
     - `python ccr_acceptance_gate.py --cand-ol-seeds <...> --cand-mpc-seeds <...> --base-ol 75.33
       --base-mpc 82.00`. Candidate means and the Platform_Baseline only, no threshold arguments: the
       predicate is reused as it stands (Requirement 10.7)
@@ -530,7 +597,7 @@ Task labels:
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7_
 
 - [ ] 16. Negative_Result_Record
-  - [ ] 16.1 [HUMAN] Write the Negative_Result_Record on a `fail` or `inconclusive` verdict
+  - [~] 16.1 [HUMAN] Write the Negative_Result_Record on a `fail` or `inconclusive` verdict
     - All four parts: (1) the sweep curve — open-loop success rate at the Tuning_Seed for every Sweep_Grid
       value and for the Baseline_Arm (Requirement 11.2); (2) the Candidate_Arm 3-seed open-loop and MPC means
       and standard deviations over the Reporting_Seeds (Requirement 11.3); (3) the Paired_Comparison against

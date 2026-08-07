@@ -1,15 +1,21 @@
-"""Scope-containment guard for the CCR feature branch.
+"""Scope-containment guard for the CCR and aggregated-space feature branches.
 
-**Validates: Requirements 5.2, 5.4, 5.6**
+**Validates: Requirements 5.2, 5.4, 5.6** (counterfactual-curvature-regularization)
+
+**Property 9: Frozen sources are byte-identical to the base revision**
+**Validates: Requirements 4.3, 4.4** (aggregated-space-planning-cost)
 
 Requirement 5.6 confines training-side changes to a small allowlist; Requirements 5.2 and 5.4 additionally
-forbid touching the planning and dataset paths at all. This module is the only automated check of either
-statement, so it is a non-optional gate rather than an optional property test.
+forbid touching the planning and dataset paths at all. The aggregated-space feature adds root-level
+``plan.py`` to that frozen set (Requirement 4.4) and two allowlist entries (Requirement 4.5). This module is
+the only automated check of any of those statements, so it is a non-optional gate rather than an optional
+property test.
 
 Two assertions:
 
 1. Every path the feature branch changed (committed, staged, unstaged or untracked) is in the allowlist.
-2. Every ``planning/*.py`` and ``datasets/*.py`` file hashes equal to its content at the base revision.
+2. Every ``planning/*.py`` and ``datasets/*.py`` file, plus root-level ``plan.py``, hashes equal to its
+   content at the base revision.
 
 Implementation notes:
 
@@ -81,6 +87,39 @@ ALLOWED_FILES = frozenset(
         # Guarded by `tests/test_vit_sdpa_equivalence.py`, which checks forward AND gradient agreement in
         # float64 and that the block-causal mask is still enforced on the fast branch.
         "models/vit.py",
+        # SCOPE AMENDMENT for the aggregated-space planning cost.
+        #
+        # `plan.py` builds its planning objective with `hydra.utils.call(cfg_dict["objective"])` and
+        # passes NOTHING else -- no model, no encoder, no planner handle. `planning/objectives.py`
+        # correspondingly receives no handle on the world model: `create_objective_fn(alpha, base,
+        # mode)` closes over three scalars. So Agg_Head, which lives on the checkpoint's
+        # `DinoV2Encoder`, cannot reach the objective through any frozen argument channel, and the
+        # aggregated-space term MUST be injected from outside the frozen paths. That is the entire
+        # reason this feature is two new root-level files rather than an edit to
+        # `planning/objectives.py`.
+        #
+        # `agg_objectives.py` computes L_agg and L_plan. It IMPORTS `planning.objectives` and CALLS
+        # `create_objective_fn` twice -- once with the configured alpha for L_spatial, once with
+        # alpha=0 on aggregated-space features for L_agg -- and rebinds nothing in that module, so
+        # the frozen coefficient and stage-dispatch logic is reused rather than copied and cannot
+        # drift from it.
+        #
+        # `plan_agg.py` is the entry point. It calls `plan.planning_main` as imported. It rewrites
+        # `_target_` in its OWN cfg_dict, and it rebinds `plan.PlanEvaluator` to a subclass that
+        # delegates to `super().eval_actions` and records the per-episode success vector the frozen
+        # evaluator reduces to a mean -- the paired comparison needs those vectors and nothing
+        # persists them. Both are runtime attribute rebinds in the wrapper's own process: no file
+        # under `planning/`, no file under `datasets/` and not `plan.py` is edited, and the
+        # byte-identity assertion below now covers `plan.py` as well to keep that honest.
+        #
+        # Guarded by `tests/test_agg_zero_bitwise.py`, which checks that at Agg_Weight 0 the returned
+        # tensor is BITWISE equal to the unmodified objective's for arbitrary inputs including
+        # non-finite ones; by `tests/test_agg_recording_evaluator.py`, which checks the recording
+        # evaluator returns its delegate's result unchanged; and by
+        # `tests/test_agg_objectives_untouched.py`, which checks every attribute of
+        # `planning.objectives` keeps its original identity after use.
+        "agg_objectives.py",
+        "plan_agg.py",
     }
 )
 
@@ -100,6 +139,16 @@ PREEXISTING_FILES = frozenset({"SHORT_BUDGET_PILOTS.md"})
 
 #: Directories whose ``*.py`` contents must be byte-identical to the base revision.
 FROZEN_DIRS = ("planning", "datasets")
+
+#: Individual files that must be byte-identical to the base revision. Requirement 4.4 of the
+#: aggregated-space feature adds root-level ``plan.py``: the wrapper `plan_agg.py` imports it and rebinds
+#: `plan.PlanEvaluator` at runtime in its own process, which edits no file, and this is what keeps that
+#: honest. ``plan.py`` is a file rather than a directory, hence a separate tuple; both are handed to git as
+#: pathspecs by ``FROZEN_PATHSPECS`` below.
+FROZEN_FILES = ("plan.py",)
+
+#: Pathspecs passed to ``git ls-tree`` / ``git ls-files`` when collecting the frozen set.
+FROZEN_PATHSPECS = FROZEN_DIRS + FROZEN_FILES
 
 
 def _git(*args, binary=False):
@@ -183,8 +232,8 @@ def _digest(data):
 
 
 def _frozen_paths_at_base():
-    code, out = _git("ls-tree", "-r", "--name-only", BASE_REV, "--", *FROZEN_DIRS)
-    assert code == 0, f"git ls-tree of {FROZEN_DIRS} at {BASE_REV} failed"
+    code, out = _git("ls-tree", "-r", "--name-only", BASE_REV, "--", *FROZEN_PATHSPECS)
+    assert code == 0, f"git ls-tree of {FROZEN_PATHSPECS} at {BASE_REV} failed"
     return {p for p in (_norm(line) for line in out.splitlines()) if p.endswith(".py")}
 
 
@@ -192,9 +241,9 @@ def _frozen_paths_now():
     # cached + untracked, honouring .gitignore, so __pycache__ and checkpoint scratch never register as
     # newly added files.
     code, out = _git(
-        "ls-files", "--cached", "--others", "--exclude-standard", "--", *FROZEN_DIRS
+        "ls-files", "--cached", "--others", "--exclude-standard", "--", *FROZEN_PATHSPECS
     )
-    assert code == 0, f"git ls-files of {FROZEN_DIRS} failed"
+    assert code == 0, f"git ls-files of {FROZEN_PATHSPECS} failed"
     return {p for p in (_norm(line) for line in out.splitlines()) if p.endswith(".py")}
 
 
@@ -210,15 +259,26 @@ def test_changed_files_are_within_the_requirement_5_6_allowlist():
     )
 
 
-def test_planning_and_datasets_are_unchanged_from_the_base_revision():
-    """Requirements 5.2, 5.4: the planning and dataset paths are untouched."""
+def test_frozen_sources_are_unchanged_from_the_base_revision():
+    """Requirements 5.2, 5.4 (CCR) and 4.3, 4.4 (aggregated-space): the frozen paths are untouched.
+
+    **Property 9: Frozen sources are byte-identical to the base revision**
+    **Validates: Requirements 4.3, 4.4**
+    """
     _require_git()
     at_base = _frozen_paths_at_base()
     now = _frozen_paths_now()
     assert at_base, (
-        f"no planning/*.py or datasets/*.py files found at base revision {BASE_REV}; "
+        f"no planning/*.py, datasets/*.py or plan.py files found at base revision {BASE_REV}; "
         "the guard would silently pass"
     )
+    # Requirement 4.4: plan.py must actually be in the compared set, so a path-collection regression
+    # cannot silently drop it and leave the assertion vacuously true for the wrapper's frozen entry point.
+    for frozen_file in FROZEN_FILES:
+        assert frozen_file in at_base, (
+            f"{frozen_file} is not in the frozen set collected at {BASE_REV}; Requirement 4.4 would not be "
+            "checked"
+        )
 
     mismatches = []
     for path in sorted(at_base | now):
@@ -240,6 +300,7 @@ def test_planning_and_datasets_are_unchanged_from_the_base_revision():
 
     # Report every mismatch, not just the first.
     assert not mismatches, (
-        "Requirements 5.2/5.4 violation: planning/*.py or datasets/*.py differ from base revision "
-        f"{BASE_REV}.\n  " + "\n  ".join(mismatches)
+        "Frozen-source violation (CCR Requirements 5.2/5.4, aggregated-space Requirements 4.3/4.4): "
+        f"planning/*.py, datasets/*.py or plan.py differ from base revision {BASE_REV}.\n  "
+        + "\n  ".join(mismatches)
     )
