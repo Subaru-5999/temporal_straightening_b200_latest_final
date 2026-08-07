@@ -312,8 +312,27 @@ reference's 0.048998, i.e. 13.5% worse — the "CCR squeezes the prediction loss
 1,000 it was 3.3% *better* (0.052731 vs 0.054557), so this is row-to-row noise, not a trend.
 Mid-run readings are failure detectors, not trajectories.
 
-**Options, with modelled rates (pending confirmation).** All of them are decisions for the
-user, not defaults to apply:
+**RESOLVED by `ccr_fast_attention` (measured 03:16-03:22 in `checkpoints_fast/`).** SDPA gives
+**1.196 it/s** against the materialised path's 0.589 — a **2.03x** speedup, steady over rows 200
+(1.135, warmup-depressed) and 400 (1.196). Refitting: `E + 2p_slow + 10p_fast = 0.836 s` with
+`E = 0.212`, `p_slow = 0.090` gives **`p_fast = 0.0444 s`**, i.e. SDPA halved the predictor pass.
+
+| path | it/s | Full_Run |
+|---|---|---|
+| materialised attention | 0.589 | 58.4 h |
+| **SDPA on the CCR rollout (shipped default)** | **1.196** | **28.8 h** |
+| SDPA everywhere (needs a baseline retrain) | ~1.34 | ~25.7 h |
+| baseline reference | 2.86 | 12.0 h |
+
+The third row is why the default-off design stands: 3 h saved for a 12 h retrain plus a 1.5 h
+re-eval, and it would invalidate the measured 75.33/82.00. Closed.
+
+Still FAILS the 1.93 it/s floor at +142% step time. That floor came from the same wrong cost
+model — no configuration adding five predictor rollouts can clear a 50% step-time bound — so it
+is doing its job as an alarm, not as an achievable target.
+
+**Options, with modelled rates (superseded above for the fast-attention row).** All of them are
+decisions for the user, not defaults to apply:
 
 | option | rate | Full_Run | cost |
 |---|---|---|---|
