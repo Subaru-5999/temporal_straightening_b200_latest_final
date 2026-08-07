@@ -282,6 +282,58 @@ Caveat that must be applied to the last two rows: the pilot has seen 8,000 steps
 baseline's 123,858, so a lower absolute R² is uninformative. **Only the ranking among the five
 dimensions is comparable.**
 
+## 6b. Pilot result at `global_iter` 8000 — VERDICT: middle band, probe then decide
+
+Run `checkpoints_fast/test/..._cf0p04_rho0p5_srcsynthetic_mca0`, driver 4077128, clean finish
+05:09:27, 8,000 steps in 6,690 s at a steady **1.198 it/s** (40 records, min 1.191 max 1.200).
+
+| term | scaled | share | baseline @8000 | delta |
+|---|---|---|---|---|
+| curvature | 0.043296 | 68.505% | 0.041421 | +4.5% |
+| prediction | **0.015428** | 24.411% | **0.013196** | **+16.9%** |
+| ccr | 0.002848 | 4.506% | — | — |
+| decoder | 0.001630 | 2.578% | 0.001554 | +4.9% |
+| total | 0.063202 | | 0.056171 | +12.5% |
+
+Four of five gate criteria PASS (term enabled with `synthesized_action_frames=3`; step-200 row
+matches; shares inside `[2%, 30%]` and prediction share 24.4% >> 11.75% floor; no collapse). The
+step-rate floor FAILS at 1.198 vs 1.933 — the known Requirement 11.7 reporting event.
+
+Applying §6a: prediction 0.015428 sits between the GO bound (0.014516) and the STOP bound
+(0.016495). **Middle band → probe the pilot checkpoint, then decide.**
+
+### The two findings that matter more than the gate
+
+**(1) The prediction-loss cost is a trend, not noise.** I had dismissed this off a single row. Per-row
+delta of our prediction loss against the reference at matched `global_iter`:
+
+```
+200  400  600  800 1000 | 1200 1400 1600 1800 2000 2200 2400 | 8000
+ −    −    −    −    −  |  +3%  +9% +14% +22% +18%  +7% +18% | +17%
+ better than baseline    | consistently worse, 8 of 8 rows
+```
+
+Eight consecutive same-direction rows is p ≈ 0.004 under a sign test. **CCR costs ~15% on the
+prediction loss from ~1,200 steps onward**, and that is the quantity planning descends on.
+
+**(2) CCR has largely solved itself.** Raw CCR: 0.3395 @200 → 0.3021 @400 → **0.0712 @8000**, a
+**79% reduction**, against the on-log curvature term's 43% over the same span. Share down to 4.51%
+and still falling. The off-log curvature is far *easier* to reduce than the on-log curvature.
+
+Reads well on its face — the mechanism works, the encoder does straighten off-log rollouts. But for
+the Full_Run it cuts the other way: a penalty 79% satisfied by step 8,000 exerts little pressure
+over the remaining 116,000 steps, so the run would pay the 15% prediction cost for the full distance
+while the geometric benefit is already banked and fading. **Measured cost, vanishing benefit.**
+
+Estimate revised **~10% → ~7%**.
+
+### Operational note
+
+The driver went `Zs` / `[bash] <defunct>` on exit and the ad-hoc monitor loop I supplied used the
+naive `kill -0`, so it span for 2h39m past a job that finished at 05:09 — **2h39m of idle GPU on a
+free slice.** This is the second time the same zombie trap cost time; `run_ccr_pilot.sh` was already
+fixed for it and the throwaway loop was not. Any wait loop must check `ps -p <pid> -o stat=` for `Z`.
+
 ## 7. Next actions, in order
 
 Common preamble for every command below:
