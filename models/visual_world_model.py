@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# Explicit: `import torch` does not reliably bind the `torch.utils.checkpoint` submodule,
+# and the CCR rollout depends on it (see _predict_maybe_checkpointed).
+import torch.utils.checkpoint
 import logging
 from torchvision import transforms
 from einops import rearrange, repeat
@@ -41,6 +44,7 @@ class VWorldModel(nn.Module):
         lambda_cf=0.0,
         ccr_rho=0.0,
         ccr_rollout_len=5,
+        ccr_grad_checkpoint=True,
         ccr_action_source="synthetic",
         mca_weight=0.0,
         **kwargs,
@@ -98,6 +102,13 @@ class VWorldModel(nn.Module):
         self.lambda_cf = float(0.0 if lambda_cf is None else lambda_cf)
         self.ccr_rho = float(0.0 if ccr_rho is None else ccr_rho)
         self.ccr_rollout_len = int(5 if ccr_rollout_len is None else ccr_rollout_len)
+        # Memory/compute tradeoff on the CCR rollout only; numerically neutral, so it is
+        # deliberately in neither ccr_tag nor LOSS_SIGNATURE_KEYS. Default True because
+        # without it the PushT target cell at L=5 needs ~40 GB of extra activation
+        # memory and OOMs the 45 GB MIG slice.
+        self.ccr_grad_checkpoint = bool(
+            True if ccr_grad_checkpoint is None else ccr_grad_checkpoint
+        )
         self.ccr_action_source = str(
             "synthetic" if ccr_action_source is None else ccr_action_source
         )
@@ -165,13 +176,14 @@ class VWorldModel(nn.Module):
                 "CCR enabled: term=ccr, weight(lambda_cf)=%s, rho=%s, rollout_len=%s, "
                 "action_source=%s, synthesized_action_frames=max(0, %s + %s - 1 - "
                 "num_frames) [resolved on the first forward], curvature_mode=aggcos, "
-                "device=%s",
+                "grad_checkpoint=%s, device=%s",
                 self.lambda_cf,
                 self.ccr_rho,
                 self.ccr_rollout_len,
                 self.ccr_action_source,
                 self.num_hist,
                 self.ccr_rollout_len,
+                self.ccr_grad_checkpoint,
                 _ccr_device,
             )
         if self.mca:
@@ -532,25 +544,61 @@ class VWorldModel(nn.Module):
         return z
 
 
-    def _rollout_latents(self, z, action):
+    def _predict_maybe_checkpointed(self, z, checkpoint):
+        """``predict``, optionally recomputed in backward instead of stored.
+
+        A single ``predict`` call at the PushT target-cell shapes stores about **8 GB**
+        of activations for backward, and essentially all of it is the attention matrix:
+        ``models/vit.py`` materialises ``dots`` of shape
+        ``(b, heads, T, T) = (32, 16, 588, 588)`` -- 177 M elements, 354 MB in bf16 --
+        and then keeps the softmax output and the dropout output at the same size, for
+        each of ``depth=6`` layers.  ``T = num_hist * num_patches = 3 * 196 = 588``.
+
+        The baseline objective calls ``predict`` once.  CCR at ``L = 5`` calls it five
+        more times, so it asks for roughly **40 GB of extra activation memory** and OOMs
+        a 45 GB MIG slice.  The design's claim that the extra predictor calls are "a
+        small fraction" of the encoder pass was about *compute time* and is simply wrong
+        about *memory*.
+
+        ``use_reentrant=False`` with the default ``preserve_rng_state=True`` saves and
+        restores the RNG around the recomputation, which matters here because the
+        predictor runs ``dropout=0.1``: without it the recomputed forward would draw a
+        different mask and the gradient would be wrong.  With it, the result is
+        numerically what the un-checkpointed path produces.
+
+        Checkpointing is skipped when grad is disabled -- under ``torch.no_grad`` there
+        is no backward to save memory for, and ``checkpoint`` would only warn.
+        """
+        if not checkpoint or not torch.is_grad_enabled():
+            return self.predict(z)
+        return torch.utils.checkpoint.checkpoint(
+            self.predict, z, use_reentrant=False
+        )
+
+    def _rollout_latents(self, z, action, checkpoint=False):
         """Predictor rollout body.
 
         Identical tensor ops, in identical order, to the previous ``rollout`` loop.
 
         input:  z: (b, n, num_patches, emb_dim) latent context (already encoded)
                 action: (b, t, action_dim) actions past the context window
+                checkpoint: recompute each ``predict`` in backward rather than storing
+                    its activations.  Default False, so ``rollout`` -- and therefore
+                    ``plan.py``, ``planning/*`` and ``Trainer.openloop_rollout`` -- take
+                    the original path unchanged (Property 7).  Only ``compute_ccr``
+                    passes True.
         output: z: (b, n+t+1, num_patches, emb_dim)
         """
         t = 0
         inc = 1
         while t < action.shape[1]:
-            z_pred = self.predict(z[:, -self.num_hist :])
+            z_pred = self._predict_maybe_checkpointed(z[:, -self.num_hist :], checkpoint)
             z_new = z_pred[:, -inc:, ...]
             z_new = self.replace_actions_from_z(z_new, action[:, t : t + inc, :])
             z = torch.cat([z, z_new], dim=1)
             t += inc
 
-        z_pred = self.predict(z[:, -self.num_hist :])
+        z_pred = self._predict_maybe_checkpointed(z[:, -self.num_hist :], checkpoint)
         z_new = z_pred[:, -1 :, ...] # take only the next pred
         z = torch.cat([z, z_new], dim=1)
         return z
@@ -660,7 +708,11 @@ class VWorldModel(nn.Module):
         z_ctx = self.replace_actions_from_z(
             z[:, : self.num_hist].clone(), act_cf[:, : self.num_hist]
         )
-        z_imag = self._rollout_latents(z_ctx, act_cf[:, self.num_hist : required])
+        z_imag = self._rollout_latents(
+            z_ctx,
+            act_cf[:, self.num_hist : required],
+            checkpoint=self.ccr_grad_checkpoint,
+        )
         # Last L + 2 frames: every velocity pair entering _cos_curvature touches at least
         # one imagined frame, so the purely-real triple the baseline term already penalises
         # is not double-counted. `visual_only` matches the baseline curvature term's channel

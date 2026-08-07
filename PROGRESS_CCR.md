@@ -260,7 +260,43 @@ export DATASET_DIR=/workspace/arun/data          # run_ccr_pilot.sh dies without
 RUN_DIR=$PWD/checkpoints/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05
 ```
 
-### Step 0 — the chained pilot launch FAILED to start; relaunch unchained
+### Step 0b — the relaunched pilot OOM'd; fixed with gradient checkpointing
+
+`torch.OutOfMemoryError` inside `F.softmax` in the predictor's attention, ~2 min into the run.
+**Not a tuning problem — the overrun is ~40 GB, and it is a design error of mine.**
+
+The arithmetic I never did. `models/vit.py` materialises the full attention matrix:
+`dots` has shape `(b, heads, T, T)` where `T = num_hist * num_patches = 3 * 196 = 588`, so
+`(32, 16, 588, 588)` = 177 M elements = **354 MB in bf16**. The softmax output and the
+`dropout=0.1` output are each the same size again, for each of `depth=6` layers. So **one
+`predict` call stores ~8 GB of activations for backward.**
+
+The baseline objective calls `predict` once. CCR at `L = 5` calls it **five** more times →
+**~40 GB of extra activation memory** on a 45 GB slice. The design said the extra predictor
+calls were "a small fraction" of the encoder pass; that was true of *compute time* and simply
+wrong about *memory*, which I never analysed. Note the `logged` control arm at `L = 2` would
+have been marginal too (~16 GB extra), so this was going to bite either way.
+
+**Fix:** `training.ccr_grad_checkpoint` (new, default `true`) recomputes the CCR rollout's
+predictor calls in backward instead of storing them, via
+`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`. Peak drops from ~40 GB extra to
+~8 GB extra. Costs one extra forward on the CCR path only, so expect the step rate to sit
+lower — the `it_per_s >= 1.91` floor is now the check to watch, and under Requirement 11.7 a
+breach is a reporting event before the Full_Run, not an abort.
+
+Numerically neutral: the default `preserve_rng_state=True` saves and restores the RNG around
+the recomputation, which matters because the predictor runs `dropout=0.1` — without it the
+recomputed forward would draw a different mask and the gradient would be wrong.
+`_rollout_latents` takes `checkpoint=False` by default, so `rollout`, `plan.py`, `planning/*`
+and `Trainer.openloop_rollout` are untouched and Property 7 still holds bitwise. The knob is
+in neither `ccr_tag` nor `LOSS_SIGNATURE_KEYS`, because toggling it must not rename a run or
+block a resume.
+
+**Also seen:** `tail: inotify cannot be used ... Too many open files`. Separate from the OOM
+(it is the interactive shell, not the trainer), but it points at leaked file descriptors from
+the accumulated runs. Check `ulimit -n` and clear stray processes if it recurs.
+
+### Step 0 — the earlier chained pilot launch FAILED to start; relaunch unchained
 
 **What happened (2026-08-06/07).** The baseline eval (driver 4032390) finished at 19:47:55.
 The pilot (driver 4032433) was chained on it with `CHAIN_ON_PID` and was still sitting in
@@ -439,6 +475,13 @@ which is the point, but also the risk.
   count at 0.
 - `models/vit.py` hardcodes its causal mask to `cuda` as a plain attribute. Worked around in
   the probe; untouched in the training path.
+- **One `predict` call costs ~8 GB of activation memory** at the target-cell shapes, because
+  `models/vit.py` materialises the `(32, 16, 588, 588)` attention matrix rather than using
+  `scaled_dot_product_attention`. CCR at `L = 5` therefore requires
+  `training.ccr_grad_checkpoint=true` on a 45 GB slice. Switching `models/vit.py` to SDPA would
+  remove the cost entirely and is the better engineering fix, but that file is outside the
+  Requirement 5.6 allowlist and the change would alter the baseline's numerics, so it is
+  deliberately **not** done here.
 
 ---
 
