@@ -406,6 +406,25 @@ resolve_run_dir_from_log() {
 report_launch() {
   local run_dir rc lam
   lam="$(resolved_lambda_cf)"
+
+  # A chained launch has not started train.py yet: the driver is in
+  # wait_for_driver_pid, polling every 30s. Waiting RUNDIR_WAIT seconds for a
+  # "Model saved dir:" line that cannot exist yet, and then reporting its absence
+  # as a problem, is a false alarm -- so say what is actually happening instead.
+  if [[ -n "${CCR_CHAIN_ON_PID:-}" ]]; then
+    echo
+    echo "Chained launch: this driver is waiting for pid ${CCR_CHAIN_ON_PID} to exit,"
+    echo "so train.py has NOT started and there is no run directory yet. That is"
+    echo "expected -- do not read it as a failure."
+    echo
+    echo "When the chain releases, resolve the run dir and run the smoke check:"
+    echo "  grep -m1 -aE 'Model saved dir:' '${CCR_LOG}'"
+    echo "  grep -aE 'CCR enabled|CCR disabled|MCA enabled|Iteration budget' '${CCR_LOG}'"
+    echo "  python summarize_training_log.py \"\$(grep -m1 -aE 'Model saved dir:' '${CCR_LOG}' \\"
+    echo "    | sed -E 's/.*Model saved dir:[[:space:]]*//')\""
+    return 0
+  fi
+
   echo
   echo "Resolving the run directory from the log (not from a hardcoded path)..."
   set +e
