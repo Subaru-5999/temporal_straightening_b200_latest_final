@@ -454,6 +454,38 @@ Single probes with 22 windows per per-dimension subset. Re-probe both checkpoint
 `--num-windows 192` (subsets grow 22 → 64). If `block_angle` is still clearly lower under CCR, the
 finding holds.
 
+## 6g. TRAINING ON THIS POD IS BITWISE DETERMINISTIC — verified, and it changes the statistics
+
+`summarize_training_log.py "$CTRL_DIR" --compare "$RUN_DIR"`: **all 40 matched rows agree to
+`+0.000000`** on `prediction`, `curvature`, `decoder` and `loss`, at `global_iter` 200 through 8000.
+The `checkpoints_ctrl8k` run is an exact reproduction of the original baseline's first 8,000 steps.
+Only `it_per_s` differs, which is wall-clock, not numerics.
+
+Two consequences, both important:
+
+**1. Zero confound.** Any CCR@8k vs control@8k difference is attributable *entirely* to CCR. There is
+no run-to-run variation to subtract. This was an assumption I had been making without checking; it is
+now verified.
+
+**2. My eval power analysis was wrong and too pessimistic.** I computed `SE(Δ) ≈ 9.8` points by
+treating the two arms as independent binomials. They are **paired**: `plan.py` seeds episode sampling
+from `seed`, and the planner is deterministic (`sample_type: zero`, `action_noise: 0`), so both arms
+see the *identical* 50 episodes. With deterministic training the pairing is exact.
+
+For a paired binary comparison the noise comes only from discordant episodes: if the models differ on
+`k` of 50, `SE(Δ) ≈ sqrt(k)/50` — 6.3 pts at k=10, 4.5 pts at k=5. More usefully: **the single-seed
+result is an exact measurement of the difference on that episode set**, with no measurement error at
+all. The only open question is generalization to other episodes, which is what extra seeds buy.
+
+So a difference of even 3-4 episodes (6-8 points) is real on that set. Extend to 3 seeds before
+believing the magnitude, but the sign is trustworthy from one seed.
+
+**Reusable consequence:** determinism means any future matched comparison needs only one run per arm
+to isolate an effect exactly. It also means the "free matched-budget control" idea in
+`SHORT_BUDGET_PILOTS.md` §4 extends from telemetry to *checkpoints* — a capped rerun reproduces any
+earlier prefix exactly, so a lost intermediate checkpoint can always be regenerated for its cost in
+steps.
+
 ## 7. Next actions, in order
 
 Common preamble for every command below:
