@@ -763,9 +763,42 @@ class Trainer:
         model_epoch = self.epoch
         return ckpt_path, model_name, model_epoch
 
+    def _warm_dino_hub(self):
+        """Make the DINOv2 hub module importable before a checkpoint is unpickled.
+
+        Checkpoints store whole ``nn.Module`` objects, and the encoder's class lives in the
+        ``torch.hub`` dinov2 cache rather than in this repository. ``torch.load`` therefore
+        has to resolve ``dinov2.*`` while walking the pickle, and on resume nothing has
+        imported it yet: ``init_models`` calls ``load_ckpt`` *before* it builds the encoder,
+        so a fresh process fails with ``ModuleNotFoundError: No module named 'dinov2'``.
+
+        Every run so far started from scratch, which is why this went unnoticed -- and it
+        matters now because a multi-hour Full_Run must survive being resumed.
+        ``plan.load_ckpt`` already does this; so does ``probe_ccr_curvature.py``.
+
+        Failure is a warning, not an error: ``torch.load`` can still succeed if the module
+        happens to be importable already, and a resume attempt should not be turned into a
+        hard stop by a best-effort import.
+        """
+        try:
+            from models.dino import DinoV2Encoder
+
+            name = "dinov2_vits14"
+            try:
+                name = str(self.cfg.encoder.get("name", name) or name)
+            except Exception:  # noqa: BLE001 - encoder may not be a DINOv2 config at all
+                pass
+            _ = DinoV2Encoder(name, "x_norm_patchtokens")
+        except Exception as exc:  # noqa: BLE001 - any hub/cache failure is non-fatal here
+            log.warning(
+                "Could not pre-import the DINOv2 hub module (%s); torch.load may still "
+                "succeed if it is already importable.", exc
+            )
+
     def load_ckpt(self, filename="model_latest.pth"):
         # weights_only=False: checkpoints store full nn.Module objects, not just
         # state-dicts. Required on torch>=2.6 (where weights_only defaults to True).
+        self._warm_dino_hub()
         ckpt = torch.load(filename, weights_only=False)
         self._loaded_optim_state = {}
         for k, v in ckpt.items():

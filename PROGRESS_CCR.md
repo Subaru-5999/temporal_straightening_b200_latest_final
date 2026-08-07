@@ -297,11 +297,20 @@ a materialised `(b, h, T, T)` attention matrix.
 Projected Full_Run at 0.573 it/s: `123,858 / 0.573 = 216,157 s` = **60.0 h**, against the 17 h
 in the recorded plan.
 
-**PRELIMINARY — confirm before acting.** This is the *first* telemetry row, which includes
-dataset loading and first-iteration warmup. The reference run's own first row read 2.548 vs its
-2.862 median, i.e. ~11% depressed. Earlier in this project a 50-step smoke test at 1.890 it/s
-was misread as a real regression when the sustained rate was 2.862 — do not repeat that. Read
-the median over rows 400/600/800 before revising the compute plan.
+**CONFIRMED, not warmup.** Six rows: 0.5725 @200, then 0.5892, 0.5890, 0.5892, 0.5896, 0.5887
+through iteration 1,200. Sustained rate **0.589 it/s**, reference 2.84-2.88 at the same
+iterations. Full_Run on this path = `123,858 / 0.589` = **58.4 h**.
+
+**CCR is learnable — a real positive signal.** Raw CCR fell 0.339185 @200 → 0.199388 @1200, a
+41% reduction, while its share *rose* 5.32% → 6.67% because the total loss fell faster. So the
+encoder is genuinely straightening the off-log rollouts rather than the term being trivially
+absorbed. Gate check 4 (raw not below 1e-3 inside 1,000 iterations) passes with four orders of
+magnitude to spare.
+
+**Watch, do not yet conclude:** at iteration 1,200 our prediction loss is 0.055630 against the
+reference's 0.048998, i.e. 13.5% worse — the "CCR squeezes the prediction loss" risk. But at
+1,000 it was 3.3% *better* (0.052731 vs 0.054557), so this is row-to-row noise, not a trend.
+Mid-run readings are failure detectors, not trajectories.
 
 **Options, with modelled rates (pending confirmation).** All of them are decisions for the
 user, not defaults to apply:
@@ -566,6 +575,17 @@ which is the point, but also the risk.
 - **The scope guard flags runtime artifacts as violations.** `*.out`, `results_per_seed.csv`
   and `results_cells.csv` are generated on the pod; they are gitignored now. A scope test that
   cries wolf is worse than no scope test.
+- **`train.py` resume was broken for DINOv2 runs** and nobody noticed, because every run so far
+  started fresh. `init_models` calls `load_ckpt` *before* building the encoder, so `torch.load`
+  hits `ModuleNotFoundError: No module named 'dinov2'` while unpickling whole `nn.Module`
+  objects whose classes live in the `torch.hub` cache. Fixed by `Trainer._warm_dino_hub`,
+  mirroring what `plan.load_ckpt` and `probe_ccr_curvature.py` already did. **A multi-hour
+  Full_Run depends on resume working, so verify it before launching one.**
+- **A relaunch into the same run directory RESUMES.** `ccr_fast_attention` and
+  `ccr_grad_checkpoint` are deliberately outside `LOSS_SIGNATURE_KEYS`, so the guard allows it.
+  That is correct behaviour but it appends to the existing `training_log.jsonl`, mixing step
+  rates from two configurations in one file. For a clean measurement use a fresh
+  `CKPT_BASE=$PWD/checkpoints_<tag>`.
 - `run_ccr_pilot.sh` applies the whole Blackwell/MIG env recipe and refuses to start if the
   slice is busy.
 - **Read loss shares, not loss values** (`SHORT_BUDGET_PILOTS.md` §6).
