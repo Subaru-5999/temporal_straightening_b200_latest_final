@@ -37,12 +37,16 @@ training:
   lambda_cf: 0.0            # weight on the CCR term; 0 disables the whole path
   ccr_rho: 0.0              # perturbation radius in normalized-action units (dimensionless)
   ccr_rollout_len: 5        # imagined predictor steps; default == planner horizon (25/frameskip 5)
-  # Recompute the CCR rollout's predictor calls in backward instead of storing them.
-  # Numerically neutral (RNG state is preserved across the recomputation), costs ~1 extra
-  # forward on the CCR path only. ON by default: a predictor call stores ~8 GB of attention
-  # activations at the target-cell shapes, so L=5 without this needs ~40 GB more than the
-  # 45 GB MIG slice has. Turn it off only on a GPU with room to spare.
-  ccr_grad_checkpoint: true
+  # Run the CCR rollout's attention through scaled_dot_product_attention instead of
+  # materialising the (batch, heads, 588, 588) score matrix. Faster AND lighter, so this is
+  # the preferred lever and the default. Confined to the CCR path: the baseline prediction
+  # loss, `rollout` and every planning call keep the original attention bitwise, which is
+  # why enabling this does not invalidate the measured Platform_Baseline.
+  ccr_fast_attention: true
+  # Recompute the CCR rollout's predictor calls in backward instead of storing them. Trades
+  # ~33% more compute for most of the memory. Only needed when ccr_fast_attention is false;
+  # with fast attention on there is nothing large to store, so this defaults to false.
+  ccr_grad_checkpoint: false
   ccr_action_source: synthetic   # 'logged' | 'synthetic'; synthetic keeps the default L=5 feasible
   # --- Metric-Consistent Aggregation (pilot only, default OFF) ---
   mca_weight: 0.0

@@ -1,5 +1,7 @@
 # adapted from https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/vit.py
+import contextlib
 import torch
+import torch.nn.functional as F
 from torch import nn
 from einops import rearrange, repeat
 
@@ -36,6 +38,21 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class Attention(nn.Module):
+    # Class-level switch, DEFAULT OFF. When False every op below is exactly what it was
+    # before, so the baseline objective, `rollout`, `plan.py` and `planning/*` are bitwise
+    # unchanged and the measured Platform_Baseline stays valid without a retrain.
+    #
+    # When True, attention runs through `F.scaled_dot_product_attention`, which never
+    # materialises the (b, heads, T, T) score matrix. At the PushT target-cell shapes that
+    # matrix is (32, 16, 588, 588) = 177 M elements = 354 MB in bf16, kept twice per layer
+    # (softmax output and dropout output) across depth=6 -- roughly 6-8 GB of activations
+    # per predictor call, and about 0.09 s. It is simultaneously why CCR at L=5 OOM'd a
+    # 45 GB slice and why it runs 4.5x slower than the baseline.
+    #
+    # Flip it with the `sdpa_attention` context manager, never by assignment, so the
+    # previous value is always restored.
+    use_sdpa = False
+
     def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
         super().__init__()
         inner_dim = dim_head *  heads
@@ -68,16 +85,50 @@ class Attention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        # apply causal mask
-        dots = dots.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        if Attention.use_sdpa:
+            # Same function, computed without ever forming the T x T score matrix.
+            # `attn_mask` is bool with True = "may attend", the inverse convention of the
+            # masked_fill below. `scale` is passed explicitly rather than relying on
+            # SDPA's default so the two branches cannot drift apart.
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=(self.bias[:, :, :T, :T] != 0),
+                dropout_p=(self.dropout.p if self.training else 0.0),
+                scale=self.scale,
+            )
+        else:
+            dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+            # apply causal mask
+            dots = dots.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
 
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
+            attn = self.attend(dots)
+            attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v)
+            out = torch.matmul(attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
+
+@contextlib.contextmanager
+def sdpa_attention(enabled=True):
+    """Scope `Attention.use_sdpa`, restoring the previous value on exit.
+
+    Used to run *only* the CCR imagined rollout through the memory-light attention while
+    the baseline prediction loss, `rollout` and every planning call keep the original
+    materialised path. Both uses share the same weights; only the implementation of the
+    forward differs, and the two agree to bf16 rounding (see
+    `tests/test_vit_sdpa_equivalence.py`).
+
+    This mutates class state, so it assumes a single training process -- which is what the
+    1g.45gb MIG slice runs. It is a context manager rather than an assignment specifically
+    so a raised exception cannot leave the fast path enabled for the baseline term.
+    """
+    previous = Attention.use_sdpa
+    Attention.use_sdpa = bool(enabled)
+    try:
+        yield
+    finally:
+        Attention.use_sdpa = previous
+
 
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):

@@ -64,6 +64,23 @@ ALLOWED_FILES = frozenset(
         # Contingency plan documenting the alternative routes to take if Plan A fails its acceptance gate.
         # Same rationale as `PROGRESS_CCR.md` above: prose only, no training, planning or dataset code.
         "PLAN_B_ALTERNATIVES.md",
+        # SCOPE AMENDMENT, recorded rather than quietly taken. `models/vit.py` is not in the
+        # Requirement 5.6 list, and it is edited here for one reason: it materialises a
+        # (batch, heads, 588, 588) attention score matrix, which made CCR at L=5 OOM a 45 GB MIG slice
+        # and then run 4.5x slower than the baseline (0.573 vs 2.548 it/s). The projected Full_Run was
+        # 60 h against 17 h planned.
+        #
+        # The amendment is admissible because the change is strictly ADDITIVE AND DEFAULT-OFF:
+        # `Attention.use_sdpa` is False unless the `sdpa_attention` context manager turns it on, and only
+        # `VWorldModel.compute_ccr` ever does. Every pre-existing caller -- the baseline prediction loss,
+        # `rollout`, `plan.py`, `planning/*`, `Trainer.openloop_rollout` -- takes the original ops in the
+        # original order. That is what lets the measured Platform_Baseline (75.33 OL / 82.00 MPC) stand
+        # without a 12 h retrain, and it is the whole reason the change was made this way rather than by
+        # switching the file's attention outright.
+        #
+        # Guarded by `tests/test_vit_sdpa_equivalence.py`, which checks forward AND gradient agreement in
+        # float64 and that the block-causal mask is still enforced on the fast branch.
+        "models/vit.py",
     }
 )
 

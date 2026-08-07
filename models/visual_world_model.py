@@ -8,6 +8,8 @@ import logging
 from torchvision import transforms
 from einops import rearrange, repeat
 
+from models.vit import sdpa_attention
+
 log = logging.getLogger(__name__)
 
 # Permitted values for `training.ccr_action_source`.
@@ -44,7 +46,8 @@ class VWorldModel(nn.Module):
         lambda_cf=0.0,
         ccr_rho=0.0,
         ccr_rollout_len=5,
-        ccr_grad_checkpoint=True,
+        ccr_grad_checkpoint=False,
+        ccr_fast_attention=True,
         ccr_action_source="synthetic",
         mca_weight=0.0,
         **kwargs,
@@ -102,12 +105,22 @@ class VWorldModel(nn.Module):
         self.lambda_cf = float(0.0 if lambda_cf is None else lambda_cf)
         self.ccr_rho = float(0.0 if ccr_rho is None else ccr_rho)
         self.ccr_rollout_len = int(5 if ccr_rollout_len is None else ccr_rollout_len)
-        # Memory/compute tradeoff on the CCR rollout only; numerically neutral, so it is
-        # deliberately in neither ccr_tag nor LOSS_SIGNATURE_KEYS. Default True because
-        # without it the PushT target cell at L=5 needs ~40 GB of extra activation
-        # memory and OOMs the 45 GB MIG slice.
+        # Two independent ways to make the CCR rollout affordable, both confined to the CCR
+        # path and both numerically neutral to bf16 rounding, so they are deliberately in
+        # neither ccr_tag nor LOSS_SIGNATURE_KEYS -- toggling either must not rename a run
+        # or block a resume.
+        #
+        #   ccr_fast_attention   scaled_dot_product_attention instead of a materialised
+        #                        (b, heads, 588, 588) score matrix. FASTER AND LIGHTER, so
+        #                        it is the default and the preferred lever.
+        #   ccr_grad_checkpoint  recompute the rollout in backward instead of storing it.
+        #                        Trades ~33% more compute for most of the memory. Only
+        #                        needed when fast attention is off; default False.
         self.ccr_grad_checkpoint = bool(
-            True if ccr_grad_checkpoint is None else ccr_grad_checkpoint
+            False if ccr_grad_checkpoint is None else ccr_grad_checkpoint
+        )
+        self.ccr_fast_attention = bool(
+            True if ccr_fast_attention is None else ccr_fast_attention
         )
         self.ccr_action_source = str(
             "synthetic" if ccr_action_source is None else ccr_action_source
@@ -176,16 +189,26 @@ class VWorldModel(nn.Module):
                 "CCR enabled: term=ccr, weight(lambda_cf)=%s, rho=%s, rollout_len=%s, "
                 "action_source=%s, synthesized_action_frames=max(0, %s + %s - 1 - "
                 "num_frames) [resolved on the first forward], curvature_mode=aggcos, "
-                "grad_checkpoint=%s, device=%s",
+                "fast_attention=%s, grad_checkpoint=%s, device=%s",
                 self.lambda_cf,
                 self.ccr_rho,
                 self.ccr_rollout_len,
                 self.ccr_action_source,
                 self.num_hist,
                 self.ccr_rollout_len,
+                self.ccr_fast_attention,
                 self.ccr_grad_checkpoint,
                 _ccr_device,
             )
+            if not self.ccr_fast_attention and not self.ccr_grad_checkpoint:
+                log.warning(
+                    "CCR has fast_attention=False AND grad_checkpoint=False. At the PushT "
+                    "target-cell shapes each of the %s predictor calls stores ~6-8 GB of "
+                    "attention activations, so this configuration needs tens of GB more "
+                    "than a 45 GB MIG slice has and will almost certainly raise "
+                    "torch.OutOfMemoryError on the first backward. Enable one of them.",
+                    self.ccr_rollout_len,
+                )
         if self.mca:
             log.info(
                 "MCA enabled: term=mca, weight(mca_weight)=%s, rho=n/a, device=%s",
@@ -544,7 +567,7 @@ class VWorldModel(nn.Module):
         return z
 
 
-    def _predict_maybe_checkpointed(self, z, checkpoint):
+    def _predict_maybe_checkpointed(self, z, checkpoint, fast_attention=False):
         """``predict``, optionally recomputed in backward instead of stored.
 
         A single ``predict`` call at the PushT target-cell shapes stores about **8 GB**
@@ -568,14 +591,24 @@ class VWorldModel(nn.Module):
 
         Checkpointing is skipped when grad is disabled -- under ``torch.no_grad`` there
         is no backward to save memory for, and ``checkpoint`` would only warn.
-        """
-        if not checkpoint or not torch.is_grad_enabled():
-            return self.predict(z)
-        return torch.utils.checkpoint.checkpoint(
-            self.predict, z, use_reentrant=False
-        )
 
-    def _rollout_latents(self, z, action, checkpoint=False):
+        ``fast_attention`` routes this call through
+        ``F.scaled_dot_product_attention``, which never forms the T x T score matrix and
+        is both faster and lighter.  The context manager is entered *inside* the
+        checkpointed callable, not around it: a checkpointed segment is recomputed during
+        **backward**, long after an enclosing ``with`` block would have exited, and a
+        recomputation on the other branch would silently produce activations that do not
+        match the ones the forward recorded.
+        """
+        def _run(z_in):
+            with sdpa_attention(fast_attention):
+                return self.predict(z_in)
+
+        if not checkpoint or not torch.is_grad_enabled():
+            return _run(z)
+        return torch.utils.checkpoint.checkpoint(_run, z, use_reentrant=False)
+
+    def _rollout_latents(self, z, action, checkpoint=False, fast_attention=False):
         """Predictor rollout body.
 
         Identical tensor ops, in identical order, to the previous ``rollout`` loop.
@@ -587,18 +620,25 @@ class VWorldModel(nn.Module):
                     ``plan.py``, ``planning/*`` and ``Trainer.openloop_rollout`` -- take
                     the original path unchanged (Property 7).  Only ``compute_ccr``
                     passes True.
+                fast_attention: run these predictor calls through
+                    ``scaled_dot_product_attention``.  Also default False for the same
+                    reason, and also only ever True from ``compute_ccr``.
         output: z: (b, n+t+1, num_patches, emb_dim)
         """
         t = 0
         inc = 1
         while t < action.shape[1]:
-            z_pred = self._predict_maybe_checkpointed(z[:, -self.num_hist :], checkpoint)
+            z_pred = self._predict_maybe_checkpointed(
+                z[:, -self.num_hist :], checkpoint, fast_attention
+            )
             z_new = z_pred[:, -inc:, ...]
             z_new = self.replace_actions_from_z(z_new, action[:, t : t + inc, :])
             z = torch.cat([z, z_new], dim=1)
             t += inc
 
-        z_pred = self._predict_maybe_checkpointed(z[:, -self.num_hist :], checkpoint)
+        z_pred = self._predict_maybe_checkpointed(
+            z[:, -self.num_hist :], checkpoint, fast_attention
+        )
         z_new = z_pred[:, -1 :, ...] # take only the next pred
         z = torch.cat([z, z_new], dim=1)
         return z
@@ -712,6 +752,7 @@ class VWorldModel(nn.Module):
             z_ctx,
             act_cf[:, self.num_hist : required],
             checkpoint=self.ccr_grad_checkpoint,
+            fast_attention=self.ccr_fast_attention,
         )
         # Last L + 2 frames: every velocity pair entering _cos_curvature touches at least
         # one imagined frame, so the purely-real triple the baseline term already penalises

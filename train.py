@@ -924,6 +924,7 @@ class Trainer:
             ccr_rho=self.cfg.training.get("ccr_rho"),
             ccr_rollout_len=self.cfg.training.get("ccr_rollout_len"),
             ccr_grad_checkpoint=self.cfg.training.get("ccr_grad_checkpoint"),
+            ccr_fast_attention=self.cfg.training.get("ccr_fast_attention"),
             ccr_action_source=self.cfg.training.get("ccr_action_source"),
             mca_weight=self.cfg.training.get("mca_weight"),
         )
