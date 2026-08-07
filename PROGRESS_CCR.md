@@ -486,6 +486,59 @@ to isolate an effect exactly. It also means the "free matched-budget control" id
 earlier prefix exactly, so a lost intermediate checkpoint can always be regenerated for its cost in
 steps.
 
+## 6h. FINAL: matched 8k success-rate comparison — CCR LOSES ON BOTH. STOP.
+
+`SEEDS=100`, one seed, both arms under the unmodified Evaluation_Protocol. Training is bitwise
+deterministic (§6g) and episodes are seeded identically, so these are **exact paired differences**,
+not estimates: counts of episodes, 2 percentage points each.
+
+| arm | open-loop | MPC |
+|---|---|---|
+| CTRL @8k | 16.0 | 18.0 |
+| CCR @8k | 14.0 | 10.0 |
+| **Δ (CCR − control)** | **−2.0 (1 episode)** | **−8.0 (4 episodes)** |
+| BASE @124k (the gate comparator) | 75.33 ± 6.11 | 82.00 ± 2.00 |
+
+### Every downstream measurement, collected
+
+| measurement | result |
+|---|---|
+| off-log curvature gap | **−96%** — CCR works perfectly at its stated objective |
+| prediction loss vs matched control | **+16.9%** worse, 8/8 consecutive rows, p ≈ 0.004 |
+| state readout, aggregate, matched, n=192 | +0.005 — nothing |
+| state readout, `block_angle`, matched, n=192 | −0.035 (−9%; was −28% at n=64, so mostly noise) |
+| success rate, open-loop, matched | **−2.0 pts** |
+| success rate, MPC, matched | **−8.0 pts** |
+| step time | **2.4x** slower → 29 h Full_Run |
+
+**CCR does exactly what it was designed to do and none of it converts.** Dual gate estimate:
+**~3-4%**. **Do not launch the Full_Run.**
+
+### Limits of this conclusion, stated fairly
+
+8,000 steps is 6.5% of the budget; both arms sit near the floor (10-18%); the test is structurally
+biased against CCR because its cost is immediate while any benefit may need longer to convert; and
+one seed does not establish generalization to other episode sets. This is **not proof that CCR fails
+at full budget.** It is the absence of any positive signal across five downstream measurements,
+against four negative ones, with the burden of proof on CCR to justify 29 GPU-hours.
+
+### What the CCR effort established (the writeup)
+
+1. **A clean platform reproduction** of the paper's PushT target cell: 75.33 ± 6.11 OL / 82.00 ± 2.00
+   MPC against the paper's 77.33 ± 6.18 / 85.33 ± 4.99, within 1 SE on both.
+2. **The paper's unproven coverage condition, measured.** Proposition `app_cos` bounds `(A − I)` only
+   along visited velocity directions. Off-log trajectories *are* measurably more curved — 5/5 state
+   dimensions at `rho = 0.5`, ratios 0.29-0.42 — so the gap the bound leaves open is real, not
+   hypothetical.
+3. **Off-log curvature is almost entirely removable, cheaply.** 96% of the perturbation-induced gap
+   eliminated in 6.5% of a training budget.
+4. **And removing it does not help planning.** −2.0 OL / −8.0 MPC at matched budget, with a 16.9%
+   prediction-loss cost. So latent-geometry conditioning off the data manifold is *not* the binding
+   constraint on PushT.
+
+Total cost ~26 GPU-h. That is a coherent negative result about a specific, previously unexamined step
+in the paper's argument.
+
 ## 7. Next actions, in order
 
 Common preamble for every command below:
