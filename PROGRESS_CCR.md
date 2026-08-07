@@ -33,8 +33,8 @@ dual acceptance gate, and the iteration cap accepted as in-scope infrastructure.
 | Test suite | **16/16 passing on the pod** |
 | Baseline train (paper's method, CCR off) | **COMPLETE** — 123,858 steps, 12.04 h |
 | Offline probe (rung 1) | **COMPLETE — gate PASS at `rho = 0.5`** |
-| Baseline 3-seed eval (task 18.1) | **not started — this is the next GPU action, ahead of the pilots** |
-| Pilot arms (rung 2) | not started — queue behind the baseline eval |
+| Baseline 3-seed eval (task 18.1) | **COMPLETE — 75.33 ± 6.11 OL / 82.00 ± 2.00 MPC, inside band** |
+| Pilot arms (rung 2) | **not started — first launch stalled on a zombie chain, see §7a** |
 | Full CCR run | not started — blocked on pilot gate |
 | Acceptance gate verdict | not started |
 
@@ -66,10 +66,23 @@ directory byte-identical to the legacy name.
 default-off contract at runtime, and its first 8,000 steps are the **free matched-budget
 control** (`SHORT_BUDGET_PILOTS.md` §4), which is why no control pilot arm is needed.
 
-Expected eval result once 18.1 runs: **~75-78 OL / ~82-85 MPC**. Paper prints 77.33±6.18 /
-85.33±4.99; the prior B200 reproduction of this cell was ~75.3 / ~82.0
-(`AGENT_MEMORY_2.0.md` §8). Below ~72 OL or above ~82 OL are both reasons to **stop and
-investigate** before touching CCR.
+### 3a. Its measured evaluation (task 18.1, COMPLETE — 1 h 26 m)
+
+`bash run_ccr_pilot.sh eval "$RUN_DIR"`, log `ccr_eval_baseline.log`, all six jobs OK.
+
+| setting | measured | paper | prior B200 |
+|---|---|---|---|
+| open-loop | **75.33 ± 6.11** (74, 82, 70) | 77.33 ± 6.18 | ~75.3 |
+| MPC | **82.00 ± 2.00** (82, 80, 84) | 85.33 ± 4.99 | ~82.0 |
+
+**Verdict: inside the pre-registered band** (~75-78 OL / ~82-85 MPC), and within 1 SE of the
+paper on both settings (−2.00 OL, −3.33 MPC against a ~5.7 pt binomial SE at n=50). It lands
+essentially on top of the prior B200 reproduction, and the open-loop std of 6.11 against the
+paper's 6.18 says even the noise structure matches. The reproduction is sound; the
+Platform_Baseline is now measured, not assumed.
+
+Read the open-loop per-seed values as the noise reality of this whole comparison: **74, 82,
+70** — a 12-point spread over three seeds on the *same checkpoint*.
 
 ---
 
@@ -221,9 +234,20 @@ strong" was wrong** — at the measured `c` it lands at 29% and is admissible.
 4. Raw CCR term does **not** fall below `1e-3` in the first 1,000 iterations. If it does, the
    term absorbed the task without pressuring the encoder → **not a success**.
 
-**Acceptance gate (dual).** Pass requires beating **77.33 OL and 85.33 MPC** *and* both
-re-measured Platform_Baseline rates. One condition alone = failure. Margin ≤6 pts =
-inconclusive. Use `python ccr_acceptance_gate.py`.
+**Acceptance gate (dual) — now resolvable to absolute numbers.** Pass requires beating
+**77.33 OL and 85.33 MPC** (paper) *and* both measured Platform_Baseline rates
+(**75.33 OL / 82.00 MPC**), with a margin over the baseline above 6 pts. One condition alone =
+failure. Taking the max of each pair of constraints:
+
+| setting | paper leg | baseline + 6 pt margin | **binding target** | delta CCR must add |
+|---|---|---|---|---|
+| open-loop | 77.33 | 75.33 + 6 = 81.33 | **81.33** | **+6.0** |
+| MPC | 85.33 | 82.00 + 6 = 88.00 | **88.00** | **+6.0** |
+
+The margin rule binds on both settings, so the gate is asking for exactly the ~6.6 pt effect
+the noise floor says is the minimum detectable one. Worth noting that the baseline landing at
+the *low* end of its band (82.00 MPC rather than 85) **lowered** the absolute bar: had it come
+in at 85, the MPC target would have been 91.00. Use `python ccr_acceptance_gate.py`.
 
 ---
 
@@ -236,7 +260,33 @@ export DATASET_DIR=/workspace/arun/data          # run_ccr_pilot.sh dies without
 RUN_DIR=$PWD/checkpoints/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05
 ```
 
-### Step 1 — baseline 3-seed eval FIRST (task 18.1, ~1.5 h GPU)
+### Step 0 — the chained pilot launch FAILED to start; relaunch unchained
+
+**What happened (2026-08-06/07).** The baseline eval (driver 4032390) finished at 19:47:55.
+The pilot (driver 4032433) was chained on it with `CHAIN_ON_PID` and was still sitting in
+`wait_for_driver_pid` **7 h 46 m later**, having never launched `train.py`: no
+`Iteration budget` line, no `CCR enabled` line, no run directory. ~6 h of idle GPU.
+
+**Cause.** `while kill -0 "$pid"; do sleep 30; done` is not a sufficient exit condition.
+`setsid` detaches the driver, so on exit its parent is PID 1 — and in this container PID 1 does
+not reap. The finished eval driver lingered as a **zombie**, its pid stayed in the process
+table, `kill -0` kept succeeding, and the loop waited on a job that had already finished.
+
+**Fixed** in `run_ccr_pilot.sh`: the loop now reads `ps -o stat=` and treats `Z*` or an empty
+state as gone, and prints a heartbeat every 30 min so a silent multi-hour wait is
+distinguishable from a hang. Confirm with `ps -p <pid> -o pid,stat,etime,cmd` — a `Z` or
+`<defunct>` is a finished job, not a running one.
+
+**Recovery.** The slice is free, so chain nothing:
+```bash
+kill 4032433                                  # the stuck driver; it holds no GPU memory
+bash run_ccr_pilot.sh pilot \
+  training.lambda_cf=0.04 training.ccr_rho=0.5 \
+  training.ccr_action_source=synthetic training.ccr_rollout_len=5 \
+  training.mca_weight=0
+```
+
+### Step 1 — baseline 3-seed eval (task 18.1) — DONE, see §3a
 **This goes before the pilots**, even though the spec numbers it with the acceptance-gate
 group. It depends on nothing but the baseline checkpoint, which is on disk, and it is the only
 check that the whole `plan.py` evaluation path produces a number in the paper's band. Run
@@ -397,6 +447,12 @@ which is the point, but also the risk.
 - **One job per MIG slice.** `1g.45gb` holds exactly one. Chain on the **driver's PID**
   (`CHAIN_ON_PID`), never on the absence of its children. `setsid` exits immediately so `$!`
   is not the driver's pid.
+- **`kill -0` succeeds on a zombie.** PID 1 does not reap in this container, so a finished
+  detached driver lingers as `stat Z` / `<defunct>` and a naive `kill -0` chain waits on it
+  forever. Always check `ps -p <pid> -o stat=`: `Z` means finished. Fixed in
+  `run_ccr_pilot.sh`, but the same trap applies to any hand-rolled wait loop.
+- **A chained launch that prints "No 'Model saved dir:' line after 240s" is normal** — the
+  driver has not started `train.py` yet. `report_launch` now says so instead of warning.
 - **`nvidia-smi` does not enumerate processes on MIG.** Use `ps`. Kill stopped (`T`/`Tl`)
   pythons — a suspended job keeps its CUDA context and its memory.
 - **Never Ctrl-Z a GPU job.**

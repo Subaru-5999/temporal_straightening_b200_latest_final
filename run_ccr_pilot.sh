@@ -172,13 +172,34 @@ preflight_or_die() {
 # Chain on the DRIVER's pid, never on the absence of its children.
 # ---------------------------------------------------------------------------
 wait_for_driver_pid() {
-  local pid="$1"
+  local pid="$1" state waited=0
   if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
     die "CHAIN_ON_PID='$pid' is not a pid. Pass the contents of an earlier run's .pid file."
   fi
+  if [[ "$pid" == "$$" ]]; then
+    die "CHAIN_ON_PID=$pid is this driver's own pid; it would wait for itself forever."
+  fi
   echo "chaining: waiting for driver pid ${pid} to exit before launching..."
+  # `kill -0` alone is NOT enough. setsid detaches the driver, so when it exits its
+  # parent is PID 1 -- and in a container PID 1 is often not a reaping init. The
+  # driver then lingers as a ZOMBIE (stat Z, "<defunct>"), the pid stays in the
+  # process table, `kill -0` keeps succeeding, and this loop waits forever on a job
+  # that finished hours ago. That has already cost this project ~6 h of idle GPU.
+  # A zombie holds no CUDA context and no GPU memory, so it must read as "gone".
   while kill -0 "$pid" 2>/dev/null; do
+    state="$(ps -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -z "$state" || "$state" == Z* ]]; then
+      echo "chaining: driver pid ${pid} is a zombie (stat='${state:-<none>}'); it has" \
+           "exited and holds no GPU memory. Treating it as gone."
+      break
+    fi
     sleep 30
+    waited=$((waited + 30))
+    # Heartbeat every 30 min: a silent multi-hour wait is indistinguishable from a
+    # hang, which is exactly how the failure above went unnoticed.
+    if (( waited % 1800 == 0 )); then
+      echo "chaining: still waiting on pid ${pid} (stat=${state}) after $((waited / 60)) min."
+    fi
   done
   echo "chaining: driver pid ${pid} is gone; continuing."
 }
