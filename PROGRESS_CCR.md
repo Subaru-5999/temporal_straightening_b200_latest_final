@@ -334,6 +334,66 @@ naive `kill -0`, so it span for 2h39m past a job that finished at 05:09 — **2h
 free slice.** This is the second time the same zombie trap cost time; `run_ccr_pilot.sh` was already
 fixed for it and the throwaway loop was not. Any wait loop must check `ps -p <pid> -o stat=` for `Z`.
 
+## 6c. Probe of the pilot's 8k checkpoint — "GATE FAIL" means CCR SUCCEEDED
+
+`probe_outputs/ccr_pilot8k.json`, 68.6 s, `rho=0.5 L=5 synthetic`, checkpoint sha256
+`0ea15e21…` unchanged. The `pristine` reference now resolves (the device fix works: "Moved 6
+non-buffer tensor attribute(s) to CPU").
+
+**Do not read the headline verdict at face value.** The gate asks "is there excess off-log
+curvature available to fix?" That is the right question for a *baseline* checkpoint and the wrong
+one for a *CCR-trained* checkpoint, where a FAIL means the target was eliminated:
+
+| quantity | baseline ckpt | CCR ckpt @8k | change |
+|---|---|---|---|
+| unperturbed off-log curvature | 0.155470 | **0.032888** | **−79%** |
+| perturbation-induced gap | 0.073174 | **0.005352** | **−93%** |
+| dimensions passing the gate | 5 of 5 | 1 of 5 | target removed |
+
+**CCR is maximally effective at its stated objective**, achieved in 6.5% of the training budget.
+Links 1 and 2 of the mechanism chain are now both confirmed: off-log trajectories are more curved,
+and CCR straightens them almost completely. Only link 3 — does that raise success rate — is open.
+
+### `state_readout_r2`: better on all five, but confounded
+
+| dimension | baseline (124k steps) | CCR (8k steps) | delta |
+|---|---|---|---|
+| aggregate | 0.675878 | **0.733137** | +0.057 |
+| agent_x | 0.727565 | 0.769019 | +0.041 |
+| agent_y | 0.502438 | 0.618116 | +0.116 |
+| block_x | 0.799777 | 0.837943 | +0.038 |
+| block_y | 0.734649 | 0.741352 | +0.007 |
+| block_angle | 0.183020 | 0.200866 | +0.018 |
+
+(`pristine` reference for context: aggregate 0.504, `block_angle` −0.995.)
+
+**Unattributable as it stands.** 8,000 steps versus 123,858 — the confound flagged in §6a, running
+in the favourable direction. The baseline's own 8,000-step checkpoint does not exist, because
+`save_ckpt` overwrites `model_latest.pth` and only epoch-boundary files survive.
+
+**On the §6a criterion this is the "argue for B1" branch.** `block_angle` did not improve relative to
+the other four: its gap to fourth place *widened*, 0.319 → 0.417. Still last by a wide margin.
+
+## 6d. NEXT: matched 8,000-step control — ~47 min, resolves the confound
+
+The pre-registered rule did not anticipate a uniform readout improvement. Worth 47 minutes to
+resolve rather than dismissing on a technicality. Train CCR-off for the same 8,000 steps, probe with
+identical flags, compare the five readouts:
+
+```bash
+CKPT_BASE=$PWD/checkpoints_ctrl8k bash run_ccr_pilot.sh pilot \
+  training.lambda_cf=0 training.ccr_rho=0 training.mca_weight=0
+```
+
+| control aggregate R² | interpretation | estimate |
+|---|---|---|
+| ~0.73 | the gain was training length, CCR did nothing to the representation | ~7-10%, stop and write up the negative |
+| ~0.60-0.65 | **CCR genuinely improves state readout** — a different and more direct mechanism than gradient conditioning | **~25-30%, argue for the Full_Run** |
+
+Why the second branch would matter: "better representation → better planning" is a far shorter causal
+chain than "better conditioning → better gradient descent → better planning", and it would sidestep
+the §8(b) objection entirely, since it does not depend on PushT's conditioning being the bottleneck.
+
 ## 7. Next actions, in order
 
 Common preamble for every command below:
