@@ -166,6 +166,36 @@ One-time installs (already done on this pod): torch stays `2.7.0+cu128`; then
 - **Debugging a "hang"**: `ps` state tells a lot (`R`=busy, `S`=blocked/idle, `Tl`=stopped).
   For stacks without ptrace: in-process `faulthandler.dump_traceback_later(..., file=open(...))`.
 
+### 5.1 Git protocol on this pod — PULL ONLY. Results travel by paste.
+
+**The pod is a read-only consumer of the repo. It never commits and never pushes.** It has no
+`user.email` / `user.name` and no GitHub credentials, and this is deliberate, not an oversight to be
+fixed. Consequences worth stating because each one has already cost a round trip:
+
+- **The remote on the pod is `origin`** (`.../temporal_straightening_b200_latest_final.git`). On the
+  authoring machine the same repo is also wired as `latest`. **`git pull latest main` fails on the pod.**
+  Any instruction handed to an operator must say `origin`.
+- **Never hand the pod a `git commit` or `git push`.** `commit` dies with "Author identity unknown",
+  and the `push` that follows it in a pasted block then blocks on an interactive
+  `Username for 'https://github.com':` prompt — which looks like a hang and needs Ctrl-C. If files were
+  already staged with `git add -f`, clear them with `git reset`; the files stay on disk.
+- **Measurement outputs come back through the terminal**, not through git. `probe_outputs/` is gitignored
+  (`.gitignore:14` matches `*outputs*`) so results are pod-local by design. Prefer a small `python -` /
+  `json` extraction that prints only the fields not already recorded in the relevant `PROGRESS_*.md`
+  over `cat`-ing whole reports into the scrollback.
+- **Always begin a pasted pod block with `git pull origin main` followed by
+  `git log --oneline -1` and the expected SHA.** Without that assertion a failed pull is invisible: every
+  later command runs against stale code and fails with a *misleading* error. This happened with the
+  Stage-0 ACS probe, where the stale checkout reported "the following arguments are required: --ckpt"
+  instead of anything about staleness.
+- **Never paste an unresolved placeholder.** `export DATASET_DIR=/path/to/datasets` was pasted verbatim
+  once. The real value is `/workspace/arun/data`, recorded in this file, `POD_SETUP_LOG.md`,
+  `REPRODUCTION.md` and every `run_*.sh` default.
+
+The generalization, since three separate round trips had the same root cause: **do not assume the pod's
+git remotes, credentials, identity, env vars or dataset inventory match the authoring machine's.** Verify
+or make the command self-checking.
+
 ---
 
 ## 6. Files created/changed during this effort

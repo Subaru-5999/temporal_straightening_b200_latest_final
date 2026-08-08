@@ -660,10 +660,14 @@ Validation split (cross-check):
 | point_maze (umaze) | raw | −0.0061 | −0.0058 | 0.5075 | 0.1258 | 0.5794 | 32,400 | 16,200 |
 | point_maze (umaze) | first | −0.0097 | −0.0222 | 0.5072 | 0.3142 | 0.5580 | 32,400 | 16,200 |
 
-- **20-bin histograms over `[-1, 1]`:** in the JSON reports under `splits.<split>.reductions.<r>.cos_histogram`,
-  not reproduced here. The two moments are misleading for UMaze in particular: `mean cos = 0.0027` with
-  `frac(cos<0) = 0.4983` is not a narrow distribution around zero, it is a broad one, and the histogram
-  is the only place that distinction is visible.
+- **20-bin histograms over `[-1, 1]`: _pending transcription_.** They live in the JSON reports under
+  `splits.<split>.reductions.<r>.cos_histogram`, and those reports are **pod-local and gitignored**
+  (`.gitignore:14` matches `*outputs*`; the pod is pull-only, see `AGENT_MEMORY_2.0.md` §5.1), so they
+  are **not** in version control. Bin counts to be transcribed into this file — the edges are
+  deterministic, 20 equal bins over `[-1, 1]`. This matters rather than being bookkeeping: the two
+  moments are actively misleading for UMaze, where `mean cos = 0.0027` with `frac(cos<0) = 0.4983` is a
+  **broad** distribution and not a narrow one around zero, and the histogram is the only place that
+  distinction is visible.
 - **Validation cross-check: agrees on every ordering.** `frac(cos<0)` train vs validation is
   0.1504/0.1331 (pusht), 0.0785/0.0796 (wall), 0.4983/0.5088 (umaze). The rule-A ordering is identical
   on both splits, so the verdict below is not a split artifact.
@@ -834,6 +838,7 @@ not kept, not that no mistakes were made.
 | 1 | 2026-08-08 | **Property 4 as specified in `design.md` was nearly vacuous.** The design states the gate-detachment property over `d(L_acs)/dz` only. Because `w` is a function of `act`, deleting `.detach()` from `action_gate` leaves `d(L_acs)/dz` **bitwise unchanged** — the test would have passed on precisely the attached gate Requirement 5.3 forbids, and the λ-reduction confound the whole design exists to eliminate would have shipped invisibly | minutes; caught before the term existed | Deliberate mutation check while writing task 3.4: `.detach()` was removed from the shipped source and the test still passed. Fixed by extending the substitution comparison to `act` and the encoder / `action_encoder` / `proprio_encoder` parameters; re-verified that 6 of 11 tests then fail on the mutant, and the source was restored |
 | 2 | 2026-08-08 | **A relative float tolerance was the wrong instrument for the `sum` reduction** in task 3.5. When substeps cancel, the reduced vector is small while the addends are not, so the relative error is unbounded while the absolute error stays at `eps · Σ|x_s|` | minutes | hypothesis falsified the first draft immediately. Replaced with a derived per-triple bound `8·eps·(n + f·(κ₁+κ₂))` carrying the cancellation amplification `κ`, measured to have ~13x headroom over 6,000 draws |
 | 3 | 2026-08-08 | **Stage-0 instructions handed to the operator contained an unresolved placeholder** — `export DATASET_DIR=/path/to/datasets` — and named the git remote `latest`, which exists only on the authoring machine and not on the pod (where it is `origin`) | one round trip, ~minutes, 0 GPU-h | The pod's `git pull` failed, so every command after it silently ran against the pre-`--readout` code and produced a misleading "the following arguments are required: --ckpt" instead of an obvious staleness error. A `git log --oneline -1` assertion was added to the reissued instructions; the real path `/workspace/arun/data` is recorded in four places in this repo and should have been read rather than placeheld |
+| 5 | 2026-08-08 | **Handed the pod a `git commit` + `git push` sequence, which it has never been able to run.** The pod is a pull-only consumer of the repo with no commit identity and no credentials. `commit` died with "Author identity unknown" and the trailing `push` then blocked on an interactive `Username for 'https://github.com':` prompt that looks like a hang | one round trip, ~minutes, 0 GPU-h | The operator pasted the prompt back. Third instance of one root cause — assuming the pod's setup matches the authoring machine's — after the `latest`-vs-`origin` remote name and the `/path/to/datasets` placeholder. Written up as a standing protocol in `AGENT_MEMORY_2.0.md` §5.1 rather than left as three separate incidents: the pod pulls, results return by terminal paste |
 | 4 | 2026-08-08 | **`point_maze_medium` is not on the pod**, so Stage 0 measured 3 of the 4 environments its rule is pre-registered over. Not checked before issuing the run | none to the verdict — clause 2.6 fires on PushT already being beaten 3.31x by UMaze, which no fourth value can change. Real cost is to N1's four-point ordering claim (§10.4, L1) | The fourth invocation raised `FileNotFoundError` on `states.pth`, and `--summarize` then refused to emit a verdict JSON rather than evaluating a four-environment rule on three — the guard behaved as designed |
 
 Inherited errors worth not repeating, carried from `PROGRESS_CCR.md`:
