@@ -144,6 +144,18 @@ ALLOWED_FILES = frozenset(
         # statistics are collected. Allowlisted here, in the first ACS task, so the guard never reports a
         # violation for a file the feature is required to create; task 4.5 creates it.
         "PROGRESS_ACS.md",
+        # The MCA arm's pre-registration, selected by `PROGRESS_ACS.md` §12 after ACS's Stage 0 returned
+        # STOP. Same rationale as `PROGRESS_CCR.md` and `PROGRESS_ACS.md` above -- prose only, no
+        # training, planning or dataset code -- and required rather than ad-hoc: the escalation ladder
+        # (`SHORT_BUDGET_PILOTS.md` §1, CCR Requirement 11.3) obliges the rung-1 gate to be written down
+        # before the offline probe runs, and the rung-2 gate before the pilot launches.
+        "PROGRESS_MCA.md",
+        # The pod operating protocol (§5.1: pull-only, results return by terminal paste). Added after
+        # three separate round trips lost minutes to the same root cause -- assuming the pod's git
+        # remotes, credentials, env vars and dataset inventory match the authoring machine's. Prose only.
+        # Recorded in the allowlist rather than left as an untracked violation because the alternative is
+        # that the lesson lives only in a chat log.
+        "AGENT_MEMORY_2.0.md",
     }
 )
 
