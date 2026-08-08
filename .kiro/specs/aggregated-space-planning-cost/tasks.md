@@ -384,7 +384,24 @@ Task labels:
     `aggregate_results.py` would average seven weights into one number without ever erroring. Task 12.7 checks
     the same property as an *outcome* on disk, 40 minutes of GPU time later — this is the cheap check
 
-- [ ] 11. Paired zero-weight end-to-end check (gates the sweep; also the sweep's zero arm)
+- [ ] 11. Paired zero-weight check, then the long-horizon Positive_Control (both gate the sweep)
+  - **Why the Positive_Control was added (tasks 11.3-11.5), stated here so the reasoning is not lost.** The
+    paper introduces `L_plan = L_spatial + 0.1 * L_agg` **only** at 50-step targets, claims it **only** under
+    MPC, and its evidence sits on PushT baselines of 13.33 open-loop / 24.00 MPC. This spec applies the same
+    formula at 25-step targets against a 75.33 / 82.00 baseline and gates on **both** settings. Of the paper's
+    eight combined-cost cells, one clears 2 SE (+9.33 MPC), two are marginal (+6.67 open-loop, and −7.33
+    open-loop on Medium), and five are inside noise; two of four open-loop cells are **worse**. So the
+    short-horizon dual gate asks for evidence the paper's own table does not contain
+  - The consequence: a flat short-horizon sweep is ambiguous on its own — it could mean the term does not
+    transfer out of the long-horizon regime, or it could mean the wrapper is subtly wrong somewhere the CPU
+    property tests cannot reach (they check the objective's algebra, never that it improves anything). The
+    Positive_Control resolves that ambiguity for ~1.5 h of GPU time, which is a fraction of the ~4 h the sweep
+    and confirmation cost
+  - No new loss mathematics exists anywhere in this feature: both terms are produced by calling the frozen
+    `planning.objectives.create_objective_fn`, and the only new computation is the frame-wise reshape through
+    the checkpoint's own `agg_mlp` / `agg_post_norm`. So the Positive_Control is testing the paper's formula in
+    a new regime, not a new method — which is precisely why reproducing the paper's own cell first is the
+    cheapest way to make the new regime's answer meaningful
   - [~] 11.1 [GPU RUN] Run `plan.py` and `plan_agg.py --agg_weight=0` at seed 400, open-loop
     - Both through the Job_Launcher (`bash run_ccr_pilot.sh eval <ckpt>`, `SETTINGS=ol SEEDS=400`), serially,
       one job at a time on the `1g.45gb` MIG slice; the second with `PLAN_ENTRY=plan_agg.py
@@ -436,6 +453,104 @@ Task labels:
       The step-0 magnitudes of L_spatial and L_agg are the first real evidence of the two terms' relative
       scale, which is what decides whether the Sweep_Grid brackets the useful range at all
     - _Requirements: 3.3, 5.1, 5.2, 5.3_
+
+  - [ ] 11.3 [CODE] Add the long-horizon protocol column to `plan_agg.py`
+    - **Why this task exists.** `resolve_protocol` is strict and aborts on any deviation from the per-setting
+      table (Requirement 8.7), and both shipped columns pin `sub_planner.horizon 25` and `n_taken_actions`
+      25 / 5. The Positive_Control in task 11.4 runs at `goal_H=50`, so it *must* deviate — without a third
+      column it aborts before loading anything. This is the smallest change that lets the control run while
+      keeping the short-horizon columns exactly as they are
+    - Key `PROTOCOL_EXPECTED` on `(config_name, goal_H)` rather than `config_name` alone, or add a
+      `PROTOCOL_EXPECTED_LONG` selected when the resolved `goal_H` is not 25. Either way the **short-horizon
+      columns must be byte-unchanged** — the reported result is still the short-horizon confirmation run
+      (Requirement 7.2), and this task must not be able to weaken the gate that protects it
+    - Add `goal_H` to `PROTOCOL_FIELDS` so the manifest records which horizon regime produced the numbers.
+      Today a manifest cannot distinguish a 25-step from a 50-step run, and after this task the tree will
+      hold both
+    - The long-horizon column's values come from task 11.4's settled reading, not from this task. Encode
+      whatever 11.4 records, and abort naming the field if a run deviates from it, exactly as the short
+      columns do
+    - _Requirements: 8.1, 8.4, 8.6, 8.7_
+
+  - [ ] 11.4 [GPU RUN] Positive_Control: reproduce the paper's long-horizon combined-cost gain
+    - **This is a control, not the reported result.** The reported result remains the short-horizon
+      confirmation run in task 14 (Requirements 7.2, 7.5). This task exists to decide what a null short-horizon
+      result *means*
+    - **What the paper actually claims, and where.** `paper_tex/sec/1_main.tex`, the Long horizon paragraph and
+      `tab:long_horizon`: `L_plan = L_spatial + 0.1 * L_agg` is introduced **only** for "a longer-horizon
+      setting where the target is 50 steps away", and the claim is scoped to MPC — "this combined cost improves
+      over using the spatial cost alone across all models **under MPC**." No open-loop claim is made. The
+      mechanism is explicitly long-range: spatial features "yield fine-grained, locally discriminative distance
+      variations, whereas global features provide a smoother, more coherent long-range signal that better
+      reflects long-horizon distance-to-goal trends"
+    - **The reference cells.** Target_Cell's paper row is `+ Proj` with `L_curv` ✓. Long-horizon PushT,
+      spatial only: **13.33 +/- 3.77 open-loop / 24.00 +/- 6.53 MPC**. Same row with the combined cost:
+      **20.00 +/- 0.00 / 33.33 +/- 4.16**. So the deltas to look for are **+6.67 open-loop / +9.33 MPC**
+    - **The ambiguity that must be settled before launch, and it is a judgement not a lookup.** The paper does
+      not state the long-horizon planner settings anywhere. The appendix protocol table (`Subplanner horizon
+      25`, `# Executed actions 25`, footnoted as 5 for MPC) is the **short**-horizon protocol. Two readings:
+      (a) scale the horizon with the goal distance — `goal_H=50`, `sub_planner.horizon=50`,
+      `n_taken_actions=50` open-loop / 5 MPC, which preserves the appendix's own "executed actions = horizon"
+      relationship; or (b) keep `horizon=25` and let open-loop cover only half the distance, which would by
+      itself explain why open-loop collapses to 13.33 while MPC reaches 24.00. **Reading (a) is the
+      recommended default** because it is the only one under which open-loop is even attempting the task, but
+      it is a guess either way and the guess must be recorded in the manifest and the progress log before the
+      job runs, not reconstructed afterwards. Both readings keep `frameskip` 5 and every horizon divisible by
+      it
+    - Run one seed first, both settings, two arms: `w=0` and `w=0.1`. `+agg_weight=0.1` is the paper-literal
+      value, not a swept one — this control does not sweep. `HYDRA_RUN_DIR=agg` separates the arms, and
+      `gH${goal_H}` is already in the template so the long-horizon runs land in their own tree and cannot
+      touch any short-horizon cell:
+
+      ```bash
+      # arm A: spatial only, long horizon
+      DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
+        PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS=100 HYDRA_RUN_DIR=agg \
+        bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=0" goal_H=50 \
+          planner.sub_planner.horizon=50 planner.n_taken_actions=50
+
+      # arm B: combined cost, long horizon, paper-literal weight
+      DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
+        PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS=100 HYDRA_RUN_DIR=agg \
+        bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=0.1" goal_H=50 \
+          planner.sub_planner.horizon=50 planner.n_taken_actions=50
+      ```
+
+      The MPC leg takes `n_taken_actions=5`, which `SETTINGS=both` supplies from `conf/plan_gd_mpc.yaml`; the
+      override above applies to the open-loop leg. If the driver cannot express a per-setting
+      `n_taken_actions`, run the two settings as separate `SETTINGS=ol` / `SETTINGS=mpc` invocations rather
+      than working around it
+    - ~1.5 h for the four runs at one seed. Strictly serial, one job at a time on the `1g.45gb` MIG slice
+      (Requirements 9.1, 9.2). Not agent-executable: needs the pod, the dataset and the Target_Cell checkpoint
+    - _Requirements: 9.1, 9.2, 9.6, 10.4, 11.2_
+
+  - [ ] 11.5 [HUMAN] Record the Positive_Control verdict and what it licenses
+    - **Read the delta, not the absolute.** The platform's own short-horizon reproduction is 75.33 / 82.00
+      against the paper's printed 77.33 / 85.33, so the long-horizon spatial-only arm should not be expected to
+      land on 13.33 / 24.00 exactly either. The pass condition is the **direction and rough magnitude of the
+      w=0 -> w=0.1 delta**, against the paper's +6.67 open-loop / +9.33 MPC. A spatial-only baseline of, say,
+      16.00 is not a failure to reproduce
+    - Report the ~5.7 point binomial standard error at n=50 alongside every rate (Requirement 10.4), and note
+      that at one seed the open-loop delta of +6.67 the paper reports is itself only about 1.2 SE. If the
+      control is ambiguous at one seed, the choice is to add the two remaining Reporting_Seeds (~3 h) or to
+      record it as ambiguous — **not** to read a one-seed delta as confirmation
+    - **What each outcome licenses, decided here rather than after seeing the numbers:**
+      - **MPC delta clearly positive (roughly +5 or more):** the implementation reproduces the paper's claim.
+        A flat or negative short-horizon sweep is then a genuine finding about horizon-dependence, and it
+        extends the paper's own limitations paragraph, which already flags that "the gains from using an
+        aggregation head for long-horizon planning suggest that regularization and planning objectives do not
+        necessarily operate in the prediction latent space." Proceed to task 12 and write the null up as a
+        result rather than a failure
+      - **MPC delta near zero or negative:** the wrapper does not reproduce the paper's own result, so a null
+        at short horizon would be uninterpretable — it could be our plumbing. **Do not proceed to task 12.**
+        Investigate first: the term-magnitude ratio from `agg_instrumentation.json` (is `0.1 * L_agg`
+        contributing anything at all against a 1568-dimensional L_spatial?), the horizon reading from task
+        11.4, and whether the Target_Cell checkpoint's `agg` head is the one the paper's `+ Proj` ✓ row used
+      - **Either way, record the step-0 and step-99 ratio `0.1 * L_agg / L_spatial`.** This is the number the
+        paper never reports and the one that distinguishes "the term was too weak to matter" from "the term
+        dominated and broke the planner." It also predicts whether the short-horizon Sweep_Grid brackets
+        anything useful, which is the whole point of running the sweep at seven weights instead of one
+    - _Requirements: 10.4, 11.2, 11.5, 11.7_
 
 - [ ] 12. Weight sweep on the Tuning_Seed (6 non-zero open-loop arms, strictly serial, ~35 min total)
   - Every arm:
@@ -677,19 +792,22 @@ Task labels:
     { "id": 8, "tasks": ["8.3", "8.4", "9.2"] },
     { "id": 9, "tasks": ["11.1"] },
     { "id": 10, "tasks": ["11.2"] },
-    { "id": 11, "tasks": ["12.1"] },
-    { "id": 12, "tasks": ["12.2"] },
-    { "id": 13, "tasks": ["12.3"] },
-    { "id": 14, "tasks": ["12.4"] },
-    { "id": 15, "tasks": ["12.5"] },
-    { "id": 16, "tasks": ["12.6"] },
-    { "id": 17, "tasks": ["12.7"] },
-    { "id": 18, "tasks": ["12.8"] },
-    { "id": 19, "tasks": ["14.1"] },
-    { "id": 20, "tasks": ["14.2"] },
-    { "id": 21, "tasks": ["14.3"] },
-    { "id": 22, "tasks": ["15.1"] },
-    { "id": 23, "tasks": ["16.1"] }
+    { "id": 11, "tasks": ["11.3"] },
+    { "id": 12, "tasks": ["11.4"] },
+    { "id": 13, "tasks": ["11.5"] },
+    { "id": 14, "tasks": ["12.1"] },
+    { "id": 15, "tasks": ["12.2"] },
+    { "id": 16, "tasks": ["12.3"] },
+    { "id": 17, "tasks": ["12.4"] },
+    { "id": 18, "tasks": ["12.5"] },
+    { "id": 19, "tasks": ["12.6"] },
+    { "id": 20, "tasks": ["12.7"] },
+    { "id": 21, "tasks": ["12.8"] },
+    { "id": 22, "tasks": ["14.1"] },
+    { "id": 23, "tasks": ["14.2"] },
+    { "id": 24, "tasks": ["14.3"] },
+    { "id": 25, "tasks": ["15.1"] },
+    { "id": 26, "tasks": ["16.1"] }
   ]
 }
 ```
