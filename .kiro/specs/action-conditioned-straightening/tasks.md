@@ -39,6 +39,15 @@ eval 0.4 GPU-h; permuted-gate arm 0.8 GPU-h; Stage 2 full run + 3-seed eval 13.6
 
 ## Tasks
 
+> **THIS SPEC IS CLOSED — STAGE-0 RETURNED `STOP` ON RULE A, 2026-08-08.**
+> Sections **6 through 13 are NOT to be executed**: a `STOP` on either Stage-0 rule forbids the ACS term
+> and every downstream arm (Requirements 2.12 / 2.13).
+> **`compute_acs` was never written and must not be written.** No ACS loss term, no `acs_tag`, no config
+> keys, no telemetry block, no GPU arm. **Total GPU-hours spent on ACS: 0.**
+> The authoritative record is `PROGRESS_ACS.md` §10.1 (measured statistics), §10.2 (the firing rule and its
+> exact numbers) and §10.4 (findings N1 / N2, and N3 as unreachable).
+> **Next arm: `MCA_Fallback`** (`PROGRESS_ACS.md` §12) — `compute_mca`, already written, never run.
+
 - [x] 1. Scope guard and test scaffolding
   - [x] 1.1 [CODE] Extend `tests/test_scope_guard.py` for the ACS file set
     - Add `PROGRESS_ACS.md` to `ALLOWED_FILES` — the only new non-test file this feature adds
@@ -231,8 +240,8 @@ eval 0.4 GPU-h; permuted-gate arm 0.8 GPU-h; Stage 2 full run + 3-seed eval 13.6
     - The novelty positioning **dated**, written before the outcome
     - _Requirements: 16.1, 16.3, 16.10, 2.1, 2.17, 10.1, 3.1, 3.2, 3.3, 3.4, 3.5, 3.7, 3.8, 3.9, 14.7_
 
-- [ ] 5. Stage 0 execution and verdict — the hard gate
-  - [~] 5.1 [CPU RUN] Run the Stage-0 action-similarity measurement on all four datasets
+- [x] 5. Stage 0 execution and verdict — the hard gate
+  - [x] 5.1 [CPU RUN] Run the Stage-0 action-similarity measurement on all four datasets
     - ```bash
       for ENV in pusht wall point_maze point_maze_medium; do
         python probe_ccr_curvature.py --readout actions --env "$ENV" \
@@ -246,9 +255,17 @@ eval 0.4 GPU-h; permuted-gate arm 0.8 GPU-h; Stage 2 full run + 3-seed eval 13.6
     - Also run task 4.2's 32-window bitwise check here, where the real dataset is present
     - **Minutes, CPU only, 0 GPU-h.** Needs `DATASET_DIR` and the four datasets, so it is not
       agent-executable. No checkpoint, no model weights, no video decode
+    - **RAN 2026-08-08 on 3 of the 4 environments**: `point_maze_medium` was not measured because
+      `/workspace/arun/data/point_maze_medium/states.pth` is absent from the pod, and `--summarize` correctly
+      refused to evaluate a four-environment rule on three. **This does not change the verdict** — clause 2.6
+      fires on PushT already being beaten 3.31x by UMaze, and no fourth value can make PushT the maximum
+      (`PROGRESS_ACS.md` §10.1, §10.2)
+    - **Task 4.2's 32-window bitwise check PASSED on the real datasets**: `pytest
+      tests/test_acs_single_gate_impl.py` → 23 passed, 1 skipped, the skip being `point_maze_medium` for the
+      missing dataset. Skipping the `VideoReader` decode did not change what was measured
     - _Requirements: 1.1, 1.11, 1.12, 1.13, 1.17, 1.18, 1.16_
 
-  - [~] 5.2 [HUMAN] Record the Stage-0 verdict and decide whether ACS is built at all
+  - [x] 5.2 [HUMAN] Record the Stage-0 verdict and decide whether ACS is built at all
     - Read rules A and B off `acs_stage0_verdict.json` and write the firing rule and its exact numbers into
       `PROGRESS_ACS.md` **before** anything downstream is launched
     - **A `STOP` on either rule ends the feature.** Tasks 6.x onward are not executed, `MCA_Fallback`

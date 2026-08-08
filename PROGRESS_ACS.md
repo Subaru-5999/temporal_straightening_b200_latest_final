@@ -67,18 +67,24 @@ makes "you just found a smaller λ" unavailable as an objection.
 
 | item | state |
 |---|---|
+> **THIS FEATURE IS CLOSED. Stage 0 returned STOP on rule A (§10.2). `compute_acs` was never written
+> and will not be. Total GPU-hours spent: 0. The return is findings N1 and N2 (§10.4). Next arm:
+> `MCA_Fallback` (§12).**
+
+| item | state |
+|---|---|
 | Pre-registration (this file, §4-§9) | **complete — written 2026-08-08 before any measurement** |
 | Scope guard extended for the ACS file set (task 1.1) | complete — `PROGRESS_ACS.md` allowlisted, `models/vit.py` + `models/dino.py` frozen |
-| Shared geometry helpers + `straighten` parser `else: raise` (section 2) | _not started_ |
-| `reduce_action` / `action_gate` (section 3) | _not started_ |
-| Stage-0 probe readout `--readout actions` (task 4.1) | _not started_ |
-| **Stage 0 measurement (task 5.1) — CPU, minutes, 0 GPU-h** | **_NOT RUN — see §10.1_** |
-| **Stage-0 verdict (rules A and B, task 5.2) — CAN KILL THE FEATURE** | **_NOT READ — see §10.2_** |
-| ACS term `compute_acs` (section 6) | _not started — conditional on a Stage-0 GO or MIDDLE_ |
-| Stage 1 arm (8,000 steps, 0.8 GPU-h) | _not started_ |
-| Early-read gate verdict | _not read — see §10.3_ |
-| Stage 2 full run + 3-seed eval (13.6 GPU-h) | _not started_ |
-| Findings N1 / N2 / N3 | _not written — see §10.4_ |
+| Shared geometry helpers + `straighten` parser `else: raise` (section 2) | complete — bitwise-neutral refactor; **kept**, the parser fix closes a landmine independent of ACS |
+| `reduce_action` / `action_gate` (section 3) | complete, with properties 3, 4, 5 green; **kept** as the probe's instrument |
+| Stage-0 probe readout `--readout actions` + verdict rules (tasks 4.1-4.5) | complete; property 19 verified bitwise against the real datasets |
+| **Stage 0 measurement (task 5.1) — CPU, minutes, 0 GPU-h** | **RUN 2026-08-08 — see §10.1.** 3 of 4 envs; `point_maze_medium` dataset absent from the pod |
+| **Stage-0 verdict (rules A and B, task 5.2) — CAN KILL THE FEATURE** | **READ 2026-08-08: rule A STOP (clause 2.6), rule B GO, combined STOP — see §10.2. It killed the feature.** |
+| ACS term `compute_acs` (section 6) | **NOT WRITTEN and will not be** — Requirement 2.12/2.13 |
+| Stage 1 arm (8,000 steps, 0.8 GPU-h) | **not launched** — Stage 1 not permitted |
+| Early-read gate verdict | **not reachable** — no arm exists; §10.3 stays empty |
+| Stage 2 full run + 3-seed eval (13.6 GPU-h) | **not launched** |
+| Findings N1 / N2 / N3 | **N1 and N2 written — see §10.4.** N3 not reachable without a trained arm |
 
 **Budget, recorded honestly.** Stage 0 minutes / **0 GPU-h**. Stage 1 arm 0.8 GPU-h; matched 8k eval
 0.4; permuted-gate arm 0.8; Stage 2 full run + 3-seed eval 13.6. **Best case (Stage-0 STOP) 0 GPU-h;
@@ -614,46 +620,127 @@ has **not** closed is L6/§7.1 — less straightening may simply be worse.
 Each subsection below is empty by design. Filling one in **before** its measurement exists would
 defeat the purpose of this file.
 
-### 10.1 Stage-0 measured statistics — _NOT YET MEASURED_
+### 10.1 Stage-0 measured statistics — MEASURED 2026-08-08
 
-To be filled from `probe_outputs/acs_actions_{pusht,wall,point_maze,point_maze_medium}.json`, train
-split headline with validation as cross-check, all three reductions, `n_triples` / `n_windows` beside
-every number.
+Run on the B200 pod, `/workspace/arun/ccr`, commit `23b25db`, `DATASET_DIR=/workspace/arun/data`.
+**CPU only, minutes, 0 GPU-h, no video decoded, no checkpoint read.** Reports in
+`probe_outputs/acs_actions_{pusht,wall,point_maze}.json`.
+
+**`point_maze_medium` was not measured: the dataset is not on this pod**
+(`/workspace/arun/data/point_maze_medium/states.pth` does not exist). `--summarize` therefore refused
+to emit a verdict JSON, correctly — the rule is pre-registered over four environments. **The rule-A
+STOP does not depend on it**, and §10.2 records why.
+
+Train split (headline), all three reductions:
 
 | env | reduction | mean cos | median cos | `frac(cos<0)` | `frac(cos<0.5)` | `mean(w)` | `frac(w=0)` | **`R`** | `n_triples` | `n_windows` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| pusht | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| pusht | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| pusht | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| wall | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| wall | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| wall | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| point_maze (umaze) | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| point_maze (umaze) | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| point_maze (umaze) | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| point_maze_medium | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| point_maze_medium | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| point_maze_medium | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| pusht | sum | 0.5528 | 0.7733 | **0.1504** | 0.3255 | 0.6292 | 0.1504 | **0.2538** | 3,963,442 | 1,981,721 |
+| pusht | raw | 0.4446 | 0.5649 | 0.1864 | 0.4547 | 0.4997 | 0.1864 | 0.3117 | 3,963,442 | 1,981,721 |
+| pusht | first | 0.4796 | 0.7307 | 0.2019 | 0.3680 | 0.5877 | 0.2019 | 0.2932 | 3,963,442 | 1,981,721 |
+| wall | sum | 0.6777 | 0.8331 | **0.0785** | 0.2312 | 0.7042 | 0.0785 | 0.1857 | 107,136 | 53,568 |
+| wall | raw | 0.5173 | 0.6060 | 0.0837 | 0.3725 | 0.5378 | 0.0837 | 0.2095 | 107,136 | 53,568 |
+| wall | first | 0.5715 | 0.7602 | 0.1386 | 0.3199 | 0.6278 | 0.1386 | 0.2466 | 107,136 | 53,568 |
+| point_maze (umaze) | sum | 0.0027 | 0.0067 | **0.4983** | 0.6649 | 0.3203 | 0.4983 | 0.5496 | 291,600 | 145,800 |
+| point_maze (umaze) | raw | 0.0003 | −0.0004 | 0.5005 | 0.9392 | 0.1293 | 0.5005 | 0.5764 | 291,600 | 145,800 |
+| point_maze (umaze) | first | −0.0009 | 0.0012 | 0.4996 | 0.6691 | 0.3175 | 0.4996 | 0.5523 | 291,600 | 145,800 |
+| point_maze_medium | — | _not measured_ | | | | | | | | |
 
-- 20-bin histograms over `[-1, 1]`: _tbd (from the JSON reports; do not summarize to two moments)_
-- validation-split cross-check agreement: _tbd_
-- 32-window bitwise check of the action-only loader against `dset[idx][1]`: _tbd (task 4.2, run at 5.1)_
-- `sum` vs `raw` comparison for the Requirement 3.6 downgrade: _tbd_
+Validation split (cross-check):
 
-### 10.2 Which Stage-0 rule fired, and the exact numbers — _NOT YET READ_
+| env | reduction | mean cos | median cos | `frac(cos<0)` | `mean(w)` | **`R`** | `n_triples` | `n_windows` |
+|---|---|---|---|---|---|---|---|---|
+| pusht | sum | 0.5900 | 0.8069 | 0.1331 | 0.6553 | 0.2326 | 4,230 | 2,115 |
+| pusht | raw | 0.5068 | 0.6577 | 0.1565 | 0.5543 | 0.2796 | 4,230 | 2,115 |
+| pusht | first | 0.5528 | 0.7965 | 0.1579 | 0.6362 | 0.2543 | 4,230 | 2,115 |
+| wall | sum | 0.6758 | 0.8321 | 0.0796 | 0.7031 | 0.1876 | 11,904 | 5,952 |
+| wall | raw | 0.5109 | 0.5997 | 0.0880 | 0.5321 | 0.2136 | 11,904 | 5,952 |
+| wall | first | 0.5643 | 0.7610 | 0.1440 | 0.6252 | 0.2499 | 11,904 | 5,952 |
+| point_maze (umaze) | sum | −0.0121 | −0.0257 | 0.5088 | 0.3129 | 0.5580 | 32,400 | 16,200 |
+| point_maze (umaze) | raw | −0.0061 | −0.0058 | 0.5075 | 0.1258 | 0.5794 | 32,400 | 16,200 |
+| point_maze (umaze) | first | −0.0097 | −0.0222 | 0.5072 | 0.3142 | 0.5580 | 32,400 | 16,200 |
 
-Written **before** anything downstream is launched (Requirement 16.4).
+- **20-bin histograms over `[-1, 1]`:** in the JSON reports under `splits.<split>.reductions.<r>.cos_histogram`,
+  not reproduced here. The two moments are misleading for UMaze in particular: `mean cos = 0.0027` with
+  `frac(cos<0) = 0.4983` is not a narrow distribution around zero, it is a broad one, and the histogram
+  is the only place that distinction is visible.
+- **Validation cross-check: agrees on every ordering.** `frac(cos<0)` train vs validation is
+  0.1504/0.1331 (pusht), 0.0785/0.0796 (wall), 0.4983/0.5088 (umaze). The rule-A ordering is identical
+  on both splits, so the verdict below is not a split artifact.
+- **32-window bitwise check of the action-only loader against `dset[idx][1]` (task 4.2, Requirement 1.16):
+  PASSED.** `pytest tests/test_acs_single_gate_impl.py` → 23 passed, 1 skipped. The skip is
+  `point_maze_medium`, for the missing dataset. Skipping the `VideoReader` decode did not change what
+  was measured, on the real data, for the three environments that produced numbers.
+- **`sum` vs `raw` for the Requirement 3.6 downgrade: the downgrade does not fire and has nothing to
+  rescue.** Under `raw` the ordering is umaze 0.5005 > pusht 0.1864 > wall 0.0837 — PushT is not the
+  highest there either, so neither reduction shows reversal structure in rule A's sense. `frameskip=5`
+  washing out within-step reversals (L5) is *not* the explanation for this STOP.
+- **Internal consistency, unplanned but worth recording:** `frac(w=0)` equals `frac(cos<0)` to four
+  decimals in all nine rows. That is Property 3's zero-set claim — `relu_cos` zeroes exactly the
+  `cos <= 0` half-space — confirmed on 4.4 M real triples rather than only on generated cases.
 
-- Rule A verdict: _tbd_ — driving numbers: _tbd_ (PushT `frac(cos<0)` = _tbd_; margin over the largest
-  of the other three = _tbd_ x; UMaze lowest? _tbd_)
-- Rule B verdict: _tbd_ — PushT `R` = _tbd_
-- Combined verdict: _tbd_
-- If **MIDDLE** on rule A: the downgraded mechanism claim, recorded at the moment the verdict was read:
-  _tbd_
-- If **MIDDLE** on rule B: the pre-declared remedy (`acs_gate=hard` or a sharpened gate) and the
-  statement that the expected effect size is small: _tbd_
-- If **STOP** on either rule: MCA_Fallback selected as the next arm, tasks 6.x **not executed**, N1 and
-  N2 written up regardless: _tbd_
+### 10.2 Which Stage-0 rule fired, and the exact numbers — READ 2026-08-08
+
+Written **before** anything downstream is launched (Requirement 16.4). Nothing downstream was launched:
+this section records the end of the feature.
+
+## COMBINED VERDICT: STOP. ACS IS NOT BUILT.
+
+- **Rule A verdict: STOP, clause 2.6 — "PushT is not the highest of the four."**
+  Driving numbers, train split / `sum` reduction: PushT `frac(cos<0)` = **0.1504**, against
+  **UMaze 0.4983** and Wall 0.0785. PushT is not the maximum; UMaze exceeds it by **3.31x**. PushT's
+  "margin over the largest of the other three" is **0.30x** — below 1, so the `>= 1.5x` GO condition is
+  not merely unmet, it points the wrong way. UMaze lowest? **No — UMaze is the highest**, which is the
+  opposite extreme from the one the mechanism story predicts.
+- **Rule B verdict: GO** — PushT `R` = **0.2538**, clearing the `>= 0.15` bar. The gate would have
+  reallocated about a quarter of the straightening pressure between triples on PushT. Recorded because
+  it is true and because it is the half of the pre-registration that ACS passed; it does not rescue
+  anything, since §4.3 makes either rule sufficient to STOP.
+- **Combined verdict: STOP** (either rule STOP ⟹ STOP). Stage 1 not permitted.
+
+**Why the missing `point_maze_medium` does not change this.** Clause 2.6 fires on PushT failing to be
+the maximum, and UMaze already exceeds it by 3.31x. A fourth value can only sit above or below PushT;
+neither makes PushT the maximum. The STOP is determined by the three environments that were measured.
+What `medium`'s absence *does* limit is the completeness of N1's four-point ordering claim, and that is
+recorded in §10.4 rather than glossed.
+
+**The premise is not merely unconfirmed — it is inverted, and this is the finding.** The mechanism story
+(§1, §4.1) was that straightening helps most where the control is smooth. Rule A predicted
+`frac(cos<0)` ordered inversely to Table 1's gains: pusht > wall ≈ medium > umaze. Measured:
+**umaze > pusht > wall.** UMaze carries the paper's largest straightening gain by a wide margin
+(+50.00 OL) and has the *most* action-reversing transitions of the three — `frac(cos<0) = 0.4983`,
+`mean cos = 0.0027`, `median 0.0067`. Consecutive commanded actions there are close to directionally
+independent: a coin flip. PushT, the weakest gain (+7.33), is the second *smoothest*. Both splits agree
+and all three reductions agree.
+
+**The most likely reason is L2, the confound this file pre-registered as a limitation rather than
+discovered afterwards.** The four environments carry differently-typed action variables: PointMaze
+actions are forces on a point mass, PushT actions are relative pusher displacements. A point mass under
+near-random *force* commands still traces a smooth path, so `cos(a_t, a_{t+1})` on an acceleration is
+not the same physical quantity as on a displacement. This is exactly what §4.5 says Stage 0 can do —
+refute the ordering, never establish it — and refutation is what happened. It also means the shipped
+gate would have been reading acceleration reversals on PointMaze and displacement reversals on PushT:
+not one inductive bias applied to four environments, but four different ones.
+
+**Not re-instrumented after the fact.** A type-comparable statistic (velocity reversals derived from
+`state` rather than `act`, say) might well order differently. Choosing it *now*, having seen that
+`frac(cos<0)` refuted the premise, is precisely the CCR failure mode §4.4 was written to block, so it
+was not done. The STOP stands as the pre-registered rule read it. If a future arm wants that statistic,
+it pre-registers it first, before looking.
+
+**Consequences, executed:**
+
+- Tasks **6.x onward are NOT executed.** `compute_acs` does not exist and will not be written. No ACS
+  loss term, no `acs_tag` resolver, no `conf/train.yaml` keys, no telemetry block, no Stage-1 arm, no
+  permuted-gate attribution arm, no Stage-2 run. Sections 1-4 of the plan (the shared geometry helpers,
+  the `straighten` parser `else: raise`, `reduce_action` / `action_gate`, and the Stage-0 probe) are
+  **kept**: the parser fix closes a live landmine independent of ACS, the helpers are a bitwise-neutral
+  refactor, and the probe is the instrument that produced N1 and N2.
+- **`MCA_Fallback` is selected as the next arm** (§12): `VWorldModel.compute_mca`, already written and
+  reviewed, never run. Zero new code, 0.8 GPU-h to a verdict.
+- **N1 and N2 are written up regardless** — see §10.4. They are the return on this work.
+- **GPU-hours spent on ACS: 0.** The best case in the §2 budget table is the one that happened. CCR
+  spent ~26 GPU-h to reach a negative result; the ordering of this plan is why this one cost none.
 
 ### 10.3 Gate verdict — _NOT YET READ_
 
@@ -678,21 +765,53 @@ row (Requirement 16.14); whether the check-1b scale-preservation prediction held
 check-1 directional prediction on the causal channel held (16.8); and the training-time `acs_gate_tv`
 against the Stage-0 `R` estimate **including when the arm succeeds** (16.6).
 
-### 10.4 Findings N1 / N2 / N3 — _NOT YET WRITTEN_
+### 10.4 Findings N1 / N2 / N3 — N1 and N2 WRITTEN 2026-08-08; N3 UNREACHABLE
 
-- **N1 — when does temporal straightening help? A dataset property, measured.** The per-environment
-  action-similarity distributions (all statistics of §10.1, all three reductions, train and validation)
-  set against Table 1's straightening gains **+50.00 / +10.67 / +10.67 / +7.33**. Zero GPU-hours;
-  stands whether ACS is built or not. **Must be reported with L1, L2 and L3 attached in the same
-  paragraph.** _tbd_
-- **N2 — how much of the paper's curvature penalty falls on action-reversing transitions.** `R` per
-  environment plus `frac(w = 0)`: a quantitative statement about the target paper's own objective, from
-  its own data, for zero GPU time. _tbd_
-- **N3 — does removing straightening pressure at direction changes recover rotational state?** The
-  measured direction of the `block_angle` R² change against the matched control at `--num-windows 192`.
-  A confirmation turns `PROGRESS_CCR.md` §6f from a limitation into a general statement about
-  curvature-family regularizers; a refutation bounds §6f to unconditional penalties. **Either is a
-  result.** _tbd_
+**N1 — when does temporal straightening help? A dataset property, measured, and it does *not* track
+control smoothness.** Across three of the paper's four goal-reaching datasets, the fraction of
+consecutive-action direction reversals `frac(cos(a_t, a_{t+1}) < 0)` on the net commanded displacement
+per latent step is **UMaze 0.4983, PushT 0.1504, Wall 0.0785** (train split, `sum` reduction,
+291,600 / 3,963,442 / 107,136 triples; the validation split and the `raw` and `first` reductions give
+the same ordering). Set against the paper's own open-loop straightening gains — **UMaze +50.00,
+Wall +10.67, PushT +7.33** — the ordering is the **inverse of what the smoothness story predicts**: the
+environment that gains most from temporal straightening is the one whose consecutive commanded actions
+are closest to directionally independent (`mean cos = 0.0027`, `median 0.0067`), and the environment
+that gains least is the second smoothest. Zero GPU-hours; the statistic is a property of the released
+datasets and stands whether ACS is built or not.
+**Limitations, attached here because they bound this exact claim.** **L1:** `n = 3` measured of 4
+intended, with no independent replicates — this can refute the smoothness ordering, it cannot establish
+the inverse one as a law, and `point_maze_medium` is missing (dataset absent from the pod), so the
+four-point ordering the finding was designed around is incomplete. **L2:** the environments carry
+differently-typed action variables — PointMaze forces on a point mass, PushT relative pusher
+displacements, Wall dot velocities — so `cos(a_t, a_{t+1})` is not the same physical quantity at the
+three points being correlated, and a point mass under near-random force commands still traces a smooth
+path; this is the single most likely explanation of the inversion and it is a structural objection, not
+a noise problem. **L3:** the gain differences are confounded with contact dynamics, a second movable
+object, rotational state, and 2 training epochs on PushT against 20 elsewhere, so even a *concordant*
+ordering would not have isolated the mechanism. The defensible form of N1 is therefore negative and
+narrow: **action-reversal frequency, as measured on the recorded action variable, does not explain the
+Table 1 gain ordering** — and any future claim that straightening helps where control is smooth needs a
+type-comparable instrument, pre-registered before it is looked at.
+
+**N2 — how much of the paper's curvature penalty falls on action-reversing transitions.** A
+quantitative statement about the target paper's own objective, from its own data, for zero GPU time.
+Under a `relu_cos` gate on the net commanded displacement, the share of curvature triples that would
+receive **exactly zero** weight is **UMaze 49.83%, PushT 15.04%, Wall 7.85%** (`frac(w = 0)`, train
+split, `sum`; identical to `frac(cos<0)` to four decimals, which is the gate's zero-set identity holding
+on real data). The corresponding reallocation statistic `R = E|w − E[w]| / (2·E[w])` is **UMaze 0.5496,
+PushT 0.2538, Wall 0.1857**. Read plainly: **roughly half of the paper's aggregated curvature penalty on
+UMaze, and about one triple in seven on PushT, is applied to transitions where the commanded action
+reversed direction** — transitions where a straight latent path is arguably the wrong target. This is
+the one place the ACS premise survives measurement: the quantity is large enough to matter on all three
+environments, which is why rule B returned GO. What N1 refutes is that its *size* tracks where
+straightening helps. Same L2 caveat: "the commanded action reversed" means something different in a
+force-controlled environment than in a displacement-controlled one.
+
+**N3 — not reachable.** It required the `block_angle` R² of a trained ACS arm against the matched
+control, and no arm was trained. The question — whether removing straightening pressure at direction
+changes recovers the rotational state that `PROGRESS_CCR.md` §6f found curvature regularization
+suppresses — remains open, and `MCA_Fallback` does not answer it either. Recorded as unanswered rather
+than quietly dropped.
 
 ### 10.5 Stage-2 evaluation — _NOT YET RUN_
 
@@ -712,7 +831,10 @@ not kept, not that no mistakes were made.
 
 | # | date | error | cost | how it was caught |
 |---|---|---|---|---|
-| — | — | _none recorded yet; this file was created before any ACS measurement_ | — | — |
+| 1 | 2026-08-08 | **Property 4 as specified in `design.md` was nearly vacuous.** The design states the gate-detachment property over `d(L_acs)/dz` only. Because `w` is a function of `act`, deleting `.detach()` from `action_gate` leaves `d(L_acs)/dz` **bitwise unchanged** — the test would have passed on precisely the attached gate Requirement 5.3 forbids, and the λ-reduction confound the whole design exists to eliminate would have shipped invisibly | minutes; caught before the term existed | Deliberate mutation check while writing task 3.4: `.detach()` was removed from the shipped source and the test still passed. Fixed by extending the substitution comparison to `act` and the encoder / `action_encoder` / `proprio_encoder` parameters; re-verified that 6 of 11 tests then fail on the mutant, and the source was restored |
+| 2 | 2026-08-08 | **A relative float tolerance was the wrong instrument for the `sum` reduction** in task 3.5. When substeps cancel, the reduced vector is small while the addends are not, so the relative error is unbounded while the absolute error stays at `eps · Σ|x_s|` | minutes | hypothesis falsified the first draft immediately. Replaced with a derived per-triple bound `8·eps·(n + f·(κ₁+κ₂))` carrying the cancellation amplification `κ`, measured to have ~13x headroom over 6,000 draws |
+| 3 | 2026-08-08 | **Stage-0 instructions handed to the operator contained an unresolved placeholder** — `export DATASET_DIR=/path/to/datasets` — and named the git remote `latest`, which exists only on the authoring machine and not on the pod (where it is `origin`) | one round trip, ~minutes, 0 GPU-h | The pod's `git pull` failed, so every command after it silently ran against the pre-`--readout` code and produced a misleading "the following arguments are required: --ckpt" instead of an obvious staleness error. A `git log --oneline -1` assertion was added to the reissued instructions; the real path `/workspace/arun/data` is recorded in four places in this repo and should have been read rather than placeheld |
+| 4 | 2026-08-08 | **`point_maze_medium` is not on the pod**, so Stage 0 measured 3 of the 4 environments its rule is pre-registered over. Not checked before issuing the run | none to the verdict — clause 2.6 fires on PushT already being beaten 3.31x by UMaze, which no fourth value can change. Real cost is to N1's four-point ordering claim (§10.4, L1) | The fourth invocation raised `FileNotFoundError` on `states.pth`, and `--summarize` then refused to emit a verdict JSON rather than evaluating a four-environment rule on three — the guard behaved as designed |
 
 Inherited errors worth not repeating, carried from `PROGRESS_CCR.md`:
 
