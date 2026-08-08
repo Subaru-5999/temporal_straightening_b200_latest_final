@@ -73,6 +73,19 @@ try:  # pragma: no cover - exercised by which environment the module is imported
     import hydra
     from hydra.core.hydra_config import HydraConfig
     from omegaconf import open_dict
+
+    # Registers the OmegaConf resolvers that `conf/plan_gd*.yaml` -- and the `hydra.run.dir`
+    # override this module is launched with -- interpolate, `replace_slash` among them.
+    # `plan.py` does the same at module level (`from custom_resolvers import replace_slash`),
+    # which is why the shipped template resolves there. Without it, Hydra parses the override
+    # fine and then job start-up dies in OmegaConf resolution with
+    #   UnsupportedInterpolationType: Unsupported interpolation type replace_slash
+    # -- one layer later than the quoting bug, and with a completely different message.
+    #
+    # Inside the guarded block on purpose: `custom_resolvers` imports hydra/omegaconf, so at
+    # module scope it would break the importability contract this file's docstring promises,
+    # namely that the protocol layer stays importable on a box with no hydra and no CUDA.
+    import custom_resolvers  # noqa: F401  # imported for its registration side effect
 except ImportError as _exc:  # pragma: no cover - the CPU dev box has no hydra
     hydra = None
     HydraConfig = None

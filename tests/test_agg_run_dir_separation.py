@@ -410,6 +410,32 @@ def test_override_differs_from_the_shipped_template_in_one_component(config_name
     assert override.endswith("_obj${objective.mode}_init${planner.sub_planner.sample_type}")
 
 
+def test_plan_agg_registers_the_custom_resolvers():
+    """The override template is useless if its resolvers are not registered.
+
+    ``hydra.run.dir`` interpolates ``${replace_slash:${model_name}}``, and ``replace_slash`` is a
+    *custom* OmegaConf resolver registered as a side effect of importing ``custom_resolvers``.
+    ``plan.py`` does that at module level, which is why the shipped template resolves there.
+    ``plan_agg.py`` did not, so its first ever launch parsed the override correctly and then died at
+    job start-up with::
+
+        UnsupportedInterpolationType: Unsupported interpolation type replace_slash
+
+    one layer past the quoting bug and with an unrelated message. A static source check rather than
+    an import-and-inspect, so it runs on a box with no hydra — which is precisely the box where the
+    mistake is easy to make, because there the import would fail anyway and its absence is
+    invisible.
+    """
+    text = (_REPO_ROOT / "plan_agg.py").read_text(encoding="utf-8", errors="replace")
+    assert "import custom_resolvers" in text, (
+        "plan_agg.py does not import custom_resolvers, so the OmegaConf resolvers that "
+        "conf/plan_gd*.yaml and the hydra.run.dir override interpolate are never registered and "
+        "every launch dies at job start-up with UnsupportedInterpolationType. plan.py imports it "
+        "at module level; plan_agg.py must too, inside its guarded hydra import block so the "
+        "no-hydra importability contract in its docstring still holds."
+    )
+
+
 def test_run_dir_override_parses_under_hydra_grammar():
     """The check that was missing, and the reason task 11.1 failed on its first invocation.
 
