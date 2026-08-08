@@ -26,7 +26,8 @@ a DINOv2 download. Steps 3-9 are task 8.2 and are marked by explicit seams below
 The Evaluation_Protocol, and the two overrides it needs
 ------------------------------------------------------
 
-The protocol is the ten-field per-setting table in :data:`PROTOCOL_EXPECTED`, which combines the
+The protocol is the eleven-field table in :data:`PROTOCOL_EXPECTED`, keyed on the
+``(config_name, goal_H)`` pair -- one column per setting per horizon regime -- which combines the
 shipped config defaults with the overrides ``run_ccr_pilot.sh`` already applies. It is *not* "no
 override relative to the mandated config file": ``conf/plan_gd.yaml`` ships ``objective.alpha: 0``
 and ``conf/plan_gd_mpc.yaml`` ships ``objective.mode: all``, while the launcher already passes
@@ -38,9 +39,20 @@ Requirement 8.4's field list (``max_iter 1``, ``n_taken_actions 25``, ...) coinc
 and ``n_taken_actions: 5``; read literally for MPC, 8.4 would force ``max_iter 1``, which makes the
 MPC setting open-loop-with-a-staged-objective and could not reproduce the 82.00 Platform_Baseline
 that Requirement 8's own user story exists to stay comparable with. The per-setting reading is
-confirmed (task 13.1) and encoded below. All ten resolved values reach the manifest either way
+confirmed (task 13.1) and encoded below. All eleven resolved values reach the manifest either way
 (Requirement 8.6), so if the literal reading were the intended one the record already shows exactly
 which two fields differ and the re-run is a two-flag change.
+
+The two horizon regimes (task 11.3)
+-----------------------------------
+
+There are two columns per setting, selected on the resolved ``goal_H``: ``short`` (``goal_H 25``)
+is the Table-1 protocol and the **reported** result (Requirement 7.2); ``long`` (``goal_H 50``) is
+task 11.4's Positive_Control, which reproduces the paper's own long-horizon combined-cost cell. The
+short columns pin exactly what they pinned before the long ones existed, and ``goal_H`` itself is
+now pinned too, which is a field the gate did not previously constrain at all. The long column's
+planner settings are **not stated anywhere in the paper** -- see
+:data:`PROTOCOL_EXPECTED_SOURCE`, whose text is written to be read out of a manifest.
 
 Importability
 -------------
@@ -99,11 +111,19 @@ __all__ = [
     "EXPECTED_AGG_IN_DIM",
     "EXPECTED_AGG_OUT_DIM",
     "FEATURE_NAME",
+    "FRAMESKIP",
+    "GOAL_H_FIELD",
+    "HORIZON_FIELDS",
+    "HORIZON_REGIMES",
+    "LONG_GOAL_H",
     "MANIFEST_FILENAME",
     "MISSING",
     "OBJECTIVE_TARGET",
     "PROTOCOL_COMMON",
+    "PROTOCOL_COMMON_LONG",
     "PROTOCOL_EXPECTED",
+    "PROTOCOL_EXPECTED_LONG",
+    "PROTOCOL_EXPECTED_SHORT",
     "PROTOCOL_EXPECTED_SOURCE",
     "PROTOCOL_FIELDS",
     "OPT_STEPS_FIELD",
@@ -111,9 +131,11 @@ __all__ = [
     "ProtocolError",
     "ProtocolRecord",
     "SETTING_NAMES",
+    "SHORT_GOAL_H",
     "build_manifest",
     "delegate_to_plan",
     "expected_table",
+    "horizon_regime",
     "load_agg_head_from_ckpt",
     "main",
     "normalize_config_name",
@@ -154,7 +176,19 @@ SETTING_NAMES: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 #: Every protocol field, in manifest order. Dotted paths into the resolved config.
+#:
+#: ``goal_H`` heads the list because it is what **selects** the expected column: the table is keyed
+#: on the ``(config_name, goal_H)`` pair (task 11.3), so the horizon regime has to be resolved out
+#: of the configuration before any other field can be compared against anything at all.
+#:
+#: Adding ``goal_H`` **strengthens** the short-horizon gate rather than weakening it. It was
+#: previously unpinned, so a 50-step run satisfied the short columns on ``sub_planner.horizon``
+#: alone and a manifest could not tell a 25-step run from a 50-step one -- which matters now that
+#: the output tree holds both (task 11.4). It is now pinned: 25 in the short columns, 50 in the
+#: long ones. Every value the two short columns pinned before task 11.3 still holds exactly that
+#: value, and ``tests/test_agg_protocol_horizon.py`` asserts that literally rather than by eye.
 PROTOCOL_FIELDS: Tuple[str, ...] = (
+    "goal_H",
     "n_evals",
     "objective.mode",
     "objective.alpha",
@@ -171,9 +205,38 @@ PROTOCOL_FIELDS: Tuple[str, ...] = (
 #: (``AGG_CONTEXT.publish(opt_steps=...)``, task 8.2).
 OPT_STEPS_FIELD = "planner.sub_planner.opt_steps"
 
-#: Fields the two settings share: 50 samples per seed (Requirement 8.1), ``objective.alpha 1``
-#: (Requirements 8.2, 8.3) and the whole ``sub_planner`` block (Requirement 8.4).
+#: The field the horizon regime is read from, and the two horizons this feature holds columns for:
+#: 25 is the Target_Cell / Table-1 protocol and the reported result (Requirement 7.2); 50 is task
+#: 11.4's long-horizon Positive_Control, which reproduces the paper's own combined-cost cell.
+GOAL_H_FIELD = "goal_H"
+SHORT_GOAL_H = 25
+LONG_GOAL_H = 50
+
+#: Regime name per pinned ``goal_H``. A lookup rather than a ``goal_H != 25`` test, so the
+#: selection names its own domain: a horizon that is in neither column aborts naming the field and
+#: the two horizons that exist, instead of quietly falling into the long column.
+HORIZON_REGIMES: Dict[int, str] = {SHORT_GOAL_H: "short", LONG_GOAL_H: "long"}
+
+#: ``plan.py`` integer-divides these three fields by the checkpoint's ``frameskip``
+#: (``PlanEvaluator.__init__``: ``goal_H // frameskip``, ``n_taken_actions // frameskip``,
+#: ``sub_planner.horizon // frameskip``), so a value that is not a multiple of it is silently
+#: **truncated** rather than rejected -- ``horizon 26`` plans the same 5 model steps as ``25``.
+#: ``frameskip`` is 5 for every Table-1 cell and is a *training* config field, so it is a constant
+#: here rather than something resolved from the plan config; ``_check_expected_tables()`` asserts
+#: every pinned horizon in every column is divisible by it.
+FRAMESKIP = 5
+HORIZON_FIELDS: Tuple[str, ...] = (
+    "goal_H",
+    "planner.n_taken_actions",
+    "planner.sub_planner.horizon",
+)
+
+#: Fields the two settings share at the **short** horizon: 50 samples per seed (Requirement 8.1),
+#: ``objective.alpha 1`` (Requirements 8.2, 8.3) and the whole ``sub_planner`` block
+#: (Requirement 8.4). ``goal_H 25`` is the shipped ``conf/plan_gd*.yaml`` value and the horizon
+#: every recorded Platform_Baseline number was measured at.
 PROTOCOL_COMMON: Dict[str, Any] = {
+    "goal_H": SHORT_GOAL_H,
     "n_evals": 50,
     "objective.alpha": 1,
     "planner.sub_planner.horizon": 25,
@@ -183,10 +246,27 @@ PROTOCOL_COMMON: Dict[str, Any] = {
     "planner.sub_planner.opt_steps": 100,
 }
 
-#: One expected table **per setting**, keyed by Hydra config name. The three per-setting fields are
-#: the ones the two configs genuinely differ in: the objective mode Requirements 8.2/8.3 mandate,
-#: and the two MPC loop parameters ``conf/plan_gd_mpc.yaml`` ships (task 13.1's confirmed reading).
-PROTOCOL_EXPECTED: Dict[str, Dict[str, Any]] = {
+#: The same block at the **long** horizon: exactly two fields move, ``goal_H`` and the subplanner
+#: horizon that follows it (task 11.4's reading (a)). ``n_evals``, ``objective.alpha``, the
+#: subplanner ``lr``, ``sample_type``, ``action_noise`` and ``opt_steps`` are unchanged, so the two
+#: regimes differ in the horizon and in nothing else.
+PROTOCOL_COMMON_LONG: Dict[str, Any] = dict(
+    PROTOCOL_COMMON,
+    **{
+        "goal_H": LONG_GOAL_H,
+        "planner.sub_planner.horizon": LONG_GOAL_H,
+    },
+)
+
+#: The short-horizon columns, one **per setting**, keyed by Hydra config name. The three
+#: per-setting fields are the ones the two configs genuinely differ in: the objective mode
+#: Requirements 8.2/8.3 mandate, and the two MPC loop parameters ``conf/plan_gd_mpc.yaml`` ships
+#: (task 13.1's confirmed reading).
+#:
+#: **These are the columns that protect the reported result** (Requirement 7.2), and task 11.3 does
+#: not touch a value in them: every field they pinned before it keeps exactly that value, and
+#: ``goal_H 25`` is added to them, which pins a field that used to be free.
+PROTOCOL_EXPECTED_SHORT: Dict[str, Dict[str, Any]] = {
     "plan_gd": dict(
         PROTOCOL_COMMON,
         **{
@@ -205,18 +285,94 @@ PROTOCOL_EXPECTED: Dict[str, Dict[str, Any]] = {
     ),
 }
 
-#: Where each column comes from, recorded in the manifest so the reading is auditable rather than
-#: implicit (Requirement 8.6).
-PROTOCOL_EXPECTED_SOURCE: Dict[str, str] = {
-    "plan_gd": (
-        "conf/plan_gd.yaml shipped defaults, plus the objective.alpha=1 and objective.mode=last "
-        "overrides run_ccr_pilot.sh already applies (Requirements 8.2, 8.4)"
+#: The long-horizon columns (task 11.4's Positive_Control, reading (a)). Identical to the short
+#: columns except for the three horizon fields: ``goal_H 50``, ``sub_planner.horizon 50``, and
+#: ``n_taken_actions`` 50 open-loop / 5 MPC -- which preserves the appendix protocol's own
+#: "executed actions = horizon" relationship open-loop and its footnoted MPC value unchanged.
+#: ``max_iter`` and ``objective.mode`` are per-setting and horizon-independent.
+PROTOCOL_EXPECTED_LONG: Dict[str, Dict[str, Any]] = {
+    "plan_gd": dict(
+        PROTOCOL_COMMON_LONG,
+        **{
+            "objective.mode": "last",
+            "planner.max_iter": 1,
+            "planner.n_taken_actions": LONG_GOAL_H,
+        },
     ),
-    "plan_gd_mpc": (
+    "plan_gd_mpc": dict(
+        PROTOCOL_COMMON_LONG,
+        **{
+            "objective.mode": "staged",
+            "planner.max_iter": 20,
+            "planner.n_taken_actions": 5,
+        },
+    ),
+}
+
+#: The expected table, keyed on the ``(config_name, goal_H)`` **pair** (task 11.3). The pair is the
+#: whole point: ``resolve_protocol`` reads ``goal_H`` out of the configuration *first* and then
+#: selects, so the short columns keep aborting on any 50-step deviation and the long columns abort
+#: on any 25-step one. Neither regime can be reached by accident, because a ``goal_H`` that is in
+#: neither is an abort rather than a fallback.
+PROTOCOL_EXPECTED: Dict[Tuple[str, int], Dict[str, Any]] = {
+    (config_name, goal_h): table
+    for goal_h, tables in (
+        (SHORT_GOAL_H, PROTOCOL_EXPECTED_SHORT),
+        (LONG_GOAL_H, PROTOCOL_EXPECTED_LONG),
+    )
+    for config_name, table in tables.items()
+}
+
+#: Where each column comes from, recorded in the manifest so the reading is auditable rather than
+#: implicit (Requirement 8.6). Keyed on the same ``(config_name, goal_H)`` pair as the tables.
+#:
+#: The two long-horizon strings say plainly that their planner settings are a **judgement call**.
+#: That text is the deliverable: it lands in ``agg_run_manifest.json`` for every long-horizon run,
+#: so the guess is attached to the numbers it produced instead of being reconstructed afterwards.
+_LONG_HORIZON_SOURCE_PREAMBLE = (
+    "LONG-HORIZON COLUMN: A RECORDED JUDGEMENT CALL, NOT A LOOKUP. The paper does NOT state the "
+    "long-horizon planner settings anywhere. Its appendix protocol table (Subplanner horizon 25, "
+    "# Executed actions 25, footnoted as 5 for MPC) is the SHORT-horizon protocol, and the "
+    "long-horizon paragraph and tab:long_horizon of paper_tex/sec/1_main.tex introduce "
+    "L_plan = L_spatial + 0.1 * L_agg for \"a longer-horizon setting where the target is 50 steps "
+    "away\" without giving a single planner value. This column encodes task 11.4's reading (a): "
+    "scale the horizon with the goal distance (goal_H 50, planner.sub_planner.horizon 50, "
+    "planner.n_taken_actions 50 open-loop), which preserves the appendix's own "
+    "\"executed actions = horizon\" relationship, and keep the footnoted MPC value of 5 executed "
+    "actions. The rejected reading (b) was to hold horizon at 25 and let open-loop cover half the "
+    "distance, which would by itself explain the paper's open-loop collapse to 13.33 against MPC's "
+    "24.00; (a) was chosen because it is the only reading under which open-loop is even attempting "
+    "the task. Both readings keep frameskip 5 and every horizon divisible by it. This is a guess "
+    "either way: it is recorded here, in the manifest, so it is auditable"
+)
+
+PROTOCOL_EXPECTED_SOURCE: Dict[Tuple[str, int], str] = {
+    ("plan_gd", SHORT_GOAL_H): (
+        "conf/plan_gd.yaml shipped defaults, plus the objective.alpha=1 and objective.mode=last "
+        "overrides run_ccr_pilot.sh already applies (Requirements 8.2, 8.4); goal_H 25 is the "
+        "shipped value and the horizon the Platform_Baseline and the Paper_Target were measured at"
+    ),
+    ("plan_gd_mpc", SHORT_GOAL_H): (
         "conf/plan_gd_mpc.yaml shipped defaults, plus the objective.alpha=1 and "
         "objective.mode=staged overrides run_ccr_pilot.sh already applies (Requirements 8.3, 8.4); "
         "max_iter 20 and n_taken_actions 5 are this setting's shipped values, per the confirmed "
-        "per-setting reading of Requirement 8.4"
+        "per-setting reading of Requirement 8.4; goal_H 25 is the shipped value and the horizon "
+        "the Platform_Baseline and the Paper_Target were measured at"
+    ),
+    ("plan_gd", LONG_GOAL_H): (
+        _LONG_HORIZON_SOURCE_PREAMBLE + ". Everything outside the three horizon fields is the "
+        "short open-loop column unchanged: conf/plan_gd.yaml shipped defaults plus the "
+        "objective.alpha=1 and objective.mode=last overrides run_ccr_pilot.sh already applies "
+        "(Requirements 8.2, 8.4)"
+    ),
+    ("plan_gd_mpc", LONG_GOAL_H): (
+        _LONG_HORIZON_SOURCE_PREAMBLE + ". Everything outside the two horizon fields that move is "
+        "the short MPC column unchanged: conf/plan_gd_mpc.yaml shipped defaults plus the "
+        "objective.alpha=1 and objective.mode=staged overrides run_ccr_pilot.sh already applies "
+        "(Requirements 8.3, 8.4), with max_iter 20 and n_taken_actions 5 this setting's shipped "
+        "values. n_taken_actions stays 5 here: the appendix footnotes 5 executed actions for MPC "
+        "independently of the horizon, and this is the setting the paper's long-horizon claim is "
+        "actually scoped to (\"under MPC\")"
     ),
 }
 
@@ -226,6 +382,73 @@ PROTOCOL_EXPECTED_SOURCE: Dict[str, str] = {
 MISSING = "<missing>"
 
 _MISSING_SENTINEL = object()
+
+
+def _check_expected_tables() -> None:
+    """Self-check on the expected columns, run at import. Raises rather than asserts.
+
+    Three statements that are cheap to hold and expensive to lose:
+
+    1. every setting has a column in **both** regimes, so a launch cannot find one regime's table
+       missing at the moment it needs it;
+    2. every column pins exactly :data:`PROTOCOL_FIELDS`, so a field added to the list without a
+       value in some column cannot surface as a ``KeyError`` inside :func:`resolve_protocol`;
+    3. every pinned horizon is divisible by :data:`FRAMESKIP`. ``plan.py`` integer-divides
+       ``goal_H``, ``planner.n_taken_actions`` and ``planner.sub_planner.horizon`` by the
+       checkpoint's frameskip, so a non-multiple is silently truncated -- a protocol column that
+       pinned one would be pinning a number the planner never actually uses.
+
+    A ``raise`` rather than an ``assert``, because ``python -O`` strips the latter and this is the
+    only check on the tables' shape.
+    """
+    settings = tuple(SETTING_NAMES)
+    for goal_h in HORIZON_REGIMES:
+        for config_name in settings:
+            if (config_name, goal_h) not in PROTOCOL_EXPECTED:
+                raise RuntimeError(
+                    f"plan_agg.PROTOCOL_EXPECTED has no column for "
+                    f"({config_name!r}, goal_H={goal_h}); every setting needs one per horizon "
+                    f"regime, or a launch in that regime aborts on a missing table rather than on "
+                    f"a protocol deviation."
+                )
+
+    fields = set(PROTOCOL_FIELDS)
+    for key, table in PROTOCOL_EXPECTED.items():
+        missing = sorted(fields - set(table))
+        extra = sorted(set(table) - fields)
+        if missing or extra:
+            raise RuntimeError(
+                f"plan_agg.PROTOCOL_EXPECTED[{key!r}] does not pin exactly PROTOCOL_FIELDS: "
+                f"missing {missing}, unexpected {extra}."
+            )
+        if key not in PROTOCOL_EXPECTED_SOURCE:
+            raise RuntimeError(
+                f"plan_agg.PROTOCOL_EXPECTED_SOURCE has no entry for {key!r}; every column's "
+                f"provenance reaches the manifest (Requirement 8.6)."
+            )
+        for field_path in HORIZON_FIELDS:
+            value = table[field_path]
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                or value % FRAMESKIP
+            ):
+                raise RuntimeError(
+                    f"plan_agg.PROTOCOL_EXPECTED[{key!r}][{field_path!r}] is {value!r}, which is "
+                    f"not a positive multiple of frameskip {FRAMESKIP}. plan.py integer-divides "
+                    f"this field by frameskip, so the planner would silently run a truncated "
+                    f"horizon while the manifest recorded the untruncated number."
+                )
+        if table["goal_H"] != key[1]:
+            raise RuntimeError(
+                f"plan_agg.PROTOCOL_EXPECTED[{key!r}] pins goal_H {table['goal_H']!r} but is keyed "
+                f"at {key[1]!r}; the table is selected by goal_H, so the two must agree or the "
+                f"selected column could never match the configuration that selected it."
+            )
+
+
+_check_expected_tables()
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +483,7 @@ class ProtocolDeviation:
 class ProtocolRecord:
     """The resolved protocol, the expected table it was checked against, and any deviations.
 
-    Produced whether or not the check passes, because Requirement 8.6 wants all ten resolved values
+    Produced whether or not the check passes, because Requirement 8.6 wants every resolved value
     recorded either way: if the literal reading of Requirement 8.4 turns out to be the intended one,
     the manifest already shows exactly which fields differ.
     """
@@ -271,6 +494,14 @@ class ProtocolRecord:
     expected: Dict[str, Any]
     deviations: Tuple[ProtocolDeviation, ...]
     expected_source: str
+    #: Which of :data:`HORIZON_REGIMES` selected ``expected`` -- ``"short"`` (goal_H 25, the
+    #: reported result) or ``"long"`` (goal_H 50, task 11.4's Positive_Control). Recorded so the
+    #: manifest states the regime in one word rather than leaving it to be inferred from three
+    #: horizon numbers, and so a reader of the output tree -- which now holds both -- can tell them
+    #: apart at all.
+    horizon_regime: str = HORIZON_REGIMES[SHORT_GOAL_H]
+    #: The resolved ``goal_H`` the regime was selected on, as an ``int``.
+    goal_H: int = SHORT_GOAL_H
 
     @property
     def ok(self) -> bool:
@@ -291,6 +522,8 @@ class ProtocolRecord:
             "protocol_resolved": dict(self.resolved),
             "protocol_expected": dict(self.expected),
             "protocol_expected_source": self.expected_source,
+            "protocol_horizon_regime": self.horizon_regime,
+            "protocol_goal_H": self.goal_H,
             "protocol_ok": self.ok,
             "protocol_deviations": [d.to_dict() for d in self.deviations],
         }
@@ -299,7 +532,8 @@ class ProtocolRecord:
         """The Requirement 8.7 abort message: every deviating field, expected and resolved."""
         lines = [
             f"Evaluation_Protocol deviation in the {self.setting} setting "
-            f"(config name {self.config_name!r}): "
+            f"(config name {self.config_name!r}, {self.horizon_regime} horizon, "
+            f"goal_H {self.goal_H}): "
             f"{len(self.deviations)} of {len(self.expected)} fields differ from the expected "
             f"table.",
         ]
@@ -392,16 +626,72 @@ def _values_match(expected: Any, resolved: Any) -> bool:
     return resolved == expected
 
 
-def expected_table(config_name: str) -> Dict[str, Any]:
-    """The expected protocol table for ``config_name``, or raise naming the known settings."""
+def _as_goal_h(value: Any) -> Optional[int]:
+    """``value`` as an integral ``goal_H``, or ``None`` if it is not one.
+
+    ``bool`` is refused for the same reason :func:`_values_match` refuses it for numeric fields:
+    ``True == 1`` must not let a flag pass as a horizon. A float is accepted only when it is
+    integral, since ``plan.py`` uses ``goal_H`` in integer division and slicing.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None
+    as_int = int(value)
+    return as_int if float(value) == float(as_int) else None
+
+
+def horizon_regime(goal_H: Any) -> Tuple[str, int]:
+    """The horizon regime ``goal_H`` selects, as ``(regime_name, goal_H_as_int)``.
+
+    This is the explicit half of task 11.3's column selection. It is a **lookup in**
+    :data:`HORIZON_REGIMES`, not a ``goal_H != 25`` test: an unrecognised horizon aborts naming the
+    field and the horizons that exist, rather than silently landing in the long column, where it
+    would then deviate on ``sub_planner.horizon`` and be reported as the wrong problem.
+
+    Raises:
+        ProtocolError: if ``goal_H`` is absent, non-integral, or not one of the two horizons this
+            feature holds a column for. Raised before any load, exactly as a field deviation is.
+    """
+    as_int = _as_goal_h(goal_H)
+    if as_int is not None and as_int in HORIZON_REGIMES:
+        return HORIZON_REGIMES[as_int], as_int
+
+    known = ", ".join(
+        f"{value} ({name})" for value, name in sorted(HORIZON_REGIMES.items())
+    )
+    raise ProtocolError(
+        f"{GOAL_H_FIELD} resolved to {goal_H!r}, and the aggregated-space planning cost holds an "
+        f"Evaluation_Protocol column only for these horizons: {known}. The short column is the "
+        f"Table-1 protocol the reported result is measured under (Requirement 7.2); the long one "
+        f"is task 11.4's Positive_Control, which reproduces the paper's own long-horizon "
+        f"combined-cost cell. A third horizon is not a deviation this feature can interpret -- its "
+        f"planner settings would be a second undocumented guess -- so it aborts here rather than "
+        f"being checked against a column that was never meant for it. Launch with "
+        f"{GOAL_H_FIELD}={SHORT_GOAL_H} or {GOAL_H_FIELD}={LONG_GOAL_H}, or add a column and "
+        f"record where its values come from in PROTOCOL_EXPECTED_SOURCE. Nothing has been loaded."
+    )
+
+
+def expected_table(config_name: str, goal_H: Any) -> Dict[str, Any]:
+    """The expected protocol table for the ``(config_name, goal_H)`` pair.
+
+    Both halves of the key are required, and neither has a default: the short columns are what
+    protect the reported result, so "which horizon regime is this" must be answered by the caller
+    out of the resolved configuration rather than assumed here.
+
+    Raises:
+        ProtocolError: naming the known settings if ``config_name`` names none, or -- through
+            :func:`horizon_regime` -- naming the known horizons if ``goal_H`` is not one of them.
+    """
     name = normalize_config_name(config_name)
+    _regime, goal_h = horizon_regime(goal_H)
     try:
-        return PROTOCOL_EXPECTED[name]
+        return PROTOCOL_EXPECTED[(name, goal_h)]
     except KeyError:
-        known = ", ".join(sorted(PROTOCOL_EXPECTED))
+        known = ", ".join(sorted(SETTING_NAMES))
         raise ProtocolError(
-            f"the aggregated-space planning cost holds one Evaluation_Protocol table per setting "
-            f"and has none for config name {name!r} (raw: {config_name!r}). Requirement 8.2 "
+            f"the aggregated-space planning cost holds one Evaluation_Protocol table per "
+            f"(setting, horizon) pair and has none for config name {name!r} at "
+            f"{GOAL_H_FIELD}={goal_h} (raw config name: {config_name!r}). Requirement 8.2 "
             f"measures the open-loop setting through conf/plan_gd.yaml and Requirement 8.3 the MPC "
             f"setting through conf/plan_gd_mpc.yaml, so the known config names are: {known}. "
             f"Launch with --config-name plan_gd.yaml or --config-name plan_gd_mpc.yaml."
@@ -409,7 +699,13 @@ def expected_table(config_name: str) -> Dict[str, Any]:
 
 
 def resolve_protocol(config_name: Any, cfg: Any, strict: bool = True) -> ProtocolRecord:
-    """Resolve all ten Evaluation_Protocol fields and check them against the setting's table.
+    """Resolve every Evaluation_Protocol field and check it against the ``(setting, horizon)`` table.
+
+    ``goal_H`` is resolved out of ``cfg`` **first**, and the expected column is selected on the
+    ``(config_name, goal_H)`` pair (task 11.3). That order is the requirement, not an
+    implementation detail: the short columns pin ``goal_H 25``, ``sub_planner.horizon 25`` and
+    ``n_taken_actions`` 25/5, so a 50-step run checked against them would abort on three fields
+    before it could say the one thing worth saying, which is that it is a long-horizon run.
 
     Args:
         config_name: what ``HydraConfig.get().job.config_name`` reports, with or without the
@@ -417,20 +713,29 @@ def resolve_protocol(config_name: Any, cfg: Any, strict: bool = True) -> Protoco
         cfg: the resolved configuration. Any nested mapping works -- an ``omegaconf`` node, or a
             plain ``dict``, which is what makes this checkable without Hydra.
         strict: raise on deviation (the default, Requirement 8.7). ``False`` returns the record with
-            its deviations recorded instead, which is how the manifest keeps all ten resolved values
+            its deviations recorded instead, which is how the manifest keeps every resolved value
             even for a configuration this feature would refuse to run (Requirement 8.6).
 
     Returns:
         The :class:`ProtocolRecord`, whose ``resolved`` holds every field in
-        :data:`PROTOCOL_FIELDS` order.
+        :data:`PROTOCOL_FIELDS` order and whose ``horizon_regime`` names the column that was used.
 
     Raises:
-        ProtocolError: if ``config_name`` names no known setting, or -- when ``strict`` -- if any
-            field deviates. Raised before any load, naming the field, the expected value and the
-            resolved value.
+        ProtocolError: if ``config_name`` names no known setting, if ``goal_H`` is not one of the
+            two horizons a column exists for, or -- when ``strict`` -- if any field deviates. The
+            first two raise even when ``strict`` is ``False``, because without a column there is
+            nothing to record a deviation *against*; that is the same behaviour an unknown config
+            name has always had. Raised before any load, naming the field, the expected value and
+            the resolved value.
     """
     name = normalize_config_name(config_name)
-    expected = expected_table(name)
+
+    # The horizon regime is resolved before the table is chosen -- see the docstring.
+    raw_goal_h = _lookup(cfg, GOAL_H_FIELD)
+    regime, goal_h = horizon_regime(
+        MISSING if raw_goal_h is _MISSING_SENTINEL else raw_goal_h
+    )
+    expected = expected_table(name, goal_h)
 
     resolved: Dict[str, Any] = {}
     deviations = []
@@ -448,13 +753,21 @@ def resolve_protocol(config_name: Any, cfg: Any, strict: bool = True) -> Protoco
                 ProtocolDeviation(field=field_path, expected=want, resolved=value)
             )
 
+    # `goal_H` is in `PROTOCOL_FIELDS`, so it is resolved and recorded like every other field, and
+    # by construction its comparison above cannot deviate: the column was chosen by it. That is
+    # deliberate -- the abort for a horizon no column covers happens earlier, in `horizon_regime`,
+    # with a message about the horizon rather than about a field mismatch. What the entry buys is
+    # the manifest record: `protocol_resolved["goal_H"]` and `protocol_horizon_regime` say which
+    # regime produced the numbers, which nothing in the output tree said before task 11.3.
     record = ProtocolRecord(
         config_name=name,
         setting=SETTING_NAMES.get(name, name),
         resolved=resolved,
         expected=dict(expected),
         deviations=tuple(deviations),
-        expected_source=PROTOCOL_EXPECTED_SOURCE[name],
+        expected_source=PROTOCOL_EXPECTED_SOURCE[(name, goal_h)],
+        horizon_regime=regime,
+        goal_H=goal_h,
     )
 
     if strict and not record.ok:
@@ -690,6 +1003,11 @@ def build_manifest(
         "feature": FEATURE_NAME,
         "config_name": protocol.config_name,
         "setting": protocol.setting,
+        # Top level as well as inside `protocol.to_dict()`: after task 11.4 the output tree holds
+        # both regimes, and "which horizon produced this number" is a first-order fact about the
+        # run rather than a detail of the protocol check.
+        "horizon_regime": protocol.horizon_regime,
+        "goal_H": protocol.goal_H,
         "agg_weight": float(agg_weight),
         "objective_target": OBJECTIVE_TARGET,
         "seed": _plain(_cfg_get(cfg, "seed", MISSING)),
@@ -702,7 +1020,7 @@ def build_manifest(
         "output_dir": output_dir,
         "git_rev": _git_rev(),
     }
-    # All ten resolved protocol values, the expected column they were checked against, its source,
+    # Every resolved protocol value, the expected column they were checked against, its source,
     # `protocol_ok` and any deviations -- recorded whether or not the check passed (Requirement 8.6).
     manifest.update(protocol.to_dict())
     return manifest
@@ -720,8 +1038,9 @@ def write_manifest(
     """Write ``agg_run_manifest.json`` next to the frozen ``logs.json`` (Requirements 2.5, 8.6).
 
     Returns the absolute path written. Called *before* ``plan.planning_main``, so a failure here
-    costs no evaluation time and is allowed to propagate: the resolved Agg_Weight and the ten
-    resolved protocol fields are what make an arm attributable after the fact, and an unlabelled
+    costs no evaluation time and is allowed to propagate: the resolved Agg_Weight, the horizon
+    regime and the resolved protocol fields are what make an arm attributable after the fact, and an
+    unlabelled
     run directory is worse than an aborted one.
     """
     directory = os.path.abspath(output_dir if output_dir else os.getcwd())
@@ -880,7 +1199,8 @@ def _main(cfg: Any) -> Any:
 
     print(
         f"[plan_agg] feature={FEATURE_NAME} setting={protocol.setting} "
-        f"config_name={protocol.config_name} agg_weight={agg_weight!r} "
+        f"config_name={protocol.config_name} horizon={protocol.horizon_regime} "
+        f"(goal_H={protocol.goal_H}) agg_weight={agg_weight!r} "
         f"protocol_ok={protocol.ok} run_dir={cfg['saved_folder']}",
         flush=True,
     )

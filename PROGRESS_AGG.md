@@ -41,8 +41,9 @@ distortion is good.
 | Objective wrapper, protocol guard, instrumentation, sweep tooling | complete (commit `d3c3ce5`); CPU property tests green |
 | **Task 11.1 — paired zero-weight check** | **PASS 2026-08-08 — see §4. Numerically identical, not merely equal in the mean** |
 | Task 11.2 — record the paired verdict | **this file, §4** |
-| Task 11.3 — long-horizon protocol column | _not started_ |
-| Task 11.4 — Positive_Control (~1.5 GPU-h) | _not launched_ |
+| Task 11.3 — long-horizon protocol column | **complete** — `PROTOCOL_EXPECTED` keyed on `(config_name, goal_H)`; short columns unweakened; `goal_H` now pinned. See §6 |
+| Task 9.2 — driver-contract test | **complete, promoted out of optional** — §5's recommendation, acted on |
+| Task 11.4 — Positive_Control (~1.5 GPU-h) | _not launched_ — **reading recorded in §6 before launch** |
 | Task 11.5 — Positive_Control verdict | _not read_ |
 | Section 12 — the 6-arm weight sweep (~4 GPU-h) | **not launched; gated on BOTH 11.1 and 11.4** |
 | Acceptance gate | not reached |
@@ -146,3 +147,84 @@ cheapest remaining insurance before the six sweep arms of section 12.**
   open-loop cell's records are keyed `mpc/success_rate`, and both task-11.1 legs printed
   `MPC iter 0 Eval` while running open-loop with the GD planner. Anyone reading these files directly
   would take open-loop numbers for MPC ones.
+
+---
+
+## 6. The long-horizon reading — RECORDED 2026-08-08, BEFORE TASK 11.4 RUNS
+
+Task 11.4 requires the reading to be written into **both** the manifest and this log *before* the job
+runs, not reconstructed afterwards. The manifest half is `PROTOCOL_EXPECTED_SOURCE[(config_name, 50)]`,
+which carries the text below into `agg_run_manifest.json` for every long-horizon run. This is the log
+half.
+
+**The paper does not state its long-horizon planner settings anywhere.** `paper_tex/sec/1_main.tex`
+introduces `L_plan = L_spatial + 0.1 · L_agg` only for "a longer-horizon setting where the target is 50
+steps away", and scopes the claim to MPC — "this combined cost improves over using the spatial cost
+alone across all models **under MPC**". No open-loop claim is made. The appendix protocol table
+(`Subplanner horizon 25`, `# Executed actions 25`, footnoted 5 for MPC) is the **short**-horizon
+protocol.
+
+**Reading taken — (a), scale the horizon with the goal distance:**
+
+| field | open-loop | MPC |
+|---|---|---|
+| `goal_H` | 50 | 50 |
+| `planner.sub_planner.horizon` | 50 | 50 |
+| `planner.n_taken_actions` | **50** | **5** |
+
+Everything else is the short column unchanged: `n_evals 50`, `objective.alpha 1`, `objective.mode`
+last/staged, `max_iter` 1/20, `sub_planner.lr 0.1`, `opt_steps 100`, `sample_type zero`,
+`action_noise 0`. `frameskip` stays 5 and every horizon is divisible by it.
+
+**Reading rejected — (b)**, hold `horizon` at 25 and let open-loop cover half the distance. Rejected
+because (a) is the only reading under which open-loop is even attempting the task. Recorded because (b)
+would **by itself** explain the paper's open-loop collapse to 13.33 against MPC's 24.00, so if the
+control reproduces MPC but not open-loop, (b) becomes the live hypothesis and this note is the thing
+that stops that from being an after-the-fact rationalisation.
+
+**MPC keeps 5 executed actions at both horizons.** The appendix footnotes 5 independently of the
+horizon, and MPC is the setting the paper's claim is actually scoped to. If 11.4 lands on 50 instead,
+that is a one-value edit plus its test literal — and it must be recorded here as a changed reading, not
+quietly swapped.
+
+**This is a guess either way.** It is written down so it is auditable, not because it is known.
+
+### 6.1 Reference cells to compare against (paper, `+ Proj` row with `L_curv` ✓)
+
+| long-horizon PushT | open-loop | MPC |
+|---|---|---|
+| spatial only | 13.33 ± 3.77 | 24.00 ± 6.53 |
+| combined cost | 20.00 ± 0.00 | 33.33 ± 4.16 |
+| **delta to look for** | **+6.67** | **+9.33** |
+
+**What the control can and cannot decide.** A *failure* to reproduce means the wrapper is wrong and the
+sweep is unreadable. A *success* only licenses interpreting a flat short-horizon sweep — **it is not
+evidence for this arm**, because it reproduces the paper's own cell with the paper's own weight. At one
+seed and `n_evals = 50` the binomial SE is ~5–7 points, so a `+9.33` MPC delta is roughly 1.5 SE on a
+single seed: the control can detect a gross wiring failure, not a small effect. Task 11.4 runs one seed
+first for exactly that reason.
+
+### 6.2 Task 11.3, as shipped
+
+`PROTOCOL_EXPECTED` and `PROTOCOL_EXPECTED_SOURCE` are now keyed on the `(config_name, goal_H)` **pair**,
+and `resolve_protocol` resolves `goal_H` out of the config *first*, then selects the column. Selection is
+a lookup over `HORIZON_REGIMES = {25: "short", 50: "long"}` rather than a `goal_H != 25` test, so a third
+horizon aborts naming the field and the two that exist instead of silently falling into the long column.
+
+**The short-horizon gate is not weakened**, and that is asserted against a literal copy of the pre-task
+table in `tests/test_agg_protocol_horizon.py` rather than checked by eye. `goal_H` is now a pinned field,
+which **strengthens** it: previously `goal_H` was unconstrained, so a 50-step run satisfied the short
+columns on `sub_planner.horizon` alone, and a manifest could not tell a 25-step run from a 50-step one —
+which matters now that the tree will hold both.
+
+Also added: a `FRAMESKIP = 5` divisibility self-check on every pinned horizon, run at import as a `raise`
+rather than an `assert` so `python -O` cannot strip it. Justification — `PlanEvaluator.__init__`
+integer-divides `goal_H`, `n_taken_actions` and `sub_planner.horizon` by frameskip and rejects nothing,
+so a non-multiple is silently **truncated** and a column could pin a number the planner never runs.
+
+**Signature change worth a reviewer's eye:** `expected_table` now takes a required second argument and
+the two dicts changed key shape. Nothing outside `plan_agg.py` referenced them, and no short-horizon
+*value* moved, but this is not purely additive.
+
+Suite after 11.3 and 9.2: **369 passed, 12 skipped, 3 failed** — up from 309 passed; the 3 failures are
+the pre-existing CUDA-only `tests/test_vit_sdpa_equivalence.py` cases.

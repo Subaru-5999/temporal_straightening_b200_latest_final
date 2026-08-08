@@ -350,11 +350,23 @@ Task labels:
       `run_ccr_pilot.sh` is already an `ALLOWED_FILES` member, so this edit adds no allowlist entry
     - _Requirements: 9.1, 9.2, 9.3_
 
-  - [ ]* 9.2 [CODE] Extend the driver-contract test for the new hooks (`tests/test_run_ccr_pilot_sh.py`)
+  - [x] 9.2 [CODE] Extend the driver-contract test for the new hooks (`tests/test_run_ccr_pilot_sh.py`)
+    - **Promoted out of optional** (`PROGRESS_AGG.md` section 5): both bugs task 11.1 hit were in code that
+      had never been executed, and a contract test on the emitted override token would have caught the first
+      for free. The suite at the time asserted the *unquoted* form, so it was pinning the bug in place
     - Assert `PLAN_ENTRY` and `SETTINGS` default to `plan.py` and `both`, that no literal `plan.py` token
       remains in `run_eval_jobs`, that each `SETTINGS` value selects the matching loop, that the two settings
       receive different `hydra.run.dir` prefixes, and that the existing `ps` preflight guard and environment
       recipe are unchanged
+    - Plus the `HYDRA_RUN_DIR` hook itself: unset emits **no** `hydra.run.dir` override at all (what keeps
+      the CCR path byte-identical), `agg` emits the per-setting token from `agg_objectives.run_dir_override`
+      with different templates per setting, every emitted value is single-quoted, a caller-supplied value
+      containing a single quote is rejected rather than mangled, and the token is one shell word
+    - **Local result (recorded):** `20 passed`. 11 source-level checks that run anywhere plus 9 that execute
+      the driver's real `add_run_dir_default` / `add_default` / `_user_overrides_key` definitions, extracted
+      from the shipped file, under `bash`; those 9 skip with a reason where no working `bash` exists (the
+      Windows `WindowsApps` stub exits non-zero with no WSL distribution, so the candidate list falls through
+      to Git-for-Windows' bash)
     - _Requirements: 9.1, 9.2, 9.3_
 
 - [x] 10. Checkpoint - all local code and tests green before any pod job
@@ -454,7 +466,7 @@ Task labels:
       scale, which is what decides whether the Sweep_Grid brackets the useful range at all
     - _Requirements: 3.3, 5.1, 5.2, 5.3_
 
-  - [ ] 11.3 [CODE] Add the long-horizon protocol column to `plan_agg.py`
+  - [x] 11.3 [CODE] Add the long-horizon protocol column to `plan_agg.py`
     - **Why this task exists.** `resolve_protocol` is strict and aborts on any deviation from the per-setting
       table (Requirement 8.7), and both shipped columns pin `sub_planner.horizon 25` and `n_taken_actions`
       25 / 5. The Positive_Control in task 11.4 runs at `goal_H=50`, so it *must* deviate — without a third
@@ -470,6 +482,24 @@ Task labels:
     - The long-horizon column's values come from task 11.4's settled reading, not from this task. Encode
       whatever 11.4 records, and abort naming the field if a run deviates from it, exactly as the short
       columns do
+    - **Implemented (recorded).** `PROTOCOL_EXPECTED` is keyed on the `(config_name, goal_H)` pair;
+      `resolve_protocol` resolves `goal_H` out of `cfg` **before** selecting, through
+      `horizon_regime(goal_H)`, which is a lookup in `HORIZON_REGIMES = {25: "short", 50: "long"}` — a
+      horizon in neither column aborts naming the field and the two that exist, rather than falling into the
+      long column and being reported as three field mismatches. Long column = task 11.4's reading (a):
+      `goal_H 50`, `sub_planner.horizon 50`, `n_taken_actions` 50 open-loop / 5 MPC, everything else the
+      short column's value. `goal_H` is now in `PROTOCOL_FIELDS` (pinned 25 short / 50 long), which
+      **strengthens** the short gate: it was unpinned before, so a 50-step run satisfied the short columns on
+      `sub_planner.horizon` alone. `ProtocolRecord.horizon_regime` / `.goal_H` reach the manifest both at top
+      level and inside `protocol_*`. `PROTOCOL_EXPECTED_SOURCE` is keyed on the same pair and its two
+      long-horizon strings state plainly that the paper does not state these settings, that the appendix
+      table is the short-horizon protocol, and that reading (a) is a recorded judgement call
+    - **Local result (recorded):** `tests/test_agg_protocol_horizon.py` `40 passed`. It pins the two short
+      columns against a *literal copy* of the pre-11.3 table, so a value relaxed while adding the long column
+      fails; asserts every pinned horizon in every column is divisible by `frameskip` 5 (`plan.py`
+      integer-divides all three fields, so a non-multiple truncates silently); and enforces the no-hydra
+      importability contract in a subprocess that cannot import `hydra`, `omegaconf`, `custom_resolvers` or
+      `plan`
     - _Requirements: 8.1, 8.4, 8.6, 8.7_
 
   - [ ] 11.4 [GPU RUN] Positive_Control: reproduce the paper's long-horizon combined-cost gain
