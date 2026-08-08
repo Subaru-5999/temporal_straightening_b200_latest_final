@@ -206,10 +206,30 @@ RUN_DIR_TEMPLATES = {
 
 
 def run_dir_override(config_name: str) -> str:
-    """Return the full ``hydra.run.dir=<template>`` override token for ``config_name``.
+    """Return the full ``hydra.run.dir='<template>'`` override token for ``config_name``.
 
     ``config_name`` is the Hydra config name (``plan_gd`` for the open-loop setting,
     ``plan_gd_mpc`` for MPC), i.e. what ``HydraConfig.get().job.config_name`` reports.
+
+    **The value is wrapped in single quotes, and they are not decoration.** Hydra parses the
+    right-hand side of a command-line override with its own ANTLR grammar, *before* OmegaConf
+    ever sees it, and that grammar rejects an unquoted ``}``::
+
+        hydra.run.dir=plan_outputs_gd/${replace_slash:${model_name}}_...
+        -> OverrideParseException: mismatched input '}' expecting <EOF>
+
+    Quoting makes the grammar read the whole value as one string literal; the ``${...}``
+    interpolations survive untouched and OmegaConf resolves them later, at composition time.
+    Verified against the pod's Hydra 1.2.0 with ``OverridesParser``: the unquoted form raises,
+    the quoted form returns the template verbatim.
+
+    This is a **second, independent** quoting requirement from the bash one. ``run_ccr_pilot.sh``
+    already protected these interpolations from *shell* expansion — an expanded one arrives
+    empty and silently truncates the directory — and
+    ``tests/test_agg_run_dir_separation.py::test_run_dir_overrides_are_single_quoted_in_shell_drivers``
+    guards that layer. Nothing guarded the Hydra layer, which is why task 11.1 failed on its
+    first ever invocation with this hook. ``test_run_dir_override_parses_under_hydra_grammar``
+    now covers it.
     """
     try:
         template = RUN_DIR_TEMPLATES[config_name]
@@ -219,7 +239,14 @@ def run_dir_override(config_name: str) -> str:
             f"no aggregated-space hydra.run.dir template for config name {config_name!r}; "
             f"known config names are: {known}"
         ) from None
-    return f"hydra.run.dir={template}"
+    if "'" in template:
+        # Unreachable with the module constants above, and checked anyway: a single quote in the
+        # template would terminate the quoted value early and hand Hydra a different override.
+        raise ValueError(
+            f"the hydra.run.dir template for {config_name!r} contains a single quote, which "
+            f"cannot be passed through Hydra's quoted-value grammar: {template!r}"
+        )
+    return f"hydra.run.dir='{template}'"
 
 
 # ---------------------------------------------------------------------------

@@ -324,7 +324,13 @@ def test_templates_require_single_quoting_and_survive_it():
             f"cannot be passed through bash single quotes."
         )
         token = run_dir_override(config_name)
-        assert token == f"hydra.run.dir={template}"
+        # The value is single-quoted for HYDRA's override grammar, which is a separate layer from
+        # the bash quoting the test above checks. This assertion previously read
+        # ``token == f"hydra.run.dir={template}"`` -- i.e. it encoded the unquoted form, and so
+        # asserted the bug that made task 11.1 fail on its first ever run with this hook:
+        # Hydra's ANTLR parser rejects an unquoted '}' with
+        # "mismatched input '}' expecting <EOF>" before OmegaConf ever sees the value.
+        assert token == f"hydra.run.dir='{template}'"
         assert "\n" not in token and " " not in token, (
             f"{config_name}: the override token {token!r} contains whitespace and would split "
             f"into two shell words."
@@ -402,6 +408,56 @@ def test_override_differs_from_the_shipped_template_in_one_component(config_name
     assert override.startswith(EXPECTED_PREFIXES[config_name] + "/")
     assert "${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/" in override
     assert override.endswith("_obj${objective.mode}_init${planner.sub_planner.sample_type}")
+
+
+def test_run_dir_override_parses_under_hydra_grammar():
+    """The check that was missing, and the reason task 11.1 failed on its first invocation.
+
+    Every other test in this module reasons about the override token as *text* — is it one shell
+    word, are its interpolations protected from bash. None of them handed the token to Hydra, and
+    Hydra parses an override's right-hand side with its own ANTLR grammar before OmegaConf sees
+    anything. That grammar rejects an unquoted ``}``::
+
+        hydra.run.dir=plan_outputs_gd/${replace_slash:${model_name}}_...
+        -> OverrideParseException: mismatched input '}' expecting <EOF>
+
+    So this asserts the real contract on the real parser: the emitted token parses, and its value
+    comes back as the template **verbatim**, with the ``${...}`` intact for OmegaConf to resolve at
+    composition time. Both halves matter — a quoting scheme that parsed but mangled the
+    interpolations would resolve to a different directory, which ``aggregate_results.py`` would
+    read as some other cell.
+
+    The negative control is asserted too, so the test cannot pass by accident on a Hydra whose
+    grammar has been relaxed: the unquoted form must still raise.
+    """
+    parser = pytest.importorskip(
+        "hydra.core.override_parser.overrides_parser",
+        reason="hydra is not installed in this environment",
+    ).OverridesParser.create()
+
+    for config_name, template in RUN_DIR_TEMPLATES.items():
+        token = run_dir_override(config_name)
+        parsed = parser.parse_overrides([token])
+        assert len(parsed) == 1, f"{config_name}: {token!r} parsed into {len(parsed)} overrides"
+        assert parsed[0].key_or_group == "hydra.run.dir"
+        assert parsed[0].value() == template, (
+            f"{config_name}: Hydra parsed the override but the value changed.\n"
+            f"  emitted  {token!r}\n"
+            f"  parsed   {parsed[0].value()!r}\n"
+            f"  expected {template!r}\n"
+            f"An altered value resolves to a different run directory, which "
+            f"aggregate_results.py reads as a different cell."
+        )
+
+        with pytest.raises(Exception) as excinfo:
+            parser.parse_overrides([f"hydra.run.dir={template}"])
+        assert "mismatched input" in str(excinfo.value) or "OverrideParseException" in type(
+            excinfo.value
+        ).__name__, (
+            f"{config_name}: the UNQUOTED override no longer fails to parse. If Hydra's grammar "
+            f"has been relaxed, the quoting in run_dir_override() is no longer load-bearing and "
+            f"this test's premise should be re-derived rather than deleted."
+        )
 
 
 def test_run_dir_override_rejects_an_unknown_config_name():

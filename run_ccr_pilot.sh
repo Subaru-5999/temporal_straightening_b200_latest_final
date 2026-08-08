@@ -140,7 +140,20 @@ add_run_dir_default() {
       die "HYDRA_RUN_DIR=agg: agg_objectives.run_dir_override('${config_name}') printed nothing."
     add_default "$token"
   else
-    add_default "hydra.run.dir=$value"
+    # Single-quoted for the same reason run_dir_override() quotes its own token, and this is a
+    # SEPARATE requirement from the bash quoting the comment above describes. Hydra parses an
+    # override's right-hand side with its own ANTLR grammar before OmegaConf sees it, and that
+    # grammar rejects a closing brace that is not inside a quoted value: passing an interpolated
+    # run-directory template as a bare right-hand side dies with
+    #   OverrideParseException: mismatched input '}' expecting <EOF>
+    # (the literal form is not reproduced here on purpose -- an unquoted example in a driver is
+    # exactly what test_run_dir_overrides_are_single_quoted_in_shell_drivers scans for, comment or
+    # not, and it is right to: a bad example one copy-paste from a real command line is a hazard).
+    # This branch is the one the paired zero-weight plan.py leg of task 11.1 takes, so it was
+    # broken in exactly the same way the HYDRA_RUN_DIR=agg branch was.
+    [[ "$value" != *"'"* ]] || die "HYDRA_RUN_DIR contains a single quote, which cannot be passed
+       through Hydra's quoted-value grammar: ${value}"
+    add_default "hydra.run.dir='$value'"
   fi
 }
 
