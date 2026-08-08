@@ -660,14 +660,55 @@ Validation split (cross-check):
 | point_maze (umaze) | raw | −0.0061 | −0.0058 | 0.5075 | 0.1258 | 0.5794 | 32,400 | 16,200 |
 | point_maze (umaze) | first | −0.0097 | −0.0222 | 0.5072 | 0.3142 | 0.5580 | 32,400 | 16,200 |
 
-- **20-bin histograms over `[-1, 1]`: _pending transcription_.** They live in the JSON reports under
-  `splits.<split>.reductions.<r>.cos_histogram`, and those reports are **pod-local and gitignored**
-  (`.gitignore:14` matches `*outputs*`; the pod is pull-only, see `AGENT_MEMORY_2.0.md` §5.1), so they
-  are **not** in version control. Bin counts to be transcribed into this file — the edges are
-  deterministic, 20 equal bins over `[-1, 1]`. This matters rather than being bookkeeping: the two
-  moments are actively misleading for UMaze, where `mean cos = 0.0027` with `frac(cos<0) = 0.4983` is a
-  **broad** distribution and not a narrow one around zero, and the histogram is the only place that
-  distinction is visible.
+- **20-bin histograms over `[-1, 1]`, transcribed 2026-08-08.** The JSON reports are **pod-local and
+  gitignored** (`.gitignore:14` matches `*outputs*`; the pod is pull-only, `AGENT_MEMORY_2.0.md` §5.1),
+  so these counts are the version-controlled copy. Edges are deterministic: 20 equal bins of width 0.1
+  over `[-1, 1]`, bin 0 = `[-1.0, -0.9]`, bin 19 = `[0.9, 1.0]`.
+
+| env | split | red | counts, bin 0 → 19 |
+|---|---|---|---|
+| point_maze | train | sum | 41902, 17641, 14192, 12372, 10951, 10367, 9637, 9583, 9302, 9357, 9101, 9497, 9773, 9955, 10263, 10863, 12138, 14301, 18046, 42359 |
+| point_maze | train | raw | 39, 621, 2179, 5347, 9527, 14712, 20559, 27006, 31386, 34575, 34284, 31160, 26784, 20970, 14735, 9345, 5232, 2471, 635, 33 |
+| point_maze | train | first | 43053, 17488, 13642, 11726, 10954, 10177, 9902, 9604, 9705, 9435, 9548, 9865, 9708, 9847, 10443, 11023, 11940, 13541, 17441, 42558 |
+| point_maze | valid | sum | 4751, 2054, 1595, 1409, 1218, 1117, 1146, 1113, 1086, 995, 997, 1029, 1095, 1095, 1126, 1184, 1298, 1548, 1908, 4636 |
+| point_maze | valid | raw | 4, 98, 243, 635, 1096, 1707, 2166, 3052, 3614, 3827, 3727, 3435, 3073, 2363, 1614, 898, 545, 239, 62, 2 |
+| point_maze | valid | first | 4850, 1971, 1569, 1353, 1216, 1148, 1162, 1032, 1063, 1068, 1034, 1080, 1024, 1053, 1165, 1198, 1333, 1412, 1964, 4705 |
+| pusht | train | sum | 122214, 49510, 39632, 37785, 37796, 46213, 50834, 57995, 69704, 84392, 99454, 114891, 134884, 156083, 188740, 213277, 255923, 315557, 466883, 1421675 |
+| pusht | train | raw | 2108, 12046, 25410, 42195, 62320, 76380, 96613, 116884, 140414, 164426, 183929, 193967, 208867, 224688, 251809, 287340, 336312, 410832, 565047, 561855 |
+| pusht | train | first | 162405, 72821, 63691, 63791, 60545, 62716, 67819, 74566, 80174, 91686, 100437, 115046, 131614, 142979, 168331, 200675, 237315, 310379, 451281, 1305171 |
+| pusht | valid | sum | 125, 25, 27, 32, 52, 38, 51, 60, 79, 74, 86, 106, 149, 153, 186, 214, 291, 332, 546, 1604 |
+| pusht | valid | raw | 0, 14, 20, 40, 66, 74, 80, 106, 132, 130, 164, 188, 196, 200, 238, 257, 374, 409, 725, 817 |
+| pusht | valid | first | 132, 54, 66, 47, 49, 55, 52, 58, 68, 87, 106, 107, 115, 185, 165, 208, 220, 358, 527, 1571 |
+| wall | train | sum | 311, 303, 413, 518, 597, 818, 949, 1241, 1475, 1787, 2080, 2653, 3019, 3916, 4693, 6077, 7754, 10699, 15311, 42522 |
+| wall | train | raw | 4, 62, 165, 372, 522, 822, 1035, 1399, 1992, 2596, 3357, 4367, 5623, 7388, 10208, 12768, 16871, 19711, 15040, 2834 |
+| wall | train | first | 1162, 849, 881, 1083, 1222, 1544, 1550, 1898, 2181, 2483, 2884, 3183, 3848, 4555, 4945, 6190, 7585, 9849, 13826, 35418 |
+| wall | valid | sum | 29, 21, 50, 57, 108, 96, 89, 149, 169, 179, 278, 288, 317, 425, 540, 608, 839, 1199, 1763, 4700 |
+| wall | valid | raw | 0, 7, 7, 34, 83, 114, 97, 173, 206, 326, 396, 505, 636, 794, 1076, 1499, 1930, 2103, 1580, 338 |
+| wall | valid | first | 114, 114, 137, 134, 144, 182, 186, 216, 246, 241, 316, 364, 406, 497, 526, 716, 820, 1041, 1604, 3900 |
+
+- **The histogram overturns the reading the two moments invited, and this is the substantive result.**
+  UMaze's `mean cos = 0.0027` is **not** a narrow distribution around zero and **not** a broad unimodal
+  one either. It is **U-shaped, with spikes at both extremes**: 14.37% of triples in `[-1, -0.9]` and
+  14.53% in `[0.9, 1.0]`, over a flat ~3.2%-per-bin floor in between.
+- **That U-shape is, to a close approximation, the arcsine law — exactly what *zero* directional
+  autocorrelation looks like in two dimensions.** For a uniformly random direction in 2-D, `cos θ` has
+  density `1/(π√(1−c²))`, which diverges at ±1; the predicted bin-0 and bin-19 masses are both 14.36%
+  and the central bins 3.19%. Measured against that law, over all 20 bins: worst deviation **2.8σ**,
+  `χ² = 45.5` on 19 df, every bin within ~3% of prediction. Formally a rejection at `n = 291,600` — the
+  deviations are mild but statistically real — while the *shape*, including both divergent tails, is
+  reproduced. **So the ±1 spikes are not a bang-bang controller signature; they are the geometry of a
+  2-D cosine under no directional correlation at all.** PushT and Wall are far from the law in the
+  opposite direction: `[0.9, 1.0]` holds 35.87% (PushT) and 39.69% (Wall) against arcsine's 14.36%,
+  and `[-1, -0.9]` holds 3.08% and 0.29% against 14.36% — strong directional persistence, Wall the
+  strongest.
+- **Methodological caution the histograms expose: `frac(cos<0.5)` is not comparable across reductions,
+  because they have different dimensionality.** `sum` reduces to a 2-D net displacement; `raw` compares
+  the full 10-D block. Under uniform directions `frac(cos<0)` is 0.5 in *any* dimension, but the mass
+  near zero grows with dimension (density `∝ (1−c²)^((d−3)/2)`), so UMaze's `raw` value of
+  `frac(cos<0.5) = 0.9392` against `sum`'s 0.6649 is largely a dimensional artifact rather than a fact
+  about the data — its `raw` histogram is the expected 10-D bell centred on 0. Rule A reads `frac(cos<0)`
+  only, so the verdict is unaffected; any future arm comparing the `raw` and `sum` columns on
+  `frac(cos<0.5)` would be comparing two different geometries.
 - **Validation cross-check: agrees on every ordering.** `frac(cos<0)` train vs validation is
   0.1504/0.1331 (pusht), 0.0785/0.0796 (wall), 0.4983/0.5088 (umaze). The rule-A ordering is identical
   on both splits, so the verdict below is not a split artifact.
@@ -782,6 +823,18 @@ environment that gains most from temporal straightening is the one whose consecu
 are closest to directionally independent (`mean cos = 0.0027`, `median 0.0067`), and the environment
 that gains least is the second smoothest. Zero GPU-hours; the statistic is a property of the released
 datasets and stands whether ACS is built or not.
+**The histograms sharpen this from a fraction into a distributional statement (§10.1).** UMaze's
+consecutive net commanded displacements are, to a close approximation, **directionally uniform**: the
+measured `cos` distribution tracks the 2-D arcsine law `1/(π√(1−c²))` across all 20 bins — 14.37% and
+14.53% in the two extreme bins against a predicted 14.36%, worst per-bin deviation 2.8σ, `χ² = 45.6` on
+19 df, so mildly but really rejected at `n = 291,600` while reproducing the shape including both
+divergent tails. PushT and Wall sit far from that law in the opposite direction, with 35.87% and 39.69%
+of triples in `[0.9, 1.0]` and 3.08% and 0.29% in `[-1, -0.9]`. Ranked by directional persistence the
+three are **Wall > PushT > UMaze (≈ none)**, and against gains of **+10.67 / +7.33 / +50.00** that is
+**not a monotone inverse relation either**: Wall is the *most* persistent yet gains more than PushT. So
+the defensible version of the pattern is about the extreme and not the ordering — the one environment
+with essentially no directional autocorrelation in its control is the one straightening helps most, by a
+factor of five over the other two — and with `n = 3` even that is an observation, not a law.
 **Limitations, attached here because they bound this exact claim.** **L1:** `n = 3` measured of 4
 intended, with no independent replicates — this can refute the smoothness ordering, it cannot establish
 the inverse one as a law, and `point_maze_medium` is missing (dataset absent from the pod), so the
