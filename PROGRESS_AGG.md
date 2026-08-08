@@ -43,8 +43,9 @@ distortion is good.
 | Task 11.2 — record the paired verdict | **this file, §4** |
 | Task 11.3 — long-horizon protocol column | **complete** — `PROTOCOL_EXPECTED` keyed on `(config_name, goal_H)`; short columns unweakened; `goal_H` now pinned. See §6 |
 | Task 9.2 — driver-contract test | **complete, promoted out of optional** — §5's recommendation, acted on |
-| Task 11.4 — Positive_Control (~1.5 GPU-h) | _not launched_ — **reading recorded in §6 before launch** |
-| Task 11.5 — Positive_Control verdict | _not read_ |
+| Task 11.3b — long-horizon attention deviation | **complete** — gated on the horizon regime; the inner-scope override that defeated it is fixed. See §7.3, §7.4 |
+| Task 11.4 — Positive_Control (~2 GPU-h, revised) | **1 of 4 runs done** — arm A open-loop = **0.16**, see §8. Arm A MPC and both arm B legs outstanding |
+| Task 11.5 — Positive_Control verdict | _not read_ — needs the `w=0` → `w=0.1` delta, so all four runs |
 | Section 12 — the 6-arm weight sweep (~4 GPU-h) | **not launched; gated on BOTH 11.1 and 11.4** |
 | Acceptance gate | not reached |
 
@@ -351,3 +352,50 @@ Suite after the fix: **389 passed, 12 skipped, 3 failed** (the same pre-existing
 path, and both OOMs are consistent with it, but no run has yet demonstrated that removing the score matrices is
 sufficient — because no run has yet actually removed them. The next launch is the first real test of both the
 estimate and the fix, and the §7.3 backend-fallback clause remains live and unverified rather than refuted.
+
+---
+
+## 8. Task 11.4 — Positive_Control, arm A open-loop: RAN (2026-08-08)
+
+First long-horizon measurement on this platform. Arm A is the **spatial-only** leg (`w = 0`), so this is the
+control's reference point, not a result about `L_agg`.
+
+| field | value |
+|---|---|
+| arm / setting / seed | `agg_weight=0` / open-loop / 100 |
+| protocol | `protocol_ok=True`, `horizon_regime=long`, `goal_H 50`, `sub_planner.horizon 50`, `n_taken_actions 50` |
+| attention | `attention_impl=sdpa` (the §7.3 deviation, now actually in effect) |
+| **success rate** | **0.16** = 8/50, binomial SE **~5.2 points** |
+| successful episodes (0-indexed) | 6, 28, 29, 31, 37, 39, 41, 48 |
+| `perform_planning_s` | 210.03 (1.98 s per GD step) |
+| records | `outcome_rows=2` (`plan0`, `output_final`), `record_failures=0` |
+
+**Against the paper's cell.** `+ Proj` with `L_curv` ✓, long-horizon PushT, spatial only: **13.33 ± 3.77**
+open-loop. Measured **16.00**. That is inside 1 SE of the paper and inside the tolerance task 11.5
+pre-registered before any of this ran ("a spatial-only baseline of, say, 16.00 is not a failure to reproduce").
+It is also the collapse the paper reports: 16.00 at `goal_H 50` against this platform's 75.33 ± 6.11 at
+`goal_H 25`, on the same checkpoint and the same planner. **Reading (a) reproduces the regime**, which is the
+one thing the spatial-only arm could tell us and the reason §6 recorded the reading in advance.
+
+**What it does not tell us.** Nothing about `L_agg`: that is the `w=0` → `w=0.1` delta, and three of the four
+control runs are still outstanding. A single arm cannot be read as reproduction of the paper's *claim*.
+
+### 8.1 The §7.2 memory estimate, now supported
+
+The run fit and completed. The estimate said ~50 GB materialised against a 45312 MiB slice, and ~22 GB with the
+score matrices removed; the materialised path OOM'd twice and the SDPA path completed. **That is directional
+support, not a measurement** — nothing sampled peak allocation, so the ~22 GB figure itself is still unverified
+and the true peak could be anywhere below the slice. The §7.3 backend-fallback clause is now **refuted for
+these shapes**: had PyTorch fallen back to the `math` backend, the run would have OOM'd exactly as before.
+
+Timing corroborates the mechanism independently: 1.98 s per GD step against 0.69 s at `goal_H 25` is 2.87x for
+2x the predictor calls, which is the shape expected when the per-call cost is no longer dominated by
+materialising and re-reading a 553 MB score matrix per layer.
+
+### 8.2 Two corrections carried forward
+
+- **My pre-registered diagnosis was wrong** and is now settled: the second OOM was the inner-scope override of
+  §7.4, not a backend fallback. Recorded there; repeated here because §7.3 stated the wrong prediction with
+  confidence and a reader arriving at §8 should not have to infer that it was superseded.
+- **The §7.2 arithmetic was right about the ordering** (25 fits, 50 does not, attention is the dominant term)
+  but is still not confirmed numerically. It is being carried as supported-not-verified.
