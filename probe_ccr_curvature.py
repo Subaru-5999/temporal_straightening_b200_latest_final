@@ -100,6 +100,52 @@ which are **pure functions over plain statistic dicts**: no file, no dataset, no
 tensor. That is what lets the boundaries be unit-tested at, just below and just
 above each threshold, and it is why the rule cannot be quietly refitted to the
 numbers it is judging.
+
+`--readout aggmetric` (MCA rung 1) is the third readout, pre-registered in
+`PROGRESS_MCA.md` section 4. Unlike `actions` it *does* take a checkpoint, so it
+goes through the same `--ckpt` / `--train-cfg` requirement reinstatement as
+`curvature`, and it is read-only and CPU-only in the same way: the checkpoint is
+hashed before and after and the run is aborted if the digest moved.
+
+    python probe_ccr_curvature.py --readout aggmetric \
+      --ckpt   checkpoints/test/pusht_.../checkpoints/model_2.pth \
+      --train-cfg checkpoints/test/pusht_.../hydra.yaml \
+      --num-windows 512 --max-minutes 10 \
+      --out probe_outputs/mca_aggmetric_pusht.json
+
+It answers one question: is `encoder.agg`'s distortion of velocity norms
+**systematic**? `agg` is the map the paper's `aggcos` straightening penalty acts
+through, while `planning/objectives.py::objective_fn_last` scores MSE in patch
+space, so straightness only transfers if `agg` is a similarity. It reports:
+
+  * **check A, never gating** -- `CV(r)` on the trained checkpoint and on the
+    `pristine` reference. Section 4.2 explains why this cannot be a gate: the
+    terminal `nn.LayerNorm(128)` bounds `||d_agg||` while `||d_patch||` is
+    unbounded, so `CV(r) > 0` is structurally guaranteed. `check_a` carries
+    `"gating": false` and that reason as a string, in the JSON, so it cannot be
+    misread later.
+  * **check B, THE GATE** -- Spearman `rho(r, ||d_patch||)`, with the
+    pre-registered thresholds of section 4.3 evaluated by `rung1_verdict`.
+  * the disaggregation section 4.4 makes mandatory: `r` by decile of
+    `||d_patch||`, a 20-bin histogram of `r/r_bar` over a fixed range, and `CV(r)`
+    and `rho` per state-dimension tercile, with `n_pairs` and `n_windows` beside
+    every statistic.
+  * the rank-disagreement rate of section 4.5, reported and never gating.
+
+`r`, `v_patch` and `v_agg` come from the **shipped**
+`VWorldModel._mca_terms`, and `compute_mca`'s own return is called and compared
+against the probe's reduction of that same `r` **bitwise**. There is deliberately
+no second computation of any of the three anywhere in this file: the rung-1
+headline statistic and the training penalty have to be the same number, and the
+only way to guarantee that is for them to be the same code (section 4.1; the same
+discipline as `cos_and_gate` / Property 19). Spearman is implemented on numpy
+alone, average-rank ties then Pearson on the ranks, because scipy is not a
+dependency of this repository.
+
+`rung1_verdict` is a **pure function of one float**, like `rule_a_verdict` above,
+for the same reason: the boundaries can then be unit-tested at, just below and
+just above both thresholds, and the rule cannot be quietly refitted to the rho it
+is judging.
 """
 import argparse
 import glob as globlib
@@ -162,7 +208,10 @@ THIN = "-" * 78
 # `state_readout_r2`) and is the default, so an invocation written before this flag
 # existed runs exactly what it ran before. `actions` is the Stage-0
 # action-similarity readout, which needs no checkpoint at all.
-READOUTS = ("curvature", "actions")
+# `aggmetric` is the MCA rung-1 readout (PROGRESS_MCA.md section 4). Unlike `actions` it
+# DOES need `--ckpt` and `--train-cfg`, so it goes through the same requirement
+# reinstatement in `main` that `curvature` does.
+READOUTS = ("curvature", "actions", "aggmetric")
 DEFAULT_READOUT = "curvature"
 
 # The four environments Stage 0 measures (ACS Requirement 1.1). `save_name` differs
@@ -265,6 +314,95 @@ ACS_VERDICT_SCHEMA = "acs_stage0_verdict/1"
 ACS_VERDICT_BASENAME = "acs_stage0_verdict.json"
 
 
+# --- `--readout aggmetric`: the MCA rung-1 readout (PROGRESS_MCA.md section 4) --
+# `eps` matches `VWorldModel.compute_mca`'s default. It appears twice in the shipped
+# term -- in `v_patch + eps` and in `r_bar.clamp_min(eps)` -- and `_mca_terms(z, eps)`
+# carries it through, so one constant here keeps the probe's reduction on the same
+# value as the training penalty's.
+MCA_EPS = 1e-6
+
+MCA_REPORT_SCHEMA = "mca_aggmetric/1"
+MCA_OUT_BASENAME = "mca_aggmetric.json"
+MCA_DEFAULT_OUT = f"{ACS_OUT_DIR}/{MCA_OUT_BASENAME}"
+
+# `r` by decile of `v_patch` (PROGRESS_MCA.md section 4.4): equal-count groups over the
+# rank order of `v_patch`, not equal-width bins, so every decile has a denominator worth
+# reporting even though `v_patch` is heavy-tailed.
+MCA_DECILES = 10
+
+# 20-bin histogram of `r / r_bar` (section 4.4). The range is FIXED at [0, 4] rather than
+# derived from the data, for the same reason `COS_HIST_RANGE` is fixed at [-1, 1]: the
+# histogram exists to be *compared* -- trained against pristine, and this run against the
+# next one -- and data-derived edges would give every measurement its own bins, which is
+# exactly how a shape difference gets misread as a distribution difference. `r / r_bar` is
+# non-negative with mean 1 by construction, so 0 is the true lower bound and 4 is "four
+# times the mean ratio"; mass outside the range is not silently dropped, it is counted in
+# `below_range` / `above_range`, so the histogram plus those two counts is lossless.
+MCA_HIST_BINS = 20
+MCA_HIST_RANGE = (0.0, 4.0)
+
+# Rank-disagreement rate (section 4.5). Exhaustive when the number of unordered pairs is
+# at or below the cap; above it, a deterministic sample of that many pairs seeded from
+# `PROBE_SEED`. The report records which of the two happened and how many pairs were
+# compared, because "X% of pairs" means nothing without knowing whether X came from all of
+# them.
+MCA_MAX_EXHAUSTIVE_PAIRS = 2_000_000
+
+# `CV(r)^2 == compute_mca(z)` is an identity, not an approximation (section 4.1), but the
+# probe checks it two ways: bitwise against the shipped reduction on the same `r`, and to
+# this relative tolerance against an independent float64 numpy population variance. The
+# second is what catches a wrong *definition* (sample vs population variance, say) that a
+# bitwise check against the same op sequence cannot see.
+#
+# `1e-4` rather than something tighter, and the number is a floor not a preference: the
+# shipped reduction runs in the checkpoint's float32 while the cross-check runs in float64,
+# so a few parts in 1e-7 of accumulation difference is expected and is not a finding. It is
+# still tight enough to do its job -- confusing the sample variance for the population one
+# is a relative error of `1/(n-1)`, which exceeds `1e-4` for every n below 10,001, and a
+# rung-1 run with more than 10,000 velocity pairs would fail the check on the tolerance
+# alone only if it were also right at the boundary of being detectable.
+MCA_CV_RELATIVE_TOLERANCE = 1e-4
+
+# Advisory only, and deliberately NOT a threshold on the verdict. Section 4.3 notes the
+# standard error of rho is ~0.01 at n in the thousands; `load_windows` yields
+# `num_frames - 1` velocity pairs per window (3 at the PushT target cell's num_frames=4),
+# so the default `--num-windows 64` is 192 pairs and a standard error of ~0.07. The probe
+# reports the standard error unconditionally and warns below this many pairs; it does not
+# refuse to produce a verdict, because the thresholds are effect sizes and not significance
+# tests, and silently changing a shared flag's default would change the `curvature`
+# readout's behaviour.
+MCA_ADVISORY_MIN_PAIRS = 1000
+
+# PRE-REGISTERED THRESHOLDS. Written 2026-08-08 in PROGRESS_MCA.md section 4.3, before the
+# rung-1 statistics were measured, and reproduced here verbatim. They are judgment calls,
+# not derivations: `0.30` is "an effect large enough to be worth 0.8 GPU-h" and `0.10` is
+# "below this, *systematic* stops being an honest word, since the monotone component
+# explains ~1% of rank variance". Neither is a significance threshold -- at n in the
+# thousands the standard error of rho is ~0.01, so significance is trivially achieved and
+# says nothing.
+#
+# PRE-REGISTERED, DO NOT TUNE AGAINST MEASURED DATA. An arbitrary threshold fixed in
+# advance is a test; the same threshold chosen afterwards is a fit, and that is the
+# documented CCR failure mode (PROGRESS_CCR.md sections 5a, 6a) that cost 26 GPU-h.
+RUNG1_RHO_GO = -0.30       # rho <= -0.30 is a GO
+RUNG1_RHO_MIDDLE = -0.10   # -0.30 < rho <= -0.10 is a MIDDLE; above it, STOP
+
+# Section 4.2, recorded as a string in the report so that nobody downstream can read
+# `CV(r)` as a gate. A bounded numerator over an unbounded denominator MUST produce spread
+# in `r`, so `CV(r) > 0` is structurally guaranteed and cannot veto anything.
+MCA_CHECK_A_NOT_GATING_REASON = (
+    "Check A is REPORTED, NEVER GATING (PROGRESS_MCA.md section 4.2). The terminal "
+    "nn.LayerNorm(128) in encoder.agg pins each aggregated vector to approximately zero "
+    "mean and unit variance across its 128 dimensions, so ||agg(x)|| ~= sqrt(128)*|gamma| "
+    "and ||d_agg|| is bounded by roughly twice that shell radius, while ||d_patch|| in "
+    "1568-d is unbounded. A bounded numerator over an unbounded denominator must produce "
+    "spread in r, so CV(r) > 0 is structurally guaranteed rather than a discovery, and it "
+    "cannot veto anything. Check A sizes the headroom and says whether training moved agg "
+    "toward or away from similarity relative to the untrained reference. The gate is "
+    "check B, rho(r, ||d_patch||), section 4.3."
+)
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -294,7 +432,11 @@ def build_parser():
                          f"curvature_gap + state_readout_r2 against a reference, i.e. "
                          f"this script's original behaviour and everything the flags "
                          f"below describe; 'actions' is the Stage-0 action-similarity "
-                         f"readout, which takes no checkpoint and builds no model")
+                         f"readout, which takes no checkpoint and builds no model; "
+                         f"'aggmetric' is the MCA rung-1 readout -- CV(r), the gate "
+                         f"statistic rho(r, ||d_patch||), r by decile, the r/r_bar "
+                         f"histogram and the rank-disagreement rate -- and DOES need "
+                         f"--ckpt and --train-cfg")
     # Not `required=True` any more, because `--readout actions` has no checkpoint to
     # take. `main` reinstates the requirement for every other readout through
     # `parser.error`, which prints the same message and exits 2 exactly as argparse
@@ -327,7 +469,8 @@ def build_parser():
                     help=f"report path or directory (default {DEFAULT_OUT}); must not "
                          f"be inside the checkpoint directory. With --readout actions "
                          f"the default is {ACS_OUT_DIR}/{ACS_OUT_PREFIX}_<env>.json and "
-                         f"a directory or a multi-env run gets one file per env")
+                         f"a directory or a multi-env run gets one file per env; with "
+                         f"--readout aggmetric the default is {MCA_DEFAULT_OUT}")
 
     acs = ap.add_argument_group(
         "--readout actions (Stage 0)",
@@ -2770,6 +2913,1064 @@ def main_summarize(args):
 
 
 # --------------------------------------------------------------------------
+# 9. `--readout aggmetric`: the MCA rung-1 readout (PROGRESS_MCA.md section 4)
+# --------------------------------------------------------------------------
+# `r`, `v_patch` and `v_agg` are read from `VWorldModel._mca_terms` and from nowhere
+# else. Nothing below differences a latent, calls `encoder.agg`, or takes a norm of
+# anything: search this section for `agg(` or `.norm(` and you will find neither.
+# That is section 4.1's requirement, and it is the structural fix for the CCR
+# calibration error -- there, the probe's statistic and the trained penalty were two
+# implementations of "the same" quantity and were not the same number.
+#
+# --- rank statistics, numpy only (no scipy) -----------------------------------
+def _average_ranks(values):
+    """1-based ranks of `values` with **average** ranks inside every tie block.
+
+    Average-rank tie handling is the easy thing to get wrong in a hand-rolled
+    Spearman, and getting it wrong biases `rho` toward zero exactly where the data
+    is discrete. Ties are found on the sorted order with a stable sort, so the
+    result is deterministic; each tie block spanning 0-based sorted positions
+    `[i, j)` gets the mean of the 1-based ranks `i+1 .. j`, i.e. `(i + j + 1) / 2`.
+    """
+    import numpy as np
+
+    x = np.asarray(values, dtype=np.float64).ravel()
+    n = int(x.shape[0])
+    ranks = np.empty(n, dtype=np.float64)
+    order = np.argsort(x, kind="stable")
+    ordered = x[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and ordered[j] == ordered[i]:
+            j += 1
+        ranks[order[i:j]] = 0.5 * (i + j - 1) + 1.0
+        i = j
+    return ranks
+
+
+def spearman_rho(x, y):
+    """Spearman rank correlation: average ranks, then Pearson on the ranks.
+
+    Returns `(rho, n)`. `rho` is `None` when `n < 3` or when either side is
+    constant (every rank equal, so the denominator vanishes and the correlation is
+    undefined rather than 0).
+
+    Rank rather than Pearson because both `r` and `||d_patch||` are heavy-tailed and
+    the predicted relation is monotone-but-nonlinear (saturating). That choice was
+    fixed in `PROGRESS_MCA.md` section 4.3 before the scatter was seen; picking the
+    estimator afterwards would be the section-0 failure mode.
+
+    numpy only. scipy is not a dependency of this repository, and `1 - 6*sum(d^2)/
+    (n^3 - n)` is not used because that shortcut is only correct without ties.
+    """
+    import numpy as np
+
+    a = np.asarray(x, dtype=np.float64).ravel()
+    b = np.asarray(y, dtype=np.float64).ravel()
+    if a.shape != b.shape:
+        raise ValueError(f"spearman_rho needs equal-length inputs, got "
+                         f"{a.shape} and {b.shape}")
+    n = int(a.shape[0])
+    if n < 3:
+        return None, n
+    ra = _average_ranks(a)
+    rb = _average_ranks(b)
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
+    denominator = math.sqrt(float((ra * ra).sum()) * float((rb * rb).sum()))
+    if not (denominator > 0.0):
+        return None, n
+    rho = float((ra * rb).sum() / denominator)
+    # Float drift can push a perfect correlation a few ULPs outside [-1, 1]; a
+    # reported |rho| > 1 would be read as a bug in the measurement rather than in
+    # the arithmetic.
+    return max(-1.0, min(1.0, rho)), n
+
+
+def rho_standard_error(n):
+    """`1/sqrt(n - 1)`, the standard error section 4.3 asks to be reported beside rho.
+
+    Reported so the reader can see it is ~0.01 at n in the thousands, i.e. that
+    statistical significance is trivially achieved here and says nothing. The
+    thresholds are effect sizes, not significance thresholds.
+    """
+    if n is None or n < 2:
+        return None
+    return 1.0 / math.sqrt(float(n) - 1.0)
+
+
+# --- the two views of CV(r) -----------------------------------------------------
+def _tensor_bits(tensor):
+    """The tensor's exact bit pattern, `nan` payloads included."""
+    return tensor.detach().cpu().contiguous().numpy().tobytes()
+
+
+def mca_reduction(r, eps=MCA_EPS):
+    """`compute_mca`'s reduction, applied to an `r` that `_mca_terms` produced.
+
+    Three lines, and they are deliberately the same three lines as the tail of
+    `VWorldModel.compute_mca`. That duplication is not a drift risk, it **is** the
+    check: `mca_measure` asserts this function's output is BITWISE equal to
+    `model.compute_mca(z)` on every window, so if the shipped reduction ever
+    changes, the probe fails loudly instead of reporting a stale number. Section
+    4.1 forbids a second computation of `r`, `v_patch` or `v_agg` -- and there is
+    none; this reduces the `r` the model handed over.
+
+    Returns a 0-d tensor, `Var(r)/E[r]^2 = CV(r)^2`.
+    """
+    r_bar = r.mean().detach().clamp_min(eps)
+    return ((r / r_bar) - 1.0).pow(2).mean()
+
+
+def cv_of_r(values):
+    """`(CV, mean, population variance)` of `r`, in float64 numpy.
+
+    The **population** variance (dividing by `n`, not `n - 1`) is the one that makes
+    `CV(r)^2 == compute_mca(z)` an identity rather than an approximation, because
+    `compute_mca` centres `r` on the mean of the same sample. Computed independently
+    of `mca_reduction` on purpose: a bitwise check against the same op sequence
+    cannot catch a wrong *definition*, and this one can.
+
+    `CV` is `None` when the sample is empty or its mean is not positive (`r >= 0`, so
+    a non-positive mean means every ratio is exactly 0 and there is no scale to be
+    relative to).
+    """
+    import numpy as np
+
+    x = np.asarray(values, dtype=np.float64).ravel()
+    if x.size == 0:
+        return None, None, None
+    mean = float(x.mean())
+    variance = float(((x - mean) ** 2).mean())
+    if not (mean > 0.0):
+        return None, mean, variance
+    return math.sqrt(variance) / mean, mean, variance
+
+
+# --- disaggregation (section 4.4) -----------------------------------------------
+def mca_decile_table(r, v_patch, deciles=MCA_DECILES):
+    """`r` aggregated by decile of `v_patch`: count, mean and median per decile.
+
+    This is the direct picture of saturation and the thing check B compresses into
+    one number, so it is reported whatever `rho` comes back as.
+
+    Equal-**count** groups over the stable rank order of `v_patch`, not equal-width
+    bins: `v_patch` is heavy-tailed, so equal-width bins would put almost every pair
+    in the first bin and leave the rest with denominators of 1 or 0. Ties are broken
+    by index through the stable sort, so the grouping is deterministic.
+    """
+    import numpy as np
+
+    rv = np.asarray(r, dtype=np.float64).ravel()
+    vp = np.asarray(v_patch, dtype=np.float64).ravel()
+    if rv.shape != vp.shape:
+        raise ValueError(f"r and v_patch must have the same length, got {rv.shape} "
+                         f"and {vp.shape}")
+    if rv.size == 0:
+        return []
+    order = np.argsort(vp, kind="stable")
+    table = []
+    for index, group in enumerate(np.array_split(order, deciles)):
+        if group.size == 0:
+            table.append({"decile": index + 1, "n_pairs": 0, "v_patch_min": None,
+                          "v_patch_max": None, "v_patch_mean": None,
+                          "r_mean": None, "r_median": None})
+            continue
+        table.append({
+            "decile": index + 1,
+            "n_pairs": int(group.size),
+            "v_patch_min": float(vp[group].min()),
+            "v_patch_max": float(vp[group].max()),
+            "v_patch_mean": float(vp[group].mean()),
+            "r_mean": float(rv[group].mean()),
+            "r_median": float(np.median(rv[group])),
+        })
+    return table
+
+
+def mca_ratio_histogram(r, bins=MCA_HIST_BINS, hist_range=MCA_HIST_RANGE,
+                        eps=MCA_EPS):
+    """20-bin histogram of `r / r_bar` over the FIXED range `MCA_HIST_RANGE`.
+
+    Section 4.4 requires the *shape* on the record, not just the variance: UMaze's
+    `mean cos = 0.0027` read as "no structure" in the ACS Stage 0 until a 20-bin
+    histogram showed a 2-D arcsine shape.
+
+    The range is fixed rather than data-derived -- see `MCA_HIST_RANGE`'s comment for
+    why -- and mass outside it is counted in `below_range` / `above_range` rather
+    than dropped, so `counts + below_range + above_range == n_pairs` exactly.
+
+    `r_bar` is `mean(r)` clamped the way `compute_mca` clamps it, so the histogram's
+    x-axis is the same `r/r_bar` the penalty squares.
+    """
+    import numpy as np
+
+    x = np.asarray(r, dtype=np.float64).ravel()
+    low, high = float(hist_range[0]), float(hist_range[1])
+    if x.size == 0:
+        return {"bins": int(bins), "range": [low, high], "edges": None,
+                "counts": None, "n_pairs": 0, "below_range": 0, "above_range": 0,
+                "r_bar": None}
+    r_bar = max(float(x.mean()), float(eps))
+    ratio = x / r_bar
+    counts, edges = np.histogram(ratio, bins=int(bins), range=(low, high))
+    below = int((ratio < low).sum())
+    # np.histogram's last bin is closed on the right, so `== high` is inside it.
+    above = int((ratio > high).sum())
+    return {
+        "bins": int(bins),
+        "range": [low, high],
+        "range_is_fixed": True,
+        "edges": [float(edge) for edge in edges],
+        "counts": [int(count) for count in counts],
+        "n_pairs": int(x.size),
+        "below_range": below,
+        "above_range": above,
+        "r_bar": r_bar,
+    }
+
+
+def rank_disagreement_rate(v_patch, v_agg, max_exhaustive=MCA_MAX_EXHAUSTIVE_PAIRS,
+                           seed=PROBE_SEED):
+    """Section 4.5: the fraction of velocity pairs the two spaces order differently.
+
+    A disagreement is a pair `(i, j)` with `v_agg[i] > v_agg[j]` while
+    `v_patch[i] < v_patch[j]`. Counted over **unordered** pairs: the condition as
+    written holds for exactly one of the two orientations of a discordant pair and
+    for neither orientation of a concordant or tied one, so the unordered-pair rate
+    is the same number and is not double-counted.
+
+    Exhaustive when `n * (n - 1) / 2 <= max_exhaustive`. Above that a deterministic
+    sample of `max_exhaustive` pairs is drawn from `numpy.random.default_rng(seed)`,
+    seeded from `PROBE_SEED` so two probes compare the same pairs; the report records
+    `exhaustive` and `pairs_compared`, because "X% of pairs" is meaningless without
+    knowing whether X came from all of them. Self-pairs are rejected on redraw rather
+    than counted as agreements, which would bias the rate downward.
+
+    Ties in either space are counted in the denominator and never as disagreements:
+    the statistic is "how often do the two spaces disagree", and no ordering is not
+    a disagreement. `tied_pairs` is reported so the reader can renormalise.
+    """
+    import numpy as np
+
+    vp = np.asarray(v_patch, dtype=np.float64).ravel()
+    va = np.asarray(v_agg, dtype=np.float64).ravel()
+    if vp.shape != va.shape:
+        raise ValueError(f"v_patch and v_agg must have the same length, got "
+                         f"{vp.shape} and {va.shape}")
+    n = int(vp.size)
+    total_pairs = n * (n - 1) // 2
+    if total_pairs == 0:
+        return {"rate": None, "n_values": n, "pairs_compared": 0,
+                "total_pairs": total_pairs, "exhaustive": True,
+                "disagreements": 0, "tied_pairs": 0, "seed": seed}
+
+    if total_pairs <= max_exhaustive:
+        i, j = np.triu_indices(n, k=1)
+        exhaustive = True
+    else:
+        rng = np.random.default_rng(seed)
+        size = int(max_exhaustive)
+        i = rng.integers(0, n, size=size)
+        j = rng.integers(0, n, size=size)
+        same = i == j
+        while same.any():
+            j[same] = rng.integers(0, n, size=int(same.sum()))
+            same = i == j
+        exhaustive = False
+
+    dp = vp[i] - vp[j]
+    da = va[i] - va[j]
+    disagree = int(((da > 0) & (dp < 0)).sum() + ((da < 0) & (dp > 0)).sum())
+    tied = int(((dp == 0) | (da == 0)).sum())
+    compared = int(i.size)
+    return {
+        "rate": disagree / compared,
+        "n_values": n,
+        "pairs_compared": compared,
+        "total_pairs": total_pairs,
+        "exhaustive": exhaustive,
+        "disagreements": disagree,
+        "tied_pairs": tied,
+        "seed": seed,
+        "definition": ("fraction of unordered velocity pairs (i, j) with "
+                       "v_agg[i] > v_agg[j] while v_patch[i] < v_patch[j]; ties in "
+                       "either space count in the denominator, never as "
+                       "disagreements"),
+    }
+
+
+# --- measurement: the shipped `_mca_terms`, once per window ----------------------
+def mca_measure(model, windows, budget, deadline, label, eps=MCA_EPS):
+    """Read `(r, v_patch, v_agg)` off `VWorldModel._mca_terms` for every window.
+
+    Each window is encoded ONCE and then handed to the shipped `_mca_terms` and to
+    the shipped `compute_mca`. `mca_reduction(r)` is compared against
+    `compute_mca(z)` **bitwise** on every window; any mismatch is recorded and made
+    fatal by the caller, because it would mean the probe's headline statistic and
+    the training penalty had stopped being the same number (section 4.1).
+
+    Windows are held per-window rather than batched so peak memory is one window's
+    activations, exactly as `measure` does it. `r` is also concatenated into one
+    `(n_windows, t - 1)` tensor so the **pooled** `CV(r)^2` -- what `compute_mca`
+    would return if every sampled window were one batch -- can be reduced from it.
+
+    Non-finite windows are counted, reported and excluded: `v_patch + eps` cannot
+    vanish, so a non-finite `r` means the latent itself was not finite and the window
+    carries no information.
+    """
+    import numpy as np
+    import torch
+
+    r_tensors, r_parts, vp_parts, va_parts = [], [], [], []
+    motion, window_index, window_of_pair = [], [], []
+    per_window_mca, mismatches = [], []
+    nonfinite = 0
+    partial = False
+    pairs_per_window = None
+
+    with torch.no_grad():
+        for position, window in enumerate(windows):
+            if budget.expired(deadline):
+                partial = True
+                log.warning("[%s] wall-clock guard hit after %s/%s window(s) "
+                            "(%.1fs elapsed); stopping early and marking the report "
+                            "partial.", label, position, len(windows), budget.elapsed())
+                break
+            obs, act = window["obs"], window["act"]
+            z = model.encode(obs, act)
+            r, v_patch, v_agg = model._mca_terms(z, eps=eps)
+            shipped = model.compute_mca(z, eps=eps)
+            reduced = mca_reduction(r, eps=eps)
+            if _tensor_bits(reduced) != _tensor_bits(shipped):
+                mismatches.append({"window": int(window["index"]),
+                                   "compute_mca": float(shipped),
+                                   "probe_reduction": float(reduced)})
+
+            r_np = r.reshape(-1).double().cpu().numpy()
+            vp_np = v_patch.reshape(-1).double().cpu().numpy()
+            va_np = v_agg.reshape(-1).double().cpu().numpy()
+            if not (np.isfinite(r_np).all() and np.isfinite(vp_np).all()
+                    and np.isfinite(va_np).all()):
+                nonfinite += 1
+                continue
+
+            index = len(window_index)
+            r_tensors.append(r.detach().reshape(1, -1))
+            r_parts.append(r_np)
+            vp_parts.append(vp_np)
+            va_parts.append(va_np)
+            window_of_pair.append(np.full(r_np.shape[0], index, dtype=np.int64))
+            motion.append(np.abs(window["state"][-1, :] - window["state"][0, :]))
+            window_index.append(int(window["index"]))
+            pairs_per_window = int(r_np.shape[0])
+            per_window_mca.append(float(shipped))
+
+    if nonfinite:
+        log.warning("[%s] excluded %s window(s) whose MCA terms were not finite.",
+                    label, nonfinite)
+
+    n_windows = len(window_index)
+    if n_windows == 0:
+        return {"label": label, "n_windows": 0, "n_pairs": 0,
+                "nonfinite_windows": nonfinite, "partial": partial,
+                "r": np.zeros(0), "v_patch": np.zeros(0), "v_agg": np.zeros(0),
+                "r_tensor": None, "mca_pooled": None, "mca_per_window": [],
+                "reduction_bitwise_mismatches": mismatches,
+                "state_motion": np.zeros((0, len(STATE_DIM_NAMES))),
+                "window_of_pair": np.zeros(0, dtype=np.int64),
+                "pairs_per_window": None, "window_indices": []}
+
+    pooled_r = torch.cat(r_tensors, dim=0)
+    return {
+        "label": label,
+        "n_windows": n_windows,
+        "n_pairs": int(sum(part.shape[0] for part in r_parts)),
+        "nonfinite_windows": nonfinite,
+        "partial": partial,
+        "r": np.concatenate(r_parts),
+        "v_patch": np.concatenate(vp_parts),
+        "v_agg": np.concatenate(va_parts),
+        "r_tensor": pooled_r,
+        # The pooled value: `compute_mca` is a *batch* statistic, so this is what it
+        # would return with every sampled window in one batch, and it is the CV(r)^2
+        # section 4.2 asks for. The per-window returns are kept beside it because
+        # each one is a real `compute_mca` call and their spread says how much of
+        # CV(r) is within-window versus across-window.
+        "mca_pooled": float(mca_reduction(pooled_r, eps=eps)),
+        "mca_per_window": per_window_mca,
+        "reduction_bitwise_mismatches": mismatches,
+        "state_motion": np.asarray(motion, dtype=np.float64),
+        "window_of_pair": np.concatenate(window_of_pair),
+        "pairs_per_window": pairs_per_window,
+        "window_indices": window_index,
+    }
+
+
+def mca_statistics(m):
+    """Every statistic section 4.4 makes mandatory, with its denominators attached."""
+    import numpy as np
+
+    n_windows = int(m["n_windows"])
+    n_pairs = int(m["n_pairs"])
+    empty_tercile = {name: {"n_windows": 0, "n_pairs": 0, "cv_r": None, "rho": None,
+                            "rho_standard_error": None} for name in STATE_DIM_NAMES}
+    if n_pairs == 0:
+        return {"n_windows": n_windows, "n_pairs": 0, "cv_r": None, "r_mean": None,
+                "r_variance_population": None, "mca": None, "cv_r_squared": None,
+                "cv_squared_minus_mca": None, "cv_squared_relative_residual": None,
+                "identity_holds": None, "rho": None, "rho_n_pairs": 0,
+                "rho_standard_error": None, "deciles": [], "histogram":
+                mca_ratio_histogram(m["r"]), "per_dim_tercile": empty_tercile,
+                "rank_disagreement": rank_disagreement_rate(m["v_patch"], m["v_agg"]),
+                "low_power": True, "pairs_per_window": m["pairs_per_window"]}
+
+    r, v_patch, v_agg = m["r"], m["v_patch"], m["v_agg"]
+    cv, mean, variance = cv_of_r(r)
+    mca = m["mca_pooled"]
+
+    # Section 4.1's identity, asserted rather than assumed. `cv_r_squared` is the
+    # probe's reported CV(r)^2 and is `mca_reduction`'s output on the pooled `r`,
+    # i.e. bitwise `compute_mca`'s reduction; `cv_r` is the independent float64
+    # route, and the residual between the two is on the record either way.
+    residual = None if cv is None or mca is None else (cv * cv) - mca
+    relative = None
+    if residual is not None:
+        scale = max(abs(mca), abs(cv * cv))
+        relative = None if scale <= 0.0 else abs(residual) / scale
+
+    rho, rho_n = spearman_rho(r, v_patch)
+
+    per_dim = {}
+    motion = m["state_motion"]
+    owner = m["window_of_pair"]
+    for d, name in enumerate(STATE_DIM_NAMES):
+        window_mask = _top_tercile_mask(motion[:, d])
+        pair_mask = window_mask[owner] if window_mask.size else np.zeros(0, dtype=bool)
+        subset_r = r[pair_mask]
+        subset_vp = v_patch[pair_mask]
+        subset_cv, _subset_mean, _subset_var = cv_of_r(subset_r)
+        subset_rho, subset_n = spearman_rho(subset_r, subset_vp)
+        per_dim[name] = {
+            "n_windows": int(window_mask.sum()),
+            "n_pairs": int(subset_r.shape[0]),
+            "cv_r": subset_cv,
+            "rho": subset_rho,
+            "rho_standard_error": rho_standard_error(subset_n),
+        }
+
+    return {
+        "n_windows": n_windows,
+        "n_pairs": n_pairs,
+        "pairs_per_window": m["pairs_per_window"],
+        "cv_r": cv,
+        "r_mean": mean,
+        "r_variance_population": variance,
+        "v_patch_mean": float(np.mean(v_patch)),
+        "v_agg_mean": float(np.mean(v_agg)),
+        "mca": mca,
+        "mca_per_window_mean": (float(np.mean(m["mca_per_window"]))
+                                if m["mca_per_window"] else None),
+        "mca_per_window_min": (float(np.min(m["mca_per_window"]))
+                               if m["mca_per_window"] else None),
+        "mca_per_window_max": (float(np.max(m["mca_per_window"]))
+                               if m["mca_per_window"] else None),
+        "cv_r_squared": mca,
+        "cv_squared_minus_mca": residual,
+        "cv_squared_relative_residual": relative,
+        "identity_holds": bool(relative is not None
+                               and relative <= MCA_CV_RELATIVE_TOLERANCE),
+        "rho": rho,
+        "rho_n_pairs": rho_n,
+        "rho_standard_error": rho_standard_error(rho_n),
+        "deciles": mca_decile_table(r, v_patch),
+        "histogram": mca_ratio_histogram(r),
+        "per_dim_tercile": per_dim,
+        "rank_disagreement": rank_disagreement_rate(v_patch, v_agg),
+        "low_power": bool(n_pairs < MCA_ADVISORY_MIN_PAIRS),
+    }
+
+
+# --------------------------------------------------------------------------
+# the rung-1 verdict: check A (never gating) and check B (the gate)
+# --------------------------------------------------------------------------
+def check_a_block(trained, pristine):
+    """Check A -- distortion magnitude. REPORTED, NEVER GATING (section 4.2).
+
+    Carries `"gating": false` and the LayerNorm reason as a string so that nobody
+    downstream can read `CV(r)` as a gate. It sizes the headroom and says whether
+    training moved `agg` toward or away from similarity relative to the untrained
+    reference; it cannot veto anything, because a bounded numerator over an unbounded
+    denominator produces spread in `r` by construction.
+    """
+    trained_cv = None if trained is None else trained.get("cv_r")
+    pristine_cv = None if pristine is None else pristine.get("cv_r")
+    direction = None
+    delta = None
+    if trained_cv is not None and pristine_cv is not None:
+        delta = trained_cv - pristine_cv
+        if delta < 0:
+            direction = ("training moved agg TOWARD similarity relative to the "
+                         "untrained reference")
+        elif delta > 0:
+            direction = ("training moved agg AWAY FROM similarity relative to the "
+                         "untrained reference")
+        else:
+            direction = ("training left CV(r) exactly at the untrained reference's "
+                         "value")
+    return {
+        "check": "A",
+        "name": "distortion magnitude",
+        "gating": False,
+        "reason": MCA_CHECK_A_NOT_GATING_REASON,
+        "cv_r_trained": _round(trained_cv),
+        "cv_r_pristine": _round(pristine_cv),
+        "cv_r_delta_trained_minus_pristine": _round(delta),
+        "direction": direction,
+        "mca_trained": _round(None if trained is None else trained.get("mca")),
+        "mca_pristine": _round(None if pristine is None else pristine.get("mca")),
+        "n_pairs_trained": None if trained is None else trained.get("n_pairs"),
+        "n_pairs_pristine": None if pristine is None else pristine.get("n_pairs"),
+        "n_windows_trained": None if trained is None else trained.get("n_windows"),
+        "n_windows_pristine": None if pristine is None else pristine.get("n_windows"),
+    }
+
+
+def rung1_verdict(rho):
+    """Check B -- is the distortion SYSTEMATIC? **THIS IS THE GATE** (section 4.3).
+
+    A pure function of one plain float. No file, no tensor, no dataset -- which is
+    what lets the boundaries be unit-tested at, just below and just above both
+    thresholds, and what makes it impossible to refit the rule to the rho it judges.
+
+    | `rho <= -0.30`         | **GO** -- saturation is present and substantial;
+                               `L_mca` has a systematic bias to correct. Write section
+                               5 and launch rung 2                                    |
+    | `-0.30 < rho <= -0.10` | **MIDDLE** -- a systematic component exists but is
+                               weak. Rung 2 permitted, expected effect size small, and
+                               the writeup must not claim `agg` is badly non-metric   |
+    | `-0.10 < rho <= 0`     | **STOP** -- no systematic saturation. The spread in `r`
+                               is noise and MCA is not piloted                        |
+    | `rho > 0`              | **STOP**, with a DISTINCT reason: `agg` *expands* large
+                               motions, which contradicts the LayerNorm argument of
+                               section 4.2 and means the architecture is not
+                               understood. Recorded as a finding; NOT retried with a
+                               different statistic                                    |
+
+    The four branches are tested in that order and the domain is `[-1, 1]`, so the
+    rule is **total**: every rank correlation lands on exactly one clause. `-0.0`
+    lands on the `rho <= 0` STOP, which is the same verdict its sign-mate `+0.0`
+    would get, so the sign of zero cannot change a decision.
+
+    Both thresholds are inclusive on the more permissive side (`<=`), which is the
+    direction the pre-registered table reads. Where a measured rho lands exactly on a
+    boundary -- it will not, at sixteen significant digits -- it takes the more
+    permissive verdict the table names, not the more cautious one, because that is
+    what "rho <= -0.30 is a GO" says.
+    """
+    if rho is None:
+        raise ValueError(
+            "rho is None: Spearman rho is undefined (fewer than 3 velocity pairs, or "
+            "r or ||d_patch|| constant across every pair). The gate is not evaluated "
+            "on an undefined statistic; fix the measurement instead.")
+    try:
+        value = float(rho)
+    except (TypeError, ValueError):
+        raise ValueError(f"rho is not a number: {rho!r}")
+    if not math.isfinite(value) or value < -1.0 or value > 1.0:
+        raise ValueError(f"rho is {value}, which is not a finite rank correlation in "
+                         f"[-1, 1]")
+
+    contradicts_layernorm = value > 0.0
+    if value <= RUNG1_RHO_GO:
+        verdict, clause = VERDICT_GO, "4.3-go"
+        reason = (f"rho(r, ||d_patch||) = {value:.6g} <= {RUNG1_RHO_GO}: saturation is "
+                  f"present and substantial, so L_mca has a systematic bias to correct "
+                  f"rather than noise to shrink. Write PROGRESS_MCA.md section 5 (the "
+                  f"rung-2 gate) and then launch the 8,000-step pilot. A GO buys "
+                  f"permission to spend 0.8 GPU-h; it is not evidence of success -- "
+                  f"CCR passed its rung-1 gate at rho = 0.5 and still lost on both "
+                  f"settings after ~26 GPU-h.")
+    elif value <= RUNG1_RHO_MIDDLE:
+        verdict, clause = VERDICT_MIDDLE, "4.3-middle"
+        reason = (f"rho(r, ||d_patch||) = {value:.6g} is in ({RUNG1_RHO_GO}, "
+                  f"{RUNG1_RHO_MIDDLE}]: a systematic component exists but is weak. "
+                  f"Rung 2 is permitted, the expected effect size is small, and the "
+                  f"writeup must NOT claim that encoder.agg is badly non-metric. "
+                  f"Recorded now, at the moment the verdict is read, rather than "
+                  f"retroactively.")
+    elif value <= 0.0:
+        verdict, clause = VERDICT_STOP, "4.3-stop"
+        reason = (f"rho(r, ||d_patch||) = {value:.6g} > {RUNG1_RHO_MIDDLE}: there is no "
+                  f"systematic saturation. The spread in r is noise, so L_mca would "
+                  f"spend gradient shrinking noise rather than correcting a bias, and "
+                  f"MCA is NOT piloted. The next arm becomes "
+                  f"aggregated-space-planning-cost, which closes the same gap from the "
+                  f"planner's side.")
+    else:
+        verdict, clause = VERDICT_STOP, "4.3-stop-positive"
+        reason = (f"rho(r, ||d_patch||) = {value:.6g} is POSITIVE: encoder.agg "
+                  f"*expands* large patch-space motions rather than compressing them. "
+                  f"This is a STOP at any magnitude, and a more interesting one than "
+                  f"the rho > -0.10 case -- it CONTRADICTS the LayerNorm saturation "
+                  f"argument of PROGRESS_MCA.md section 4.2, which predicted that a "
+                  f"bounded aggregated shell must compress large motions, and it "
+                  f"therefore means the architecture is not understood. RECORD IT AS A "
+                  f"FINDING. Do NOT retry with a different statistic: choosing the "
+                  f"estimator after seeing the scatter is the section-0 failure mode.")
+
+    return {
+        "check": "B",
+        "rule": "B",
+        "name": "systematic saturation",
+        "gating": True,
+        "verdict": verdict,
+        "clause": clause,
+        "reason": reason,
+        "rho": _round(value),
+        "thresholds": {"go": RUNG1_RHO_GO, "middle": RUNG1_RHO_MIDDLE},
+        "rung2_permitted": verdict != VERDICT_STOP,
+        "contradicts_layernorm_argument": bool(contradicts_layernorm),
+        "pre_registered_in": "PROGRESS_MCA.md section 4.3 (written 2026-08-08)",
+        "caps_applied": [],
+    }
+
+
+# --- report -----------------------------------------------------------------------
+# Section 4.6, attached to the report rather than left in a footnote.
+MCA_NOTES = (
+    "The gate and every threshold in it (-0.30, -0.10) were written into "
+    "PROGRESS_MCA.md section 4.3 on 2026-08-08, before this measurement existed. They "
+    "are judgment calls, not derivations, and must not be tuned against the measured "
+    "rho.",
+    "Rung 1 CANNOT predict success. CCR passed its rung-1 gate at rho = 0.5 and lost on "
+    "both settings at matched budget after ~26 GPU-h. A GO buys permission to spend 0.8 "
+    "GPU-h.",
+    "||d_patch|| between consecutive frames is a PROXY for what the planner measures, "
+    "not the thing itself: objective_fn_last scores MSE between a predicted and a "
+    "target latent, which is ||.||^2/1568 -- monotone in the same norm, so the "
+    "connection is real -- but the planner's pairs are not consecutive-frame pairs. "
+    "Rung 1 measures the geometry of the map, not the planner's loss surface.",
+    "One checkpoint, one environment, one epoch count. The target cell is PushT at 2 "
+    "epochs; nothing here generalises to UMaze / Wall / Medium without re-running, and "
+    "the ACS Stage 0 demonstrated that cross-environment intuitions about this codebase "
+    "can invert.",
+    "A near-isometric result would NOT clear encoder.agg. It is also not injective "
+    "(1568 -> 128), and MCA does not address injectivity at all: straightness could fail "
+    "to transfer through information loss even with every norm preserved perfectly. MCA "
+    "is one of two failure modes and rung 1 measures only that one.",
+    "Check A (CV(r)) is reported and NEVER gating; the LayerNorm argument of section 4.2 "
+    "makes CV(r) > 0 structurally guaranteed. The rank-disagreement rate of section 4.5 "
+    "is reported and never gating either. The only gate is check B, rho.",
+    "The standard error of rho is 1/sqrt(n-1) and is reported beside it. At n in the "
+    "thousands it is ~0.01, so significance is trivially achieved and says nothing; the "
+    "thresholds are effect sizes.",
+)
+
+
+def _round_row(row, places=6):
+    return {key: (_round(value, places) if isinstance(value, float) else value)
+            for key, value in row.items()}
+
+
+def _round_mca_stats(stats, places=6):
+    """Round the report's leaf floats. Residuals keep more places: they are tiny."""
+    if stats is None:
+        return None
+    out = dict(stats)
+    for key in ("cv_r", "r_mean", "r_variance_population", "v_patch_mean",
+                "v_agg_mean", "mca", "cv_r_squared", "mca_per_window_mean",
+                "mca_per_window_min", "mca_per_window_max", "rho",
+                "rho_standard_error"):
+        if key in out:
+            out[key] = _round(out[key], places)
+    for key in ("cv_squared_minus_mca", "cv_squared_relative_residual"):
+        if key in out:
+            out[key] = _round(out[key], 15)
+    out["deciles"] = [_round_row(row, places) for row in (out.get("deciles") or [])]
+    histogram = dict(out.get("histogram") or {})
+    if histogram.get("edges") is not None:
+        histogram["edges"] = [_round(edge, places) for edge in histogram["edges"]]
+    histogram["r_bar"] = _round(histogram.get("r_bar"), places)
+    out["histogram"] = histogram
+    out["per_dim_tercile"] = {
+        name: _round_row(entry, places)
+        for name, entry in (out.get("per_dim_tercile") or {}).items()}
+    disagreement = dict(out.get("rank_disagreement") or {})
+    disagreement["rate"] = _round(disagreement.get("rate"), places)
+    out["rank_disagreement"] = disagreement
+    return out
+
+
+def build_aggmetric_report(args, ckpt_path, cfg_path, before, after, train_cfg,
+                           measurement, trained, pristine, pristine_source, check_a,
+                           verdict, budget, num_frames, epoch, dims):
+    """The MCA rung-1 report. Machine-readable first, printed second."""
+    return {
+        "schema": MCA_REPORT_SCHEMA,
+        "probe": "probe_ccr_curvature.py",
+        "readout": "aggmetric",
+        "measures": "MCA rung 1 -- is encoder.agg's velocity-norm distortion systematic?",
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "pre_registered_in": "PROGRESS_MCA.md section 4 (written 2026-08-08)",
+        "ckpt": str(ckpt_path),
+        "ckpt_sha256": before["sha256"],
+        "ckpt_size_bytes": before["size_bytes"],
+        "ckpt_mtime": before["mtime"],
+        "ckpt_sha256_final": after["sha256"],
+        "checkpoint_modified": bool(after["sha256"] != before["sha256"]),
+        "ckpt_epoch": epoch,
+        "train_cfg": str(cfg_path),
+        "env": str(train_cfg.env.name),
+        "num_hist": int(train_cfg.num_hist),
+        "num_frames": int(num_frames),
+        # Section 3: the aggregation width is read off the checkpoint's own resolved
+        # config, NEVER off the run-directory name -- `hydra.run.dir`'s `_agg32_` is a
+        # hardcoded literal, not an interpolation, so every run directory claims agg32
+        # whatever `agg_out_dim` really is.
+        "agg_out_dim": _agg_out_dim_from_cfg(train_cfg),
+        "state_dim": dims.get("state_dim"),
+        "num_windows_requested": int(args.num_windows),
+        "windows_evaluated": int(measurement["n_windows"]),
+        "windows_nonfinite": int(measurement["nonfinite_windows"]),
+        "pairs_evaluated": int(measurement["n_pairs"]),
+        "pairs_per_window": measurement["pairs_per_window"],
+        "seed": PROBE_SEED,
+        "eps": MCA_EPS,
+        "partial": bool(measurement["partial"]),
+        "elapsed_s": _round(budget.elapsed(), 1),
+        "max_minutes": float(args.max_minutes),
+        "reference_source": pristine_source,
+        "single_implementation": (
+            "r, v_patch and v_agg come from the shipped VWorldModel._mca_terms; the "
+            "probe never re-derives them. mca_reduction(r) is compared BITWISE against "
+            "compute_mca(z) on every window (PROGRESS_MCA.md section 4.1)."),
+        "reduction_bitwise_mismatches": measurement["reduction_bitwise_mismatches"],
+        "cv_identity": {
+            "claim": "compute_mca(z) == CV(r)^2 == Var(r)/E[r]^2 (population variance)",
+            "relative_tolerance": MCA_CV_RELATIVE_TOLERANCE,
+            "trained_residual": (None if trained is None else
+                                 _round(trained.get("cv_squared_minus_mca"), 15)),
+            "trained_relative_residual": (
+                None if trained is None else
+                _round(trained.get("cv_squared_relative_residual"), 15)),
+            "trained_holds": None if trained is None else trained.get("identity_holds"),
+            "pristine_residual": (None if pristine is None else
+                                  _round(pristine.get("cv_squared_minus_mca"), 15)),
+            "pristine_relative_residual": (
+                None if pristine is None else
+                _round(pristine.get("cv_squared_relative_residual"), 15)),
+            "pristine_holds": (None if pristine is None
+                               else pristine.get("identity_holds")),
+        },
+        "statistics": {
+            "trained": _round_mca_stats(trained),
+            "pristine": _round_mca_stats(pristine),
+        },
+        "check_a": check_a,
+        "check_b": verdict,
+        "verdict": None if verdict is None else verdict["verdict"],
+        "rung2_permitted": None if verdict is None else verdict["rung2_permitted"],
+        "thresholds": {"rho_go": RUNG1_RHO_GO, "rho_middle": RUNG1_RHO_MIDDLE},
+        "histogram_range_fixed": list(MCA_HIST_RANGE),
+        "notes": list(MCA_NOTES),
+    }
+
+
+def _agg_out_dim_from_cfg(train_cfg):
+    """`encoder.agg_out_dim` from the checkpoint's own resolved config (section 3)."""
+    try:
+        value = train_cfg.encoder.get("agg_out_dim", None)
+    except Exception:
+        return None
+    return None if value is None else int(value)
+
+
+def print_aggmetric_report(report):
+    """The rung-1 readout, printed, with every denominator attached."""
+    trained = report["statistics"]["trained"] or {}
+    pristine = report["statistics"]["pristine"] or {}
+    print()
+    print(RULE)
+    print(f"MCA RUNG-1 PROBE (--readout aggmetric)  {report['ckpt']}")
+    print(RULE)
+    print(f"  env / epoch           : {report['env']} / {report['ckpt_epoch']}")
+    print(f"  agg_out_dim           : {report['agg_out_dim']} "
+          f"(read from {Path(report['train_cfg']).name}, never from the run-dir name)")
+    print(f"  windows / pairs       : {report['windows_evaluated']}"
+          f"/{report['num_windows_requested']} windows, "
+          f"{report['pairs_evaluated']} velocity pairs "
+          f"({report['pairs_per_window']} per window)"
+          + (f", {report['windows_nonfinite']} non-finite excluded"
+             if report["windows_nonfinite"] else ""))
+    print(f"  reference             : {report['reference_source']}")
+    print(f"  elapsed               : {report['elapsed_s']}s "
+          f"(guard {report['max_minutes']} min)"
+          + ("  PARTIAL" if report["partial"] else ""))
+    print(f"  checkpoint sha256     : {report['ckpt_sha256'][:16]}... "
+          f"({'UNCHANGED' if not report['checkpoint_modified'] else 'CHANGED'})")
+
+    identity = report["cv_identity"]
+    print()
+    print("CHECK A -- distortion magnitude.  REPORTED, NEVER GATING (section 4.2)")
+    print(THIN)
+    print(f"  {'statistic':<26}{'trained':>14}{'pristine':>14}")
+    print(f"  {'CV(r)':<26}{_fmt(trained.get('cv_r'), 14)}"
+          f"{_fmt(pristine.get('cv_r'), 14)}")
+    print(f"  {'compute_mca = CV(r)^2':<26}{_fmt(trained.get('mca'), 14)}"
+          f"{_fmt(pristine.get('mca'), 14)}")
+    print(f"  {'mean(r)':<26}{_fmt(trained.get('r_mean'), 14)}"
+          f"{_fmt(pristine.get('r_mean'), 14)}")
+    print(f"  {'n_pairs':<26}{str(trained.get('n_pairs', 'n/a')):>14}"
+          f"{str(pristine.get('n_pairs', 'n/a')):>14}")
+    print(f"  {'n_windows':<26}{str(trained.get('n_windows', 'n/a')):>14}"
+          f"{str(pristine.get('n_windows', 'n/a')):>14}")
+    print(f"  CV^2 vs compute_mca   : relative residual "
+          f"{identity['trained_relative_residual']} (tolerance "
+          f"{identity['relative_tolerance']}) -> "
+          f"{'HOLDS' if identity['trained_holds'] else 'DOES NOT HOLD'}")
+    if report["check_a"]["direction"]:
+        print(f"  direction             : {report['check_a']['direction']} "
+              f"(delta {report['check_a']['cv_r_delta_trained_minus_pristine']})")
+    print(f"  NOT A GATE            : {report['check_a']['reason']}")
+
+    print()
+    print("r BY DECILE OF ||d_patch||   (section 4.4; the direct saturation picture)")
+    print(THIN)
+    print(f"  {'decile':<8}{'n_pairs':>9}{'|d_patch| mean':>16}{'mean r':>12}"
+          f"{'median r':>12}")
+    for row in trained.get("deciles") or []:
+        print(f"  {row['decile']:<8}{row['n_pairs']:>9}"
+              f"{_fmt(row['v_patch_mean'], 16)}{_fmt(row['r_mean'], 12)}"
+              f"{_fmt(row['r_median'], 12)}")
+
+    histogram = trained.get("histogram") or {}
+    if histogram.get("counts"):
+        print()
+        print(f"HISTOGRAM OF r/r_bar   ({histogram['bins']} bins over the FIXED range "
+              f"{histogram['range']}; r_bar={histogram['r_bar']})")
+        print(THIN)
+        edges, counts = histogram["edges"], histogram["counts"]
+        for index, count in enumerate(counts):
+            bar = "#" * min(50, count)
+            print(f"  [{edges[index]:>6.3f}, {edges[index + 1]:>6.3f}) "
+                  f"{count:>8}  {bar}")
+        print(f"  below {histogram['range'][0]}: {histogram['below_range']}   "
+              f"above {histogram['range'][1]}: {histogram['above_range']}   "
+              f"total {histogram['n_pairs']}")
+
+    print()
+    print("PER STATE-DIMENSION TERCILE   (section 4.4; a distortion confined to one "
+          "channel cannot hide in the aggregate)")
+    print(THIN)
+    print(f"  {'dimension':<14}{'CV(r)':>12}{'rho':>12}{'SE(rho)':>12}"
+          f"{'n_pairs':>10}{'n_windows':>11}")
+    for dim in STATE_DIM_NAMES:
+        entry = (trained.get("per_dim_tercile") or {}).get(dim, {})
+        print(f"  {dim:<14}{_fmt(entry.get('cv_r'))}{_fmt(entry.get('rho'))}"
+              f"{_fmt(entry.get('rho_standard_error'))}"
+              f"{str(entry.get('n_pairs', 'n/a')):>10}"
+              f"{str(entry.get('n_windows', 'n/a')):>11}")
+    print("  (each tercile is the top third of windows by "
+          "|state_d[last] - state_d[first]|)")
+
+    disagreement = trained.get("rank_disagreement") or {}
+    coverage = ("EXHAUSTIVE" if disagreement.get("exhaustive")
+                else f"SAMPLED at seed {disagreement.get('seed')}")
+    print()
+    print("RANK-DISAGREEMENT RATE   (section 4.5; reported, never gating)")
+    print(THIN)
+    print(f"  the two spaces order motions differently on "
+          f"{_fmt(disagreement.get('rate'), 0, 4).strip()} of pairs "
+          f"({disagreement.get('disagreements')} of "
+          f"{disagreement.get('pairs_compared')} compared, {coverage}"
+          f"; {disagreement.get('total_pairs')} pairs exist, "
+          f"{disagreement.get('tied_pairs')} tied)")
+    if disagreement.get("rate") is not None:
+        print(f"  plain language        : \"straightening ranks motions differently "
+              f"than the planner does, on {disagreement['rate'] * 100:.1f}% of pairs.\"")
+
+    verdict = report["check_b"]
+    provenance = ((verdict or {}).get("pre_registered_in")
+                  or report["pre_registered_in"])
+    print()
+    print(RULE)
+    print(f"CHECK B -- THE GATE: rho(r, ||d_patch||)   ({provenance})")
+    print(RULE)
+    print(f"  rho                   : {_fmt(trained.get('rho'), 0, 6).strip()}   "
+          f"(n_pairs {trained.get('rho_n_pairs')}, standard error "
+          f"{_fmt(trained.get('rho_standard_error'), 0, 4).strip()})")
+    print(f"  pristine rho          : {_fmt(pristine.get('rho'), 0, 6).strip()}   "
+          f"(n_pairs {pristine.get('rho_n_pairs')})   reported, not gating")
+    print()
+    print(f"  rho <= {RUNG1_RHO_GO}          -> GO      saturation present and "
+          f"substantial; write section 5, launch rung 2")
+    print(f"  {RUNG1_RHO_GO} < rho <= {RUNG1_RHO_MIDDLE}   -> MIDDLE  systematic but "
+          f"weak; rung 2 permitted, small effect expected")
+    print(f"  {RUNG1_RHO_MIDDLE} < rho <= 0     -> STOP    spread in r is noise; MCA "
+          f"NOT piloted")
+    print(f"  rho > 0              -> STOP    agg EXPANDS large motions; contradicts "
+          f"section 4.2, architecture not understood")
+    print()
+    if verdict is None:
+        print("  RUNG-1 VERDICT        : NOT EVALUATED -- rho is undefined "
+              "(fewer than 3 velocity pairs, or a constant column).")
+    else:
+        print(f"  RUNG-1 VERDICT        : {verdict['verdict']}   "
+              f"[{verdict['clause']}]")
+        print(f"  rung 2 permitted      : "
+              f"{'YES' if verdict['rung2_permitted'] else 'NO'}")
+        print(f"    {verdict['reason']}")
+        if verdict["contradicts_layernorm_argument"]:
+            print("    THIS IS A FINDING, not a measurement to retry. Record it.")
+    if trained.get("low_power"):
+        print(f"  NOTE: only {trained.get('n_pairs')} velocity pairs "
+              f"(< {MCA_ADVISORY_MIN_PAIRS}), so the standard error of rho is "
+              f"{_fmt(trained.get('rho_standard_error'), 0, 4).strip()}. Raise "
+              f"--num-windows before acting on a verdict near a threshold.")
+    if report["partial"]:
+        print("  NOTE: the report is PARTIAL (wall-clock guard). Judge the gate on a "
+              "complete run before acting on it.")
+    print()
+    for note in report["notes"]:
+        print(f"  - {note}")
+    print(RULE)
+
+
+def main_aggmetric(args):
+    """`--readout aggmetric`: MCA rung 1. Read-only, CPU-only, no optimizer, no GPU."""
+    # ---- 1. paths first, before any model or weight (Requirement 7.5) ----
+    ckpt_path, cfg_path = validate_paths(args.ckpt, args.train_cfg)
+    out_path = resolve_out_path(args.out if args.out is not None else MCA_DEFAULT_OUT,
+                                ckpt_path)
+    budget = Budget(args.max_minutes)
+
+    # ---- 2. fingerprint the checkpoint (Requirement 7.4) ----
+    before = file_fingerprint(ckpt_path)
+    log.info("Checkpoint %s: sha256=%s size=%s bytes mtime=%s",
+             ckpt_path, before["sha256"], before["size_bytes"], before["mtime"])
+
+    from omegaconf import OmegaConf
+    train_cfg = OmegaConf.load(cfg_path)
+    num_frames = int(train_cfg.num_hist) + int(train_cfg.num_pred)
+    if num_frames < 2:
+        print(f"ERROR: MCA needs at least 2 frames per window to form one velocity, "
+              f"but num_hist + num_pred = {num_frames} in {cfg_path}.", file=sys.stderr)
+        return 1
+
+    # ---- 3. load the model, read-only, CPU-only, no optimizer ----
+    model, epoch = load_probe_model(ckpt_path, train_cfg)
+    if not hasattr(model.encoder, "agg"):
+        # The shipped `_mca_terms` raises this too; failing here keeps the dataset --
+        # the expensive part -- untouched.
+        print(f"ERROR: MCA requires encoder.agg(), and the encoder in {ckpt_path} "
+              f"({type(model.encoder).__name__}) has none. There is nothing to probe.",
+              file=sys.stderr)
+        return 1
+    log.info("Probing MCA rung 1: eps=%s num_hist=%s num_frames=%s agg_out_dim=%s",
+             MCA_EPS, train_cfg.num_hist, num_frames,
+             _agg_out_dim_from_cfg(train_cfg))
+
+    # ---- 4. windows from the unmodified loader at a fixed seed ----
+    try:
+        windows, dims = load_windows(train_cfg, args.num_windows)
+    except FileNotFoundError as exc:
+        print(f"ERROR: could not read the dataset ({exc}). Check DATASET_DIR and "
+              f"env.dataset.data_path in {cfg_path}.", file=sys.stderr)
+        return 1
+
+    # ---- 5. measure the trained checkpoint ----
+    measurement = mca_measure(model, windows, budget,
+                              budget.deadline(MAIN_BUDGET_FRACTION), "checkpoint")
+    if measurement["n_pairs"] == 0:
+        print("ERROR: no window produced a finite MCA term; there is nothing to "
+              "report.", file=sys.stderr)
+        return 1
+    trained = mca_statistics(measurement)
+    if trained["n_pairs"] < MCA_ADVISORY_MIN_PAIRS:
+        log.warning("Only %s velocity pairs (< %s): the standard error of rho is %.3f. "
+                    "Raise --num-windows before acting on a verdict near a threshold.",
+                    trained["n_pairs"], MCA_ADVISORY_MIN_PAIRS,
+                    trained["rho_standard_error"] or float("nan"))
+
+    # ---- 6. the pristine reference (section 4.2), measured on the SAME windows ----
+    pristine_stats, pristine_source = None, None
+    pristine_model = build_pristine_model(train_cfg, dims)
+    if pristine_model is None:
+        log.warning("The pristine reference is unavailable; check A reports the trained "
+                    "CV(r) with no reference beside it.")
+    elif not hasattr(pristine_model.encoder, "agg"):
+        log.warning("The pristine encoder has no agg(); skipping the reference.")
+    else:
+        pristine_measurement = mca_measure(
+            pristine_model, windows, budget,
+            budget.deadline(REFERENCE_BUDGET_FRACTION), "pristine")
+        if pristine_measurement["n_pairs"] == 0:
+            log.warning("The pristine reference produced no finite MCA term.")
+        else:
+            pristine_stats = mca_statistics(pristine_measurement)
+            pristine_source = "pristine"
+            measurement["reduction_bitwise_mismatches"] = (
+                measurement["reduction_bitwise_mismatches"]
+                + pristine_measurement["reduction_bitwise_mismatches"])
+
+    # ---- 7. the verdict: check A (never gating), check B (the gate) ----
+    check_a = check_a_block(trained, pristine_stats)
+    verdict = None if trained["rho"] is None else rung1_verdict(trained["rho"])
+
+    # ---- 8. re-hash, report ----
+    after = file_fingerprint(ckpt_path)
+    report = build_aggmetric_report(args, ckpt_path, cfg_path, before, after, train_cfg,
+                                    measurement, trained, pristine_stats,
+                                    pristine_source, check_a, verdict, budget,
+                                    num_frames, epoch, dims)
+    write_report(out_path, report)
+    print_aggmetric_report(report)
+    print(f"\nReport written to {out_path}")
+
+    if report["checkpoint_modified"]:
+        # The report is still written, for forensics, and then this is fatal.
+        raise RuntimeError(
+            f"The checkpoint {ckpt_path} CHANGED while the probe was running: "
+            f"sha256 {before['sha256']} -> {after['sha256']}. The probe is read-only, "
+            f"so something else wrote to it; every number in {out_path} is suspect."
+        )
+    if measurement["reduction_bitwise_mismatches"]:
+        raise RuntimeError(
+            f"The probe's reduction of `r` is no longer BITWISE equal to "
+            f"compute_mca(z) on "
+            f"{len(measurement['reduction_bitwise_mismatches'])} window(s): "
+            f"{measurement['reduction_bitwise_mismatches'][:3]}. The rung-1 headline "
+            f"statistic and the training penalty have stopped being the same number, "
+            f"which is exactly the CCR calibration error PROGRESS_MCA.md section 4.1 "
+            f"exists to prevent. Every number in {out_path} is suspect."
+        )
+    if not trained["identity_holds"]:
+        cv_squared = None if trained["cv_r"] is None else trained["cv_r"] ** 2
+        raise RuntimeError(
+            f"compute_mca(z) = {trained['mca']!r} is not CV(r)^2 = {cv_squared!r} to a "
+            f"relative tolerance of {MCA_CV_RELATIVE_TOLERANCE} (relative residual "
+            f"{trained['cv_squared_relative_residual']!r}). Section 4.1's identity is "
+            f"the whole reason the headline statistic and the training penalty are the "
+            f"same number; every number in {out_path} is suspect."
+        )
+    log.info("Checkpoint unchanged (sha256 %s); the probe wrote only %s.",
+             after["sha256"], out_path)
+    log.info("MCA rung-1 verdict: %s (rho=%s, n_pairs=%s); rung 2 %s.",
+             report["verdict"], trained["rho"], trained["n_pairs"],
+             "permitted" if report["rung2_permitted"] else "NOT permitted")
+    if verdict is None:
+        print("ERROR: rho is undefined, so the pre-registered gate was not evaluated. "
+              "The measurement is in the report; fix the sampling and re-run.",
+              file=sys.stderr)
+        return 1
+    # `partial` is not a failure: the wall-clock guard exits 0 (Requirement 7.6). A
+    # STOP verdict is not a failure of the probe either -- it is the probe working.
+    return 0
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 def main(argv=None):
@@ -2798,6 +3999,8 @@ def main(argv=None):
     if missing:
         parser.error(f"the following arguments are required with "
                      f"--readout {args.readout}: {', '.join(missing)}")
+    if args.readout == "aggmetric":
+        return main_aggmetric(args)
     return main_curvature(args)
 
 

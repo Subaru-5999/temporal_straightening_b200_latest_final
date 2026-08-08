@@ -281,3 +281,60 @@ def reference_curvature_forward_tail(model, z, loss, loss_components):
             curvature_loss * model.straighten_scale
         )
     return loss
+
+# ---------------------------------------------------------------------------
+# MCA path frozen at ``6a5741c``
+# ---------------------------------------------------------------------------
+#
+# Base commit: ``6a5741c`` ("Pre-register the MCA rung-1 gate before running the
+# offline probe", full SHA ``6a5741c55a96b7aa1a460f704cd54ea41b58314c``).
+#
+# :func:`reference_compute_mca` is a **verbatim copy** of the body of
+# ``VWorldModel.compute_mca`` in ``models/visual_world_model.py`` as it exists at
+# that commit, rewritten only so that it is a standalone function taking the model
+# as its first argument (every ``self.`` became ``model.``). Nothing else was
+# changed: the same operations, the same order, the same dtypes, the same ``eps``
+# default, the same ``flatten(2)`` / ``norm(dim=-1)`` reductions, the same
+# ``r_bar.detach().clamp_min(eps)``.
+#
+# It is frozen *before* the MCA rung-1 refactor splits ``compute_mca`` into
+# ``_mca_terms`` plus a reduction (`PROGRESS_MCA.md` §4.1, which requires that
+# split to be bitwise neutral and the probe to call ``_mca_terms`` rather than
+# re-derive ``r``). ``tests/test_mca_terms.py`` compares the refactored
+# ``VWorldModel.compute_mca`` against this copy **bitwise**, over every
+# ``agg_type`` in ``tests.conftest.AGG_TYPES``. That comparison is the structural
+# fix for the CCR calibration error: the rung-1 headline statistic and the
+# training penalty are the same number because they are the same code.
+#
+# This is a third, independent snapshot. It does not touch the ``d73b9c6`` or
+# ``d3c3ce5`` sections above; they keep their names and their bodies, because
+# ``tests/test_rollout_refactor.py``, ``tests/test_agg_zero_bitwise.py`` and
+# ``tests/test_acs_off_bitwise.py`` read them.
+#
+# Do **not** "improve", simplify, reformat or extend the function below either.
+# Its only value is being a faithful frozen snapshot of the pre-refactor
+# behaviour. If the frozen behaviour ever needs to change, the base commit
+# comment above must change with it.
+
+
+def reference_compute_mca(model, z, eps=1e-6):
+    """Frozen copy of ``VWorldModel.compute_mca`` at commit ``6a5741c``.
+
+    Metric-Consistent Aggregation (pilot only).
+
+    Penalises `encoder.agg` for distorting velocity norms: straightness is enforced in
+    aggregated space while planning/objectives.py scores distances in patch space.
+    `agg` only needs to be a *similarity* (distance-preserving up to one global
+    constant) for straightness to transfer, so the penalty compares each velocity's
+    norm ratio against the batch-mean ratio and is therefore scale-invariant.
+
+    `encoder.agg` is an existing module; this adds no module and no parameter.
+    """
+    feats = model.visual_only(z)                                  # (b, t, p, d)
+    b, t, p, d = feats.shape
+    agg = model.encoder.agg(feats.reshape(b * t, p, d)).reshape(b, t, -1)
+    v_patch = (feats[:, 1:] - feats[:, :-1]).flatten(2).norm(dim=-1)   # (b, t-1)
+    v_agg = (agg[:, 1:] - agg[:, :-1]).norm(dim=-1)                    # (b, t-1)
+    r = v_agg / (v_patch + eps)
+    r_bar = r.mean().detach().clamp_min(eps)
+    return ((r / r_bar) - 1.0).pow(2).mean()

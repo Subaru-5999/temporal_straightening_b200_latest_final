@@ -1115,6 +1115,31 @@ class VWorldModel(nn.Module):
         feats = self.visual_only(z_imag[:, -(L + 2) :])
         return self.total_curvature(feats, mode="aggcos")
 
+    def _mca_terms(self, z, eps=1e-6):
+        """The three MCA quantities: `(r, v_patch, v_agg)`, each `(b, t - 1)`.
+
+        `v_patch` is the consecutive-frame velocity norm in the flattened patch space
+        `visual_only(z)` lives in (1568-d at the target cell), `v_agg` is the same
+        velocity's norm after `encoder.agg` (128-d), and `r = v_agg / (v_patch + eps)`
+        is the per-velocity norm ratio the penalty is built on.
+
+        This is the *single* implementation of `r`: `compute_mca` reduces it, and the
+        rung-1 offline probe (`probe_ccr_curvature.py --readout aggmetric`) reads it
+        rather than re-deriving it, so the headline statistic and the training penalty
+        cannot drift apart (`PROGRESS_MCA.md` section 4.1). The operations, their order and
+        their dtypes are the pre-refactor `compute_mca` body's, verbatim, which is what
+        keeps the training path bitwise identical.
+        """
+        if not hasattr(self.encoder, "agg"):
+            raise ValueError("MCA requires encoder.agg().")
+        feats = self.visual_only(z)                                  # (b, t, p, d)
+        b, t, p, d = feats.shape
+        agg = self.encoder.agg(feats.reshape(b * t, p, d)).reshape(b, t, -1)
+        v_patch = (feats[:, 1:] - feats[:, :-1]).flatten(2).norm(dim=-1)   # (b, t-1)
+        v_agg = (agg[:, 1:] - agg[:, :-1]).norm(dim=-1)                    # (b, t-1)
+        r = v_agg / (v_patch + eps)
+        return r, v_patch, v_agg
+
     def compute_mca(self, z, eps=1e-6):
         """Metric-Consistent Aggregation (pilot only).
 
@@ -1125,12 +1150,14 @@ class VWorldModel(nn.Module):
         norm ratio against the batch-mean ratio and is therefore scale-invariant.
 
         `encoder.agg` is an existing module; this adds no module and no parameter.
+
+        The returned value is `E[(r/r_bar - 1)^2]`, which is exactly
+        `Var(r)/E[r]^2 = CV(r)^2` -- a population variance, since `r_bar` is the mean of
+        the same sample. The training penalty and the rung-1 headline statistic are
+        therefore the *same number*, which is why the probe reports `CV(r)` beside this
+        value and asserts the identity rather than assuming it (`PROGRESS_MCA.md` section
+        4.1).
         """
-        feats = self.visual_only(z)                                  # (b, t, p, d)
-        b, t, p, d = feats.shape
-        agg = self.encoder.agg(feats.reshape(b * t, p, d)).reshape(b, t, -1)
-        v_patch = (feats[:, 1:] - feats[:, :-1]).flatten(2).norm(dim=-1)   # (b, t-1)
-        v_agg = (agg[:, 1:] - agg[:, :-1]).norm(dim=-1)                    # (b, t-1)
-        r = v_agg / (v_patch + eps)
+        r, _v_patch, _v_agg = self._mca_terms(z, eps=eps)
         r_bar = r.mean().detach().clamp_min(eps)
         return ((r / r_bar) - 1.0).pow(2).mean()
