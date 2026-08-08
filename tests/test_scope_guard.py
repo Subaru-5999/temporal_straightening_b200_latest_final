@@ -1,21 +1,38 @@
-"""Scope-containment guard for the CCR and aggregated-space feature branches.
+"""Scope-containment guard for the CCR, aggregated-space and ACS feature branches.
 
 **Validates: Requirements 5.2, 5.4, 5.6** (counterfactual-curvature-regularization)
 
 **Property 9: Frozen sources are byte-identical to the base revision**
 **Validates: Requirements 4.3, 4.4** (aggregated-space-planning-cost)
 
+**Property 16: Frozen sources are byte-identical to the base revision**
+**Validates: Requirements 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7**
+(action-conditioned-straightening)
+
 Requirement 5.6 confines training-side changes to a small allowlist; Requirements 5.2 and 5.4 additionally
 forbid touching the planning and dataset paths at all. The aggregated-space feature adds root-level
-``plan.py`` to that frozen set (Requirement 4.4) and two allowlist entries (Requirement 4.5). This module is
-the only automated check of any of those statements, so it is a non-optional gate rather than an optional
-property test.
+``plan.py`` to that frozen set (Requirement 4.4) and two allowlist entries (Requirement 4.5). ACS adds
+``PROGRESS_ACS.md`` to the allowlist (ACS Requirements 14.6, 14.7 — the only new non-test file it
+introduces) and adds ``models/vit.py`` and ``models/dino.py`` to the frozen set (ACS Requirement 14.5), so
+ACS cannot touch the encoder or the predictor source. This module is the only automated check of any of
+those statements, so it is a non-optional gate rather than an optional property test.
 
-Two assertions:
+Three assertions:
 
 1. Every path the feature branch changed (committed, staged, unstaged or untracked) is in the allowlist.
-2. Every ``planning/*.py`` and ``datasets/*.py`` file, plus root-level ``plan.py``, hashes equal to its
-   content at the base revision.
+2. Every ``planning/*.py`` and ``datasets/*.py`` file, plus root-level ``plan.py`` and ``models/dino.py``,
+   hashes equal to its content at the base revision.
+3. ``models/vit.py`` hashes equal to its **current** content, pinned as a literal digest below.
+
+Assertion 3 records a tension rather than papering over it. ``models/vit.py`` is already in
+``ALLOWED_FILES`` under the CCR SDPA scope amendment, so it legitimately differs from the base revision:
+comparing it against ``BASE_REV`` like the other frozen files would fail on a change ACS did not cause,
+and dropping it from the frozen set would leave ACS Requirement 14.5 unchecked for that file. It is
+therefore frozen against the CCR-amended content that is in the tree today, exactly the way
+``PREEXISTING_FILES`` exempts pre-ACS additions from the allowlist assertion. The equivalence of that
+amended content to the original attention math is *not* this module's job; it is guarded by
+``tests/test_vit_sdpa_equivalence.py``, which checks forward and gradient agreement in float64 and that the
+block-causal mask is still enforced on the fast branch.
 
 Implementation notes:
 
@@ -120,6 +137,13 @@ ALLOWED_FILES = frozenset(
         # `planning.objectives` keeps its original identity after use.
         "agg_objectives.py",
         "plan_agg.py",
+        # ACS Requirements 14.6 and 14.7: the only new non-test file the action-conditioned-straightening
+        # feature adds. Same rationale as `PROGRESS_CCR.md` above -- prose only, no training, planning or
+        # dataset code -- and it is a required artifact rather than an ad-hoc addition, because ACS
+        # Requirement 2.1 obliges the Stage-0 verdict rules to be written down *before* the Stage-0
+        # statistics are collected. Allowlisted here, in the first ACS task, so the guard never reports a
+        # violation for a file the feature is required to create; task 4.5 creates it.
+        "PROGRESS_ACS.md",
     }
 )
 
@@ -143,12 +167,35 @@ FROZEN_DIRS = ("planning", "datasets")
 #: Individual files that must be byte-identical to the base revision. Requirement 4.4 of the
 #: aggregated-space feature adds root-level ``plan.py``: the wrapper `plan_agg.py` imports it and rebinds
 #: `plan.PlanEvaluator` at runtime in its own process, which edits no file, and this is what keeps that
-#: honest. ``plan.py`` is a file rather than a directory, hence a separate tuple; both are handed to git as
-#: pathspecs by ``FROZEN_PATHSPECS`` below.
-FROZEN_FILES = ("plan.py",)
+#: honest. ACS Requirement 14.5 adds ``models/dino.py``: ACS touches the encoder only through the existing
+#: ``encoder.agg`` call, so the encoder source must not move. These are files rather than directories, hence
+#: a separate tuple; both are handed to git as pathspecs by ``FROZEN_PATHSPECS`` below.
+#:
+#: ``models/vit.py`` is deliberately NOT here -- see ``FROZEN_CURRENT_DIGESTS``.
+FROZEN_FILES = ("plan.py", "models/dino.py")
 
 #: Pathspecs passed to ``git ls-tree`` / ``git ls-files`` when collecting the frozen set.
 FROZEN_PATHSPECS = FROZEN_DIRS + FROZEN_FILES
+
+#: ACS Requirement 14.5 for ``models/vit.py``, frozen against its **current** content rather than the base
+#: revision, with the digest pinned here so the check is a real check and not a tautology.
+#:
+#: The tension, recorded rather than hidden: ``models/vit.py`` is in ``ALLOWED_FILES`` above under the CCR
+#: SDPA scope amendment (the additive, default-off ``Attention.use_sdpa`` path that only
+#: ``VWorldModel.compute_ccr`` enables). It therefore differs from ``BASE_REV`` by design, and a naive
+#: base-revision hash comparison would fail on a change ACS did not cause. Freezing it against today's
+#: CCR-amended bytes gives ACS Requirement 14.5 what it actually asks for -- ACS must not touch the
+#: predictor source -- while leaving the CCR amendment where it already lives.
+#:
+#: Guard of record for the amendment's *correctness* (as opposed to its immutability):
+#: ``tests/test_vit_sdpa_equivalence.py``.
+#:
+#: sha256 over newline-normalized bytes, matching ``_digest`` (see the module docstring on core.autocrlf).
+#: If a later, separately argued amendment to ``models/vit.py`` is admitted, update this digest in the same
+#: commit and say why in the commit message -- that is the point of pinning it.
+FROZEN_CURRENT_DIGESTS = {
+    "models/vit.py": "f831b8a942d27ec2c874ad317acbec516b6b20556dcca3d34b7c9cbb229dc364",
+}
 
 
 def _git(*args, binary=False):
@@ -260,24 +307,27 @@ def test_changed_files_are_within_the_requirement_5_6_allowlist():
 
 
 def test_frozen_sources_are_unchanged_from_the_base_revision():
-    """Requirements 5.2, 5.4 (CCR) and 4.3, 4.4 (aggregated-space): the frozen paths are untouched.
+    """The frozen paths are untouched.
 
-    **Property 9: Frozen sources are byte-identical to the base revision**
-    **Validates: Requirements 4.3, 4.4**
+    Requirements 5.2, 5.4 (CCR), 4.3, 4.4 (aggregated-space) and 14.2, 14.3, 14.4, 14.5 (ACS).
+
+    **Property 9 / Property 16: Frozen sources are byte-identical to the base revision**
+    **Validates: Requirements 4.3, 4.4, 14.2, 14.3, 14.4, 14.5**
     """
     _require_git()
     at_base = _frozen_paths_at_base()
     now = _frozen_paths_now()
     assert at_base, (
-        f"no planning/*.py, datasets/*.py or plan.py files found at base revision {BASE_REV}; "
-        "the guard would silently pass"
+        f"no planning/*.py, datasets/*.py, plan.py or models/dino.py files found at base revision "
+        f"{BASE_REV}; the guard would silently pass"
     )
-    # Requirement 4.4: plan.py must actually be in the compared set, so a path-collection regression
-    # cannot silently drop it and leave the assertion vacuously true for the wrapper's frozen entry point.
+    # Requirement 4.4 (plan.py) and ACS Requirement 14.5 (models/dino.py): each named file must actually be
+    # in the compared set, so a path-collection regression cannot silently drop it and leave the assertion
+    # vacuously true.
     for frozen_file in FROZEN_FILES:
         assert frozen_file in at_base, (
-            f"{frozen_file} is not in the frozen set collected at {BASE_REV}; Requirement 4.4 would not be "
-            "checked"
+            f"{frozen_file} is not in the frozen set collected at {BASE_REV}; Requirement 4.4 / ACS "
+            "Requirement 14.5 would not be checked"
         )
 
     mismatches = []
@@ -300,7 +350,38 @@ def test_frozen_sources_are_unchanged_from_the_base_revision():
 
     # Report every mismatch, not just the first.
     assert not mismatches, (
-        "Frozen-source violation (CCR Requirements 5.2/5.4, aggregated-space Requirements 4.3/4.4): "
-        f"planning/*.py, datasets/*.py or plan.py differ from base revision {BASE_REV}.\n  "
-        + "\n  ".join(mismatches)
+        "Frozen-source violation (CCR Requirements 5.2/5.4, aggregated-space Requirements 4.3/4.4, ACS "
+        f"Requirements 14.2/14.3/14.4/14.5): planning/*.py, datasets/*.py, plan.py or models/dino.py "
+        f"differ from base revision {BASE_REV}.\n  " + "\n  ".join(mismatches)
+    )
+
+
+def test_ccr_amended_vit_is_frozen_at_its_current_content():
+    """ACS Requirement 14.5 for ``models/vit.py``, which cannot be compared against the base revision.
+
+    **Property 16: Frozen sources are byte-identical to the base revision**
+    **Validates: Requirements 14.1, 14.5**
+
+    ``models/vit.py`` carries the CCR SDPA scope amendment, so it is both in ``ALLOWED_FILES`` and required
+    by ACS to stay put. Those two facts do not fit in one base-revision comparison, so this test pins the
+    amended content's digest instead. The amendment's numerical equivalence to the original attention is
+    ``tests/test_vit_sdpa_equivalence.py``'s job, not this one's.
+    """
+    mismatches = []
+    for path, expected in sorted(FROZEN_CURRENT_DIGESTS.items()):
+        target = REPO_ROOT / path
+        if not target.is_file():
+            mismatches.append(f"{path}: missing from the working tree")
+            continue
+        actual = _digest(target.read_bytes())
+        if actual != expected:
+            mismatches.append(f"{path}: pinned {expected[:12]} -> now {actual[:12]}")
+
+    assert not mismatches, (
+        "Frozen-source violation (ACS Requirements 14.1/14.5): a file frozen at its CCR-amended content "
+        "changed.\n  " + "\n  ".join(mismatches) + "\n"
+        "ACS is confined to models/visual_world_model.py, train.py, conf/train.yaml, custom_resolvers.py, "
+        "probe_ccr_curvature.py, summarize_training_log.py, run_ccr_pilot.sh, tests/* and PROGRESS_ACS.md; "
+        "models/vit.py is not in that list. If this change is a separately argued amendment rather than ACS "
+        "scope creep, update FROZEN_CURRENT_DIGESTS in the same commit and record the reason."
     )

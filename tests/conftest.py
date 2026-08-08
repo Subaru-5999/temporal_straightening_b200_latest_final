@@ -965,3 +965,487 @@ def identity_agg_head():
 def stub_agg_encoder():
     """A stub encoder carrying an ``agg_type == "mlp"`` head, for ``extract_agg_head``."""
     return make_stub_agg_encoder()
+
+# ===========================================================================
+# Action-conditioned straightening (ACS): shared strategies and degenerate cases
+#
+# Feature: action-conditioned-straightening (task 1.2). Strictly ADDITIVE —
+# every name above this banner keeps its identity and its value, because the
+# CCR and aggregated-space property tests depend on them. The model factory
+# above already carries the two new ctor kwargs (``acs_action_reduce``,
+# ``acs_gate``) through its ``**extra_model_kwargs`` passthrough, so nothing
+# there needed changing either.
+#
+# Everything here is CPU float32 and tiny. Latents are ``(b, t, p, d)`` visual
+# features — the shape ``visual_only(z)`` hands to ``_agg_velocities`` — and
+# actions are ``(b, t, f * d_env)`` recorded normalized actions, the shape the
+# dataset's ``rearrange("(n f) d -> n (f d)")`` produces. The two are always
+# generated **jointly in t**: ``compute_acs`` raises when
+# ``z.shape[1] != act.shape[1]`` (E7), so a strategy that drew them
+# independently would spend its budget on that one error path.
+#
+# Requirements: 14.13, 14.14
+# ===========================================================================
+
+# Target_Cell shapes, recorded so a test can assert against them without
+# building the real DINOv2 encoder. conf/encoder/dino_channel.yaml projects to
+# emb_dim 8 over 196 patches; conf/env/pusht.yaml gives proprio 10 and a 2-d
+# action at frameskip 5, so `act` is (32, 4, 10) = (b, t, f * d_env). With
+# num_hist=3 / num_pred=1 there are t - 2 = 2 curvature triples per sample and
+# 64 per batch.
+ACS_TARGET_CELL_BATCH = 32
+ACS_TARGET_CELL_FRAMES = 4
+ACS_TARGET_CELL_PATCHES = 196
+ACS_TARGET_CELL_CHANNELS = 8
+ACS_TARGET_CELL_PROPRIO_DIM = 10
+ACS_TARGET_CELL_ENV_ACTION_DIM = 2
+ACS_TARGET_CELL_SUBSTEPS = 5  # frameskip
+ACS_TARGET_CELL_ACTION_DIM = (
+    ACS_TARGET_CELL_SUBSTEPS * ACS_TARGET_CELL_ENV_ACTION_DIM
+)  # 10
+ACS_TARGET_CELL_TRIPLES_PER_SAMPLE = ACS_TARGET_CELL_FRAMES - 2  # 2
+ACS_TARGET_CELL_TRIPLES = ACS_TARGET_CELL_BATCH * ACS_TARGET_CELL_TRIPLES_PER_SAMPLE  # 64
+
+# The three constants compute_acs hardcodes (design section 8.1). Mirrored here
+# so a property can reference the same numbers the implementation uses without
+# importing private module state; they are asserted against the implementation
+# in the property tests that own them, never redefined by them.
+ACS_EPS = 1e-6
+ACS_STEP_THRESH = 1e-6
+ACS_WEIGHT_SUM_FLOOR = 1e-3
+
+# The two closed enums. `raw` is an identity reduction, so it is in the list
+# even though it changes nothing — the gate must behave for it too.
+ACS_ACTION_REDUCTIONS = ("sum", "raw", "first")
+ACS_GATES = ("relu_cos", "affine_cos", "hard", "permuted")
+
+# Generator ranges. `t >= 3` because a curvature triple needs three frames
+# (E6); `b` reaches 6 and `p, d` stay small so 100 hypothesis examples stay
+# fast. The value bound keeps every intermediate — a difference of frames, then
+# a sum over f substeps, then a squared norm — far away from float32 overflow,
+# so a non-finite result is always a real defect and never a generator artifact.
+ACS_MIN_BATCH, ACS_MAX_BATCH = 1, 6
+ACS_MIN_FRAMES, ACS_MAX_FRAMES = 3, 6
+ACS_MIN_PATCHES, ACS_MAX_PATCHES = 1, 4
+ACS_MIN_CHANNELS, ACS_MAX_CHANNELS = 1, 4
+ACS_MIN_SUBSTEPS, ACS_MAX_SUBSTEPS = 1, 5
+ACS_MIN_ENV_ACTION_DIM, ACS_MAX_ENV_ACTION_DIM = 1, 3
+ACS_VALUE_BOUND = 10.0
+
+# Log-uniform exponent ranges, kept as exponents so no log10 import is needed.
+# [1e-3, 1e3] is the rescaling range Properties 5 and 6 sweep; [1e-3, 1] is the
+# constant-gate range Property 2 sweeps, whose upper end w = 1 is the special
+# case that reduces exactly to the baseline mean.
+ACS_SCALE_LOG10_LO, ACS_SCALE_LOG10_HI = -3.0, 3.0
+ACS_GATE_CONST_LOG10_LO, ACS_GATE_CONST_LOG10_HI = -3.0, 0.0
+
+# The kinds `make_acs_case` knows how to build, one per degenerate case named in
+# the design's testing strategy plus the ordinary one.
+ACS_CASE_KINDS = (
+    "generic",
+    "static",
+    "one_moving",
+    "parallel",
+    "antiparallel",
+    "zero_action",
+)
+
+acs_batch_size_strategy = st.integers(min_value=ACS_MIN_BATCH, max_value=ACS_MAX_BATCH)
+acs_num_frames_strategy = st.integers(min_value=ACS_MIN_FRAMES, max_value=ACS_MAX_FRAMES)
+acs_patch_count_strategy = st.integers(min_value=ACS_MIN_PATCHES, max_value=ACS_MAX_PATCHES)
+acs_channel_width_strategy = st.integers(
+    min_value=ACS_MIN_CHANNELS, max_value=ACS_MAX_CHANNELS
+)
+acs_substeps_strategy = st.integers(min_value=ACS_MIN_SUBSTEPS, max_value=ACS_MAX_SUBSTEPS)
+acs_env_action_dim_strategy = st.integers(
+    min_value=ACS_MIN_ENV_ACTION_DIM, max_value=ACS_MAX_ENV_ACTION_DIM
+)
+
+acs_action_reduce_strategy = st.sampled_from(ACS_ACTION_REDUCTIONS)
+acs_gate_strategy = st.sampled_from(ACS_GATES)
+acs_case_kind_strategy = st.sampled_from(ACS_CASE_KINDS)
+
+
+def acs_log_uniform(log10_lo: float, log10_hi: float):
+    """Log-uniform positive floats over ``[10**log10_lo, 10**log10_hi]``.
+
+    Drawn on the exponent, so the three decades below 1 get the same share of the
+    budget as the three above it. A uniform draw over ``[1e-3, 1e3]`` would put
+    99.9% of its examples above 1 and never exercise a small scale.
+    """
+    return st.floats(
+        min_value=float(log10_lo),
+        max_value=float(log10_hi),
+        allow_nan=False,
+        allow_infinity=False,
+    ).map(lambda exponent: 10.0**exponent)
+
+
+# `α` for the positive-rescaling properties: the gate is scale-free, so a factor
+# of a million between the smallest and largest draw must change nothing.
+acs_positive_scale_strategy = acs_log_uniform(ACS_SCALE_LOG10_LO, ACS_SCALE_LOG10_HI)
+
+# The constant gate value for the reduction-to-L_curv property. Includes exactly
+# 1.0 (the `10**0` endpoint) because a flat gate of 1 is the case the whole
+# no-λ-reduction argument rests on.
+acs_gate_constant_strategy = acs_log_uniform(
+    ACS_GATE_CONST_LOG10_LO, ACS_GATE_CONST_LOG10_HI
+)
+
+
+def _acs_generator(seed: int) -> torch.Generator:
+    return torch.Generator(device="cpu").manual_seed(int(seed))
+
+
+def _acs_uniform(gen, shape, *, bound: float = ACS_VALUE_BOUND) -> torch.Tensor:
+    """Uniform in ``[-bound, bound]``, CPU float32.
+
+    Values come from a torch generator seeded by a drawn integer rather than from
+    a drawn list of floats: a target-cell latent is 200k elements and drawing
+    them elementwise would dominate every property's runtime.
+    """
+    bound = float(bound)
+    return torch.rand(tuple(int(s) for s in shape), generator=gen, dtype=torch.float32) * (
+        2.0 * bound
+    ) - bound
+
+
+def _acs_away_from_zero(gen, shape, *, bound: float = ACS_VALUE_BOUND) -> torch.Tensor:
+    """Random signs on magnitudes in ``[1, max(bound, 1)]``, so every entry is nonzero.
+
+    Used to build the parallel and antiparallel action cases, where a reduced
+    action block that happened to come out at zero norm would silently turn a
+    `cos = ±1` triple into a `cos = 0` one and quietly weaken the test.
+    """
+    hi = max(float(bound), 2.0)
+    shape = tuple(int(s) for s in shape)
+    magnitude = torch.rand(shape, generator=gen, dtype=torch.float32) * (hi - 1.0) + 1.0
+    sign = torch.randint(0, 2, shape, generator=gen, dtype=torch.float32) * 2.0 - 1.0
+    return magnitude * sign
+
+
+@dataclass
+class ACSCase:
+    """A jointly generated ``(z, act)`` pair plus the shapes and the case label.
+
+    ``z`` is ``(b, t, p, d)`` — visual-only features, what ``visual_only(z)``
+    returns and what ``_agg_velocities`` consumes. ``act`` is
+    ``(b, t, substeps * env_action_dim)``, with the ``s * d + j`` channel layout
+    ``reduce_action("sum")`` sums over. The frame axes agree by construction.
+
+    ``kind`` records which degenerate case (if any) produced the tensors, so a
+    property that draws from :func:`acs_cases` can branch its assertions on it
+    and a failure message says which case shrank.
+    """
+
+    z: torch.Tensor
+    act: torch.Tensor
+    batch_size: int
+    num_frames: int
+    patches: int
+    channels: int
+    substeps: int
+    env_action_dim: int
+    kind: str = "generic"
+    moving_index: int | None = None
+
+    @property
+    def action_dim(self) -> int:
+        """``f * d_env``, i.e. ``act.shape[-1]``."""
+        return self.substeps * self.env_action_dim
+
+    @property
+    def triples_per_sample(self) -> int:
+        """``t - 2``: one curvature triple per consecutive frame window."""
+        return self.num_frames - 2
+
+    @property
+    def num_triples(self) -> int:
+        """``b * (t - 2)``: the tensor size of ``c``, ``w`` and the mask before masking."""
+        return self.batch_size * self.triples_per_sample
+
+    @property
+    def static_samples(self) -> int:
+        """How many samples have every frame equal, hence velocities below ``step_thresh``."""
+        if self.kind == "static":
+            return self.batch_size
+        if self.kind == "one_moving":
+            return self.batch_size - 1
+        return 0
+
+
+def make_acs_case(
+    *,
+    kind: str = "generic",
+    batch_size: int = 2,
+    num_frames: int = 4,
+    patches: int = 2,
+    channels: int = 3,
+    substeps: int = 2,
+    env_action_dim: int = 2,
+    bound: float = ACS_VALUE_BOUND,
+    moving_index: int | None = None,
+    seed: int = 0,
+) -> ACSCase:
+    """Build one :class:`ACSCase` deterministically in ``seed``.
+
+    Single implementation of every degenerate construction: the hypothesis
+    strategies below and the fixtures at the bottom of this file both route
+    through here, so there is one definition of "all-antiparallel" in the suite
+    rather than one per test module.
+
+    The kinds:
+
+    - ``generic``: uniform latents and uniform actions.
+    - ``static``: every frame of every sample identical, so both aggregated
+      velocities are **exactly** zero for every triple and the whole batch is
+      masked out (E9). Exact rather than merely small: identical inputs give
+      identical ``encoder.agg`` outputs whatever the head is, so the difference
+      is a true zero and sits below ``step_thresh`` for any head.
+    - ``one_moving``: ``static`` with sample ``moving_index`` replaced by a
+      moving one, the "exactly one non-static sample among static ones" case.
+    - ``parallel``: every frame's action block is the same nonzero vector tiled
+      over the substeps, so every consecutive reduced pair has ``cos = +1``
+      under all three reductions and the gate must return 1.
+    - ``antiparallel``: the same block with its sign flipped each frame, so every
+      consecutive reduced pair has ``cos = -1`` under all three reductions. The
+      tiling matters — an arbitrary block can sum to zero across substeps, which
+      would give ``cos = 0`` instead of ``-1`` under ``sum`` and turn the
+      all-reversing case into a zero-norm one.
+    - ``zero_action``: every action block exactly zero, so ``cosine_similarity``
+      falls back on its ``eps`` and returns 0 without raising (E10).
+    """
+    if kind not in ACS_CASE_KINDS:
+        raise ValueError(f"unknown ACS case kind {kind!r}; expected one of {ACS_CASE_KINDS}")
+    if num_frames < 3:
+        raise ValueError(f"an ACS case needs at least 3 frames, got {num_frames}")
+
+    b = int(batch_size)
+    t = int(num_frames)
+    p = int(patches)
+    d = int(channels)
+    f = int(substeps)
+    d_env = int(env_action_dim)
+    gen = _acs_generator(seed)
+
+    # ---- latents ----
+    if kind in ("static", "one_moving"):
+        frame = _acs_uniform(gen, (b, 1, p, d), bound=bound)
+        z = frame.expand(b, t, p, d).clone()  # clone: expand aliases one frame's storage
+        if kind == "one_moving":
+            idx = 0 if moving_index is None else int(moving_index) % b
+            z[idx] = _acs_uniform(gen, (t, p, d), bound=bound)
+        else:
+            idx = None
+    else:
+        z = _acs_uniform(gen, (b, t, p, d), bound=bound)
+        idx = None
+
+    # ---- actions ----
+    if kind == "zero_action":
+        act = torch.zeros((b, t, f * d_env), dtype=torch.float32)
+    elif kind in ("parallel", "antiparallel"):
+        block = _acs_away_from_zero(gen, (b, 1, d_env), bound=bound)
+        act = block.repeat(1, t, f)  # (b, t, f * d_env), channel layout s * d_env + j
+        if kind == "antiparallel":
+            signs = torch.tensor(
+                [(-1.0) ** k for k in range(t)], dtype=torch.float32
+            ).view(1, t, 1)
+            act = act * signs
+    else:
+        act = _acs_uniform(gen, (b, t, f * d_env), bound=bound)
+
+    return ACSCase(
+        z=z.contiguous(),
+        act=act.contiguous(),
+        batch_size=b,
+        num_frames=t,
+        patches=p,
+        channels=d,
+        substeps=f,
+        env_action_dim=d_env,
+        kind=kind,
+        moving_index=idx,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis strategies (ACS)
+# ---------------------------------------------------------------------------
+
+
+@st.composite
+def acs_cases(
+    draw,
+    *,
+    kind: str | None = None,
+    batch_size: int | None = None,
+    num_frames: int | None = None,
+    patches: int | None = None,
+    channels: int | None = None,
+    substeps: int | None = None,
+    env_action_dim: int | None = None,
+    bound: float = ACS_VALUE_BOUND,
+) -> ACSCase:
+    """The general ACS strategy: latents and actions drawn jointly.
+
+    Any dimension can be pinned by the caller; the rest are drawn. ``kind`` left
+    as ``None`` draws from :data:`ACS_CASE_KINDS`, so an unqualified
+    ``acs_cases()`` covers the ordinary case *and* every degenerate one — that is
+    the "full strategy including degenerates" the design asks Property 7 to use.
+    Pin ``kind`` to get one case exclusively, or use the named strategies below.
+
+    ``t`` is drawn once and used for both ``z`` and ``act``, so the frame axes
+    always agree and no example is wasted on the ``z.shape[1] != act.shape[1]``
+    error path (E7), which has its own unit test.
+    """
+    case_kind = draw(acs_case_kind_strategy) if kind is None else str(kind)
+    b = draw(acs_batch_size_strategy) if batch_size is None else int(batch_size)
+    t = draw(acs_num_frames_strategy) if num_frames is None else int(num_frames)
+    p = draw(acs_patch_count_strategy) if patches is None else int(patches)
+    d = draw(acs_channel_width_strategy) if channels is None else int(channels)
+    f = draw(acs_substeps_strategy) if substeps is None else int(substeps)
+    d_env = (
+        draw(acs_env_action_dim_strategy) if env_action_dim is None else int(env_action_dim)
+    )
+    moving_index = draw(st.integers(min_value=0, max_value=b - 1))
+    seed = draw(st.integers(min_value=0, max_value=2**31 - 1))
+
+    case = make_acs_case(
+        kind=case_kind,
+        batch_size=b,
+        num_frames=t,
+        patches=p,
+        channels=d,
+        substeps=f,
+        env_action_dim=d_env,
+        bound=bound,
+        moving_index=moving_index,
+        seed=seed,
+    )
+    event(f"acs case: kind={case_kind}, b={b}, t={t}, p={p}, d={d}, f={f}, d_env={d_env}")
+    return case
+
+
+def acs_generic_cases(**kwargs):
+    """Ordinary latents and ordinary actions: no degenerate structure imposed."""
+    return acs_cases(kind="generic", **kwargs)
+
+
+def acs_static_cases(**kwargs):
+    """All-equal frames: every aggregated velocity is exactly 0, so every triple is masked."""
+    return acs_cases(kind="static", **kwargs)
+
+
+@st.composite
+def acs_one_moving_cases(draw, *, batch_size: int | None = None, **kwargs) -> ACSCase:
+    """Exactly one non-static sample among static ones.
+
+    ``b`` is drawn from 2 upward so the "among static ones" part is real; the
+    single-sample case has its own strategy. The moving sample's index is on the
+    returned case as ``moving_index``.
+    """
+    if batch_size is None:
+        b = draw(st.integers(min_value=2, max_value=ACS_MAX_BATCH))
+    else:
+        b = int(batch_size)
+        if b < 2:
+            raise ValueError(f"acs_one_moving_cases needs batch_size >= 2, got {b}")
+    return draw(acs_cases(kind="one_moving", batch_size=b, **kwargs))
+
+
+def acs_single_sample_cases(*, kind: str | None = None, **kwargs):
+    """``b = 1``: the reduction normalizes over 1 sample's triples and nothing else."""
+    return acs_cases(kind=kind, batch_size=1, **kwargs)
+
+
+def acs_parallel_action_cases(**kwargs):
+    """All-parallel actions: every consecutive reduced pair has ``cos = +1``, so ``w = 1``."""
+    return acs_cases(kind="parallel", **kwargs)
+
+
+def acs_antiparallel_action_cases(**kwargs):
+    """All-antiparallel actions: every consecutive reduced pair has ``cos = -1``.
+
+    Under ``relu_cos`` and ``hard`` this makes every unmasked triple a reversing
+    triple, which is the all-reversing batch Property 10 needs: the weight sum is
+    0, ``WEIGHT_SUM_FLOOR`` binds and the term is exactly 0 rather than a NaN.
+    """
+    return acs_cases(kind="antiparallel", **kwargs)
+
+
+def acs_zero_action_cases(**kwargs):
+    """Zero-norm action blocks: ``cosine_similarity``'s ``eps`` returns 0 without raising."""
+    return acs_cases(kind="zero_action", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures (ACS)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_acs_case_fn():
+    """Factory fixture wrapping :func:`make_acs_case`."""
+    return make_acs_case
+
+
+@pytest.fixture
+def acs_generic_case():
+    """A small ordinary case: ``b=2, t=4, p=2, d=3``, ``act`` ``(2, 4, 4)``."""
+    return make_acs_case(kind="generic")
+
+
+@pytest.fixture
+def acs_static_case():
+    """All-equal frames, so every triple falls below ``step_thresh``."""
+    return make_acs_case(kind="static")
+
+
+@pytest.fixture
+def acs_one_moving_case():
+    """Exactly one non-static sample (index 0) among three static ones."""
+    return make_acs_case(kind="one_moving", batch_size=4, moving_index=0)
+
+
+@pytest.fixture
+def acs_single_sample_case():
+    """``b = 1``."""
+    return make_acs_case(kind="generic", batch_size=1)
+
+
+@pytest.fixture
+def acs_parallel_action_case():
+    """All-parallel actions: the gate is flat at 1, so the term reduces to the baseline."""
+    return make_acs_case(kind="parallel")
+
+
+@pytest.fixture
+def acs_antiparallel_action_case():
+    """All-antiparallel actions: every unmasked triple reverses."""
+    return make_acs_case(kind="antiparallel")
+
+
+@pytest.fixture
+def acs_zero_action_case():
+    """Zero-norm action blocks."""
+    return make_acs_case(kind="zero_action")
+
+
+@pytest.fixture
+def acs_target_cell_case():
+    """The PushT Target_Cell shapes: ``z`` ``(32, 4, 196, 8)``, ``act`` ``(32, 4, 10)``.
+
+    2 curvature triples per sample, 64 per batch. Roughly 0.8 MB of float32, so it
+    is cheap enough for a unit test but too slow for a 100-example property — the
+    properties use the small drawn shapes and this fixture pins the real cell.
+    """
+    return make_acs_case(
+        kind="generic",
+        batch_size=ACS_TARGET_CELL_BATCH,
+        num_frames=ACS_TARGET_CELL_FRAMES,
+        patches=ACS_TARGET_CELL_PATCHES,
+        channels=ACS_TARGET_CELL_CHANNELS,
+        substeps=ACS_TARGET_CELL_SUBSTEPS,
+        env_action_dim=ACS_TARGET_CELL_ENV_ACTION_DIM,
+    )

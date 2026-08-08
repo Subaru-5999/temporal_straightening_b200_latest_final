@@ -1,0 +1,815 @@
+# PROGRESS — Action-Conditioned Straightening (ACS)
+
+Live state of the ACS effort. Written so the work can be resumed cold, without the conversation
+that produced it. Update this file at every decision point.
+
+Spec: `.kiro/specs/action-conditioned-straightening/` (`requirements.md`, `design.md`, `tasks.md`)
+Repo: https://github.com/Subaru-5999/temporal_straightening_b200_latest_final (branch `main`)
+Sibling records: `PROGRESS_CCR.md` (the completed negative round this file's conventions come from),
+`.kiro/specs/temporal-metric-regularization/design.md` (TMR, **on hold**; ACS supersedes it)
+
+---
+
+## 0. What this file is, and why it exists in this order
+
+**This is a pre-registration.** Sections 4 (Stage-0 rules A and B), 5 (early-read gate checks 0, 1,
+1b, 1c, 2a, 2b, 3), 6 (the acceptance bars), 7 (the recorded limitations), 8 (the novelty
+positioning) and 9 (the probability estimate) are written **before any ACS measurement is taken** —
+before the Stage-0 probe runs, before the loss term exists in the code, and before any GPU time is
+spent. Section 10 holds the empty slots the measurements go into.
+
+The reason is a documented failure mode from the previous round, not a stylistic preference. In CCR,
+`rho = 0.05` was **derived rather than measured**, the probe failed against it, and the criterion was
+then widened (`PROGRESS_CCR.md` §5a); the λ-selection rule had to be corrected after the fact because
+it named the wrong quantity (§6a); and the loss shares were called "converged" off two data points and
+kept moving for another 120,000 steps (§4). Each of those is a rule meeting its data and losing. The
+countermeasure is mechanical: write the rule down first, in a file the scope guard tracks, and let a
+tool evaluate it afterwards.
+
+Created 2026-08-08, at repo revision `d3c3ce5`, **before Stage 0 was run.**
+
+Requirements this file discharges: 16.1, 16.3, 16.10, 2.1, 2.17, 10.1, 3.1, 3.2, 3.3, 3.4, 3.5, 3.7,
+3.8, 3.9, 14.7.
+
+---
+
+## 1. What ACS is, in one paragraph
+
+A change to the **reduction** inside the paper's existing curvature term — not a new loss term. The
+paper penalizes `c_t = 1 - cos(v_t, v_{t+1})` uniformly over every latent-velocity triple; ACS
+replaces the uniform mean with a **gate-weighted mean over the same per-triple values**, where the
+gate measures how similar the controlling actions were:
+
+```
+L_acs = Σ_t w_t · c_t / clamp_min(Σ_t w_t, 1e-3),   c_t = 1 - cos(v_t, v_{t+1}),
+w_t   = relu(cos(a_t, a_{t+1})).detach() ∈ [0, 1],  a_t = Σ_{s=0}^{4} act[:, t, 2s:2s+2]
+```
+
+The space (the paper's 128-d aggregated space via `encoder.agg`), `λ = 0.1`, and the
+`step_thresh = 1e-6` static-velocity mask are all **unchanged**. The gate is computed from the **raw
+`act` tensor** and detached, so nothing the encoder or the trained `action_encoder` learns can move it.
+
+The gap targeted is in the paper's **premise**, not its formula: perceptual straightening is a
+hypothesis about *passive natural video*, where there is no controller and smoothness is the right
+prior. The paper transplants it to an actively controlled agent trained on random, suboptimal
+rollouts, where a direction change in the latent velocity is often the *correct* representation of a
+change in action. Selected by the mode string `training.straighten=acsaggcos1e-1`; the default path
+(`aggcos1e-1`, and `False`) stays **bitwise** the pre-feature code.
+
+Because the weighted mean is invariant to any uniform rescaling of the gate (`w ≡ ŵ > 0` gives
+`L_acs = L_curv` exactly), ACS can only **reallocate** straightening pressure, never reduce it in
+aggregate. That is what makes the λ-matched control the **existing baseline** at zero cost, and what
+makes "you just found a smaller λ" unavailable as an objection.
+
+---
+
+## 2. Status
+
+| item | state |
+|---|---|
+| Pre-registration (this file, §4-§9) | **complete — written 2026-08-08 before any measurement** |
+| Scope guard extended for the ACS file set (task 1.1) | complete — `PROGRESS_ACS.md` allowlisted, `models/vit.py` + `models/dino.py` frozen |
+| Shared geometry helpers + `straighten` parser `else: raise` (section 2) | _not started_ |
+| `reduce_action` / `action_gate` (section 3) | _not started_ |
+| Stage-0 probe readout `--readout actions` (task 4.1) | _not started_ |
+| **Stage 0 measurement (task 5.1) — CPU, minutes, 0 GPU-h** | **_NOT RUN — see §10.1_** |
+| **Stage-0 verdict (rules A and B, task 5.2) — CAN KILL THE FEATURE** | **_NOT READ — see §10.2_** |
+| ACS term `compute_acs` (section 6) | _not started — conditional on a Stage-0 GO or MIDDLE_ |
+| Stage 1 arm (8,000 steps, 0.8 GPU-h) | _not started_ |
+| Early-read gate verdict | _not read — see §10.3_ |
+| Stage 2 full run + 3-seed eval (13.6 GPU-h) | _not started_ |
+| Findings N1 / N2 / N3 | _not written — see §10.4_ |
+
+**Budget, recorded honestly.** Stage 0 minutes / **0 GPU-h**. Stage 1 arm 0.8 GPU-h; matched 8k eval
+0.4; permuted-gate arm 0.8; Stage 2 full run + 3-seed eval 13.6. **Best case (Stage-0 STOP) 0 GPU-h;
+typical case ~0.8-1.2 GPU-h; worst case ~16 GPU-h.** CCR spent ~26 GPU-h to reach a negative result;
+the asymmetry here is the design.
+
+---
+
+## 3. The control reference row (measured, do not re-derive)
+
+Every Stage-1 comparison is read against these numbers. They come from the completed baseline run
+(`model_2.pth`, 123,858 steps, 12.04 h) and its **bitwise** 8,000-step prefix in `checkpoints_ctrl8k`
+(40/40 telemetry rows agree to `+0.000000` on re-run — training on this pod is bitwise deterministic,
+so the matched control is *exact* and there is no run-to-run variance to subtract).
+
+**`global_iter` 8000, the row the gate is judged against:**
+
+| term | scaled | share |
+|---|---|---|
+| curvature | 0.041421 | **73.741%** |
+| prediction | **0.013196** | 23.493% |
+| decoder | 0.001554 | 2.767% |
+| **total** | **0.056171** | 100% |
+
+**Step rate:** median **2.862** it/s over 619 telemetry records (a 50-step smoke read 1.890 it/s, so
+warmup rows are artifacts and must not be used).
+
+**Success rates.** Baseline @124k, 3 data-sampling seeds (100/200/300), `n_evals=50`:
+
+| setting | measured | per-seed | paper |
+|---|---|---|---|
+| open-loop | **75.33 ± 6.11** | 74, 82, 70 | 77.33 ± 6.18 |
+| MPC | **82.00 ± 2.00** | 82, 80, 84 | 85.33 ± 4.99 |
+
+Control **@8k**: **16.0** OL / **18.0** MPC.
+
+Read the open-loop per-seed spread — **74, 82, 70**, a 12-point range over three seeds on the *same
+checkpoint* — as the noise reality every claim in this file lives in. Table 1's straightening gains
+(`L_curv` ✗ → ✓, open-loop) that rule A is set against: UMaze **+50.00**, Medium **+10.67**, Wall
+**+10.67**, PushT **+7.33**.
+
+**Share drift, recorded because calling shares "converged" off two points was a documented CCR
+error:** curvature share 31.4% @200 → 65.4% @3000 → **73.7% @8000** → 80.5% @35.6k → 79.5% @84.4k →
+82.7% @123.9k. Not monotone, plateaus near 80%. The reference is read at 8,000 and nowhere else.
+
+---
+
+## 4. Stage 0 — the pre-registered verdict rules. WRITTEN 2026-08-08, BEFORE THE DATA
+
+Stage 0 measures the distribution of consecutive-action similarity `cos(a_t, a_{t+1})` across **all
+four** datasets (PushT, Wall, PointMaze-UMaze, PointMaze-Medium), on the **train** split (validation
+reported as a cross-check), for **all three** action reductions (`sum` ≡ `mean`, `raw`, `first`).
+CPU only, minutes, **no GPU, no checkpoint, no model weights, no video decode**.
+
+Reported per environment per reduction: mean, median, `frac(cos<0)`, `frac(cos<0.5)`, a 20-bin
+histogram over `[-1, 1]`, `mean(w)` for `w = relu(cos)`, `frac(w=0)`,
+**`R = E|w − E[w]| / (2·E[w])`**, and `n_triples` / `n_windows` beside every statistic so no number
+appears without its denominator.
+
+`mean(w)` is deliberately **not** a gate statistic. Because ACS uses a weighted mean, a flat gate at
+*any* level reproduces the baseline exactly — `w ≡ 0.5` everywhere gives `L_acs = L_curv`. `R` is the
+weight mass moved relative to uniform (the population form of the total-variation distance between
+`w/Σw` and `1/N`), and it is the quantity that gates. `R = 0` means ACS *is* the baseline regardless
+of `mean(w)`.
+
+### 4.1 Rule A — the mechanism-ordering test
+
+If straightening helps most where the control is smooth, `frac(cos<0)` should order **inversely** to
+Table 1's gains: UMaze lowest, Medium ≈ Wall in the middle, **PushT highest**.
+
+| outcome | verdict |
+|---|---|
+| PushT's `frac(cos<0)` is the **highest** of the four **AND** exceeds each of the Wall / UMaze / Medium values by **>= 1.5x** **AND** UMaze's value is the **lowest** of the four | **GO** — the ordering is consistent with the mechanism story; build ACS and make the (weak) mechanism claim |
+| PushT is highest **but** the remaining ordering inverts (e.g. Wall > Medium, or UMaze not lowest), **or** PushT's margin over the largest of the other three is in **`[1.1x, 1.5x)`** | **MIDDLE** — build ACS, but the mechanism claim is **downgraded** to "the gate is a useful inductive bias", and the writeup must **not** claim ACS explains the Table 1 gain ordering |
+| PushT's `frac(cos<0)` is **not the highest** of the four, **or** is within **1.1x** of the smoothest environment's value | **STOP** — the premise is dead, the mechanism story is wrong, **the feature is not built** |
+
+**Additional pre-declared downgrade (Requirement 3.6).** If the `sum` reduction shows **no** reversal
+structure while `raw` **does**, the reversals are happening *inside* a latent step — which the latent
+velocity cannot see either — and the rule A verdict is recorded as **MIDDLE**, not GO.
+
+### 4.2 Rule B — the reallocation test (independent, and it can STOP on its own)
+
+| PushT `R` | verdict |
+|---|---|
+| **`R >= 0.15`** | **GO** on rule B |
+| **`0.08 <= R < 0.15`** | **MIDDLE** — the expected effect size is small; ACS may be built, and **`acs_gate=hard` or a sharpened gate is the pre-declared remedy**, recorded now rather than invented later |
+| **`R < 0.08`** | **STOP** — the term reallocates under 8% of its mass and cannot plausibly produce a +4/+5 effect when the entire first-order straightening effect was +7.33 OL / +6.66 MPC |
+
+### 4.3 Combination, and what a STOP actually means
+
+Both rules are evaluated **independently** and mechanically, by
+`probe_ccr_curvature.py --readout actions --summarize`. The combined verdict is **STOP if either rule
+is STOP**. Stage 1 is permitted **only** when rule A is GO-or-MIDDLE **and** rule B is GO-or-MIDDLE.
+
+**A STOP ends the feature.** Tasks 6.x onward are not executed: no `compute_acs`, no gate, no action
+reducer, no ACS code path at all. `MCA_Fallback` (`compute_mca` — already written, reviewed, never
+run, zero new code, `<0.1%` overhead, 0.8 GPU-h to a verdict, targeting the orthogonal
+regularization-space-versus-planning-space gap) becomes the next arm, and the Stage-0 statistics are
+written up as findings **N1 and N2 regardless** (§10.4). There is no salvage path that keeps the
+story: gating on a signal that does not vary the way the story requires is not an inductive bias, it
+is noise.
+
+On a **MIDDLE**, the downgraded claim is recorded **at the moment the verdict is read**, not
+retroactively.
+
+### 4.4 The thresholds are judgment calls, not derivations (Requirement 2.17)
+
+`1.5x`, `1.1x`, `0.15` and `0.08` are **judgment calls.** None is derived from a model, a power
+calculation or a measurement. `1.5x` is "clearly separated rather than marginally separated"; `1.1x`
+is "indistinguishable"; `0.08` is the point below which the reallocated mass is too small to
+plausibly move a +4/+5 bar given that the whole first-order effect was +7.33; `0.15` is roughly twice
+that. They are written down before the data **precisely because they are judgment calls** — an
+arbitrary threshold fixed in advance is a test, and the same threshold chosen afterwards is a fit.
+This is the CCR failure mode (`PROGRESS_CCR.md` §5a, §6a) being blocked structurally.
+
+### 4.5 What Stage 0 can and cannot establish — attached here, not in a footnote
+
+**`n = 4` with no independent replicates. It can refute the mechanism; it cannot establish it.** Four
+points, and the "gains" it is correlated against are themselves 3-seed means with per-seed spreads as
+wide as 74/82/70 on a single checkpoint. Two further limitations matter more than the sample size:
+
+1. **The four environments carry differently-typed action variables.** PushT's actions are *relative
+   pusher displacements* (`rel_actions.pth`, `/100.0`, normalized by the hardcoded near-isotropic
+   `ACTION_STD = [0.2019, 0.2002]`); PointMaze's are forces / velocity commands on a point mass;
+   Wall's are dot velocities — the latter two normalized by *data-computed* per-dim mean/std. So
+   `cos(a_t, a_{t+1})` is **not the same physical quantity** across the four points being correlated.
+   This is a *structural* limitation of the comparison, not a noise problem, and no amount of data
+   fixes it.
+2. **A confirmed ordering is consistent with many mechanisms other than ACS's.** PushT differs from
+   PointMaze in **contact dynamics**, in having a **second movable object**, in having **rotational
+   state** (`block_angle` readout R² 0.183 against 0.50-0.80 for the positional dims,
+   `PROGRESS_CCR.md` §5c), and in being trained for **2 epochs instead of 20**. Any of those could
+   produce the same gain ordering.
+3. **`frameskip=5` may wash out the reversals that motivate the whole idea.** The gate sees the *net*
+   displacement over 5 env steps. A pusher that reverses *within* a latent step has a small-norm sum
+   whose direction is dominated by whichever half of the motion was larger, and two consecutive
+   latent steps could both have near-zero net displacement and an essentially random relative angle.
+   This is measured directly, and it is why `raw` and `first` are measured too (§4.1's downgrade
+   rule).
+
+Therefore the Stage-0 result is used **asymmetrically, on purpose**: a STOP is decisive, because the
+premise is a necessary condition and it failed; a **GO is permission to spend 0.8 GPU-h, not evidence
+for the mechanism.**
+
+Stage 0 is worth running even if ACS is never built: the per-environment statistics answer *when does
+temporal straightening help?* with a measurable dataset property rather than a post-hoc narrative, for
+zero GPU-hours (N1, N2).
+
+---
+
+## 5. The early-read gate — checks 0, 1, 1b, 1c, 2a, 2b, 3. WRITTEN BEFORE THE ARM IS LAUNCHED
+
+Pre-registered here in full, with every threshold, before the Stage-1 arm exists. Checks 0-3 and their
+mechanization through `summarize_training_log.py --prediction-gate` are reused from the on-hold TMR
+design; **check 1's interpretation is inverted, and that inversion is the most important content in
+the whole spec.** Every quantity is read at **matched `global_iter`** against `checkpoints_ctrl8k`'s
+own rows, which are exact. Cost of the whole gate: **~0.8 GPU-h** (the control is free, and a lost
+prefix can be regenerated bitwise).
+
+### 5.1 Check 0 — step rate, as a bug detector
+
+**`it_per_s >= 2.72`** at steady state, read from telemetry rows **past row 400**, against the
+reference **2.862** it/s.
+
+Predicted ACS cost is order **`1e-8`** of the step (one 5-term sum over `(32,4,10)`, one cosine over
+`(32,2,2)`, one relu, two masked sums — against 128 DINOv2 ViT-S/14 image passes at ~4.6 GFLOPs each).
+So a 5% breach is **not a cost to accept**: it means the implementation is doing work it was not
+designed to do. **Fix the code and hold the arm.** This is a bug detector, not a budget check.
+
+### 5.2 Check 1 — prediction loss, INVERTED: a positive directional prediction, not a guard
+
+For CCR and TMR, prediction loss was a **guard** — the thing that must not degrade. For ACS it is a
+**positive prediction.** ACS stops forcing differently-acted transitions to look collinear, which is
+exactly the information the predictor needs to know where a given action takes the latent. If the
+mechanism is real, the predictor should get *better*.
+
+This matters because prediction loss is **the only quantity measured to be causally linked to success
+on this codebase**: CCR degraded it by +16.9% in 8 of 8 consecutive matched rows (one-sided sign test
+p ≈ 0.004) and success fell (−2.0 OL, −8.0 MPC at matched budget). Every prior intervention here
+pushed that channel the wrong way and lost.
+
+Run with `--prediction-gate <CONTROL_RUN_DIR> --prediction-gate-direction improve` (default is
+`guard`; check 1 must be run in `improve` mode).
+
+| condition at `global_iter` 8000 (scaled `prediction`; control **0.013196**) | verdict |
+|---|---|
+| `prediction <= 0.013196` (at or better than control) **AND** **>= 15 of the last 20** matched rows better (one-sided sign test p ≈ 0.021) | **GO** — the directional prediction is confirmed on the causal channel; the strongest early signal available in this project |
+| additionally `prediction <= 0.012536` (−5% or better) | **STRONG GO** — recorded **separately**, because effect size matters for whether +4/+5 is reachable |
+| `prediction > 0.014516` (+10%) **OR** **>= 15 of the last 20** matched rows **worse** | **STOP** — the directional prediction was **refuted** on the one channel measured to be causal, and ACS's whole mechanism story runs through it |
+| anything else | **MIDDLE** — decided by checks 1b, 1c and 2, **with no discretion** |
+
+The STOP bound tightens from TMR's +25% to **+10%** because for ACS a degradation is not a cost to
+tolerate, it is a **refutation**: the mechanism claim is precisely that removing pressure from
+action-reversing transitions preserves action-discriminability.
+
+**Limit of this check, stated with it:** it is measured at 8,000 steps, which is **6.5% of the
+budget**, on a single arm, on one channel. A confirmed direction at 8k is far more informative than
+check 3 (a continuous quantity on 40 exact matched rows on a bitwise-deterministic platform, versus a
+near-floor binomial), but it is a *proxy* for success, not success.
+
+### 5.3 Check 1b — scale preservation (the λ prediction, made falsifiable)
+
+The weighted mean is scale-preserving, so the curvature share should land where the baseline's did.
+Read at **`global_iter` 200 and 8000**:
+
+- **curvature share within `[65%, 80%]`** — the control's value is **73.741%** at 8k. Outside that
+  band, either the reallocation is far more consequential than the algebra suggests or there is a bug;
+  **both require investigation before the arm is believed.**
+- **prediction share `>= 11.75%`** — the CCR floor, retained (predicted ~23.5%, so ~2x slack).
+- **no term below the collapse threshold inside the first 1,000 iterations** (`--collapse-check`).
+- record `curvature_loss_used_for_training` at 200 and at 8000 **and report the ratio**. A term ~80%
+  satisfied by step 8000 exerts little pressure over the remaining ~116,000 steps while the cost is
+  paid for the full distance; CCR's raw term fell 79% and that was **measured cost with vanishing
+  benefit** — a STOP even though it looks like the mechanism working.
+- compare the arm's **`curvature_loss_unweighted`** against the control's curvature at
+  `global_iter` 200 within **`rtol = 0.05`**, using the *unweighted* quantity.
+
+**Why the unweighted key exists at all, recorded here so the gate is not misread:** under ACS the
+`curvature` row is a **w-weighted** average while the control's is a **uniform** average of the same
+per-triple values, and ACS downweights exactly the triples it says are most curved. So the arm's
+curvature row will read **lower than the control's even with identical geometry.** Comparing those two
+rows as if they measured geometry is a false positive waiting at exactly the moment it matters.
+`curvature_loss_unweighted` is the geometry number, bitwise equal to
+`total_curvature(visual_only(z), "aggcos")`, detached, never added to the loss, and deliberately
+**not** in `TELEMETRY_TERMS` so `Σ share ≈ 1.0` still holds.
+
+### 5.4 Check 1c — did the gate actually gate?
+
+ACS-specific, and it is the check that stops an unattributable result. Read from the `acs` telemetry
+block via `summarize_training_log.py --acs-gate-check`:
+
+| quantity | rule |
+|---|---|
+| **`acs_gate_tv`** (the finite-batch form of `R`) | must be **`>= 0.08`** **AND** within a factor **1.5** of the Stage-0 population `R` for PushT |
+| **`acs_denom_clamped_frac`** | must be **`< 0.01`** |
+| `acs_gate_mean`, `acs_gate_p10` / `p50` / `p90` | reported; must be consistent with the Stage-0 distribution |
+| `acs_gate_zero_frac` | reported; should match Stage-0's `frac(cos<0)` |
+| `acs_masked_frac` | reported; a high value means the windows are mostly static and the whole term is thin |
+
+**If `acs_gate_tv ≈ 0`, the term IS the baseline and nothing can be attributed to it — regardless of
+what `mean(w)` reads. That is a STOP.** A mismatch beyond 1.5x against Stage-0's `R` means the
+training-time `a_t` is not the one Stage 0 measured, i.e. a **wiring defect** in the substep reduction
+or in the triple-to-action-pair alignment. That class of error is caught by a mechanical check and
+missed by an eyeball, which is why Stage 0 and training call the **same shipped `reduce_action` and
+`action_gate`** — the structural fix for CCR's calibration error, applied to the gate.
+
+### 5.5 Check 2a — the gate-split curvature signature (held-out)
+
+ACS's target is not "less curvature", it is a **reallocation**. Measured on **held-out** windows at
+**`--num-windows 192`** (the CCR round established that 64 windows is noise: a −28% `block_angle`
+delta at n=64 collapsed to −9% at n=192), arm checkpoint versus control checkpoint, **identical flags
+and seed**, through the existing `_aggregate_latent` helper and the shared geometry helpers. Split
+held-out triples by gate value and compare **unweighted** per-triple curvature:
+
+| bucket | pre-registered ACS prediction |
+|---|---|
+| **`w = 0`** (reversing) | curvature **higher** than the control's — pressure was removed here, so the geometry is allowed to bend |
+| **`w >= 0.5`** (near-constant) | curvature **equal or lower** than the control's — pressure was concentrated here |
+| overall unweighted mean | **reported, direction not pre-registered** — it is a mixture of the two |
+
+**Failing both directional rows = STOP:** the reduction did not reallocate anything measurable on
+held-out data, so nothing downstream is attributable to the gate. This is sharper than "did the loss go
+down", because a loss that goes down for the wrong reason is exactly what CCR delivered (−96% on its
+own objective, none of it converted).
+
+### 5.6 Check 2b — the rotational-state prediction (a known limitation turned into a test)
+
+`PROGRESS_CCR.md` §6f established that curvature regularization **suppresses rotational state**:
+`block_angle` readout R² is 0.183 in the paper's own trained model against 0.50-0.80 for the four
+positional dimensions, it *degrades with training* (0.278 @8k → 0.183 @124k), and Table 1's gains are
+largest on the pure-position tasks and smallest on PushT — the only task with rotational state.
+Rotation *is* curvature: a rotating object traces an arc, so its velocity direction changes by
+construction.
+
+ACS removes straightening pressure precisely where the latent velocity turns, so it predicts the
+**opposite** direction: `block_angle` R² should **improve** versus the matched control. Measured with
+`state_readout_r2` **unchanged**, at **`--num-windows 192`**, on `--readout state` (`block_angle`).
+
+**Gated leniently and deliberately:** check 2b passes when `block_angle` R² **does not degrade beyond
+noise**. An improvement is recorded as **supporting evidence and is not required for GO** — it is a
+bonus prediction. A confirmation would convert §6f from a limitation into a general statement about
+curvature-family regularizers; a refutation bounds §6f to unconditional penalties. Either is finding
+N3.
+
+### 5.7 Check 3 — matched-budget success rate, CATASTROPHE DETECTOR ONLY
+
+8,000-step checkpoints, **1 seed**, unmodified evaluation protocol, open-loop and MPC. Training is
+bitwise deterministic and `plan.py` seeds episodes from `seed` with a deterministic planner
+(`sample_type=zero`, `action_noise=0`), so this is an **exact paired difference** — counts of
+episodes, 2 percentage points each. Control @8k: **16.0 OL / 18.0 MPC**.
+
+| condition | reading |
+|---|---|
+| difference **`<= -10`** points in either setting | **red flag worth acting on** |
+| difference within **`±10`** points | **carries no information** — must be reported as **neither support nor refutation** |
+
+**Honest statement of its power, in the same paragraph as its rule: it is nearly uninformative.** Both
+arms sit near the floor; at `p ≈ 0.17` the per-arm binomial SE is **~5.2 points**, so distinguishing
+arms at 2 SE needs `Δ >= ~11` points — 5 to 6 episodes out of 50. It is a catastrophe detector and
+nothing else. The matched-budget test is also **structurally biased against any new term**, since a
+new term pays its cost from step 1 and 8,000 steps is 6.5% of the budget, and **one seed does not
+establish generalization** to other episode sets.
+
+---
+
+## 6. Acceptance bars for a full run (Stage 2) — PRE-REGISTERED
+
+| setting | our baseline | paper | **operational bar** |
+|---|---|---|---|
+| open-loop | 75.33 ± 6.11 (74, 82, 70) | 77.33 ± 6.18 | **79.33** (+4.0) |
+| MPC | 82.00 ± 2.00 (82, 80, 84) | 85.33 ± 4.99 | **87.00** (+5.0) |
+
+**Both settings must clear their bar.** Mean over the **3 data-sampling seeds 100 / 200 / 300** at
+**`n_evals=50`**, evaluated by `ccr_acceptance_gate.py`. **Per-seed values are reported alongside the
+mean, never a mean in isolation.**
+
+Protocol invariants, unchanged from the paper: encoder lr `1e-5`, **2 epochs** on PushT, batch 32,
+`num_hist=3`, `num_pred=1`, `frameskip=5`, bf16, `stop_grad=True`, **`λ = 0.1` in every ACS arm**,
+CCR off (`lambda_cf=0`, `ccr_rho=0`). Open-loop: GD planner, `objective.mode=last`, `alpha=1`,
+`max_iter=1`, `n_taken_actions=25`. MPC: GD planner, `objective.mode=staged`, `alpha=1`,
+`max_iter=20`, `n_taken_actions=5`. Sub-planner: horizon 25, lr 0.1, `sample_type=zero`,
+`action_noise=0`, `opt_steps=100`. **PushT runs before any other environment**, and if another
+environment is attempted the claim there is **open-loop only** (paper MPC is 100.00 Wall / 100.00
+UMaze / 98.67 Medium — a +5 MPC margin is arithmetically impossible).
+
+**Limit of this bar, stated with it:** **+4 open-loop on a 3-seed mean is roughly 1.3 standard
+errors**, even with exact pairing, and the single-checkpoint per-seed spread of **74 / 82 / 70** is the
+noise reality it lives in. A positive result at this bar is real but **thin**, and would need the
+per-seed values and the paired per-episode vectors reported alongside it.
+
+---
+
+## 7. Recorded limitations — consolidated, each already stated next to its conclusion
+
+Requirement 3.9 requires every limitation to appear in the same paragraph as the conclusion it limits,
+so each of these is stated **inline** above as well. This section is the index, not the only place they
+appear.
+
+| # | limitation | the conclusion it limits | stated inline at |
+|---|---|---|---|
+| L1 | **`n = 4`, no independent replicates.** Can refute the mechanism, cannot establish it | the Stage-0 rule A verdict | §4.5(1) |
+| L2 | **Differently-typed action variables** across the four environments: PushT relative pusher displacements, PointMaze forces / velocity commands on a point mass, Wall dot velocities. `cos(a_t, a_{t+1})` is not the same physical quantity across the four correlated points. *Structural, not a noise problem — no amount of data fixes it* | the Stage-0 cross-environment correlation, and any mechanism claim built on it | §4.5(1), §8.5 |
+| L3 | **Confounds:** contact dynamics, a second movable object, rotational state (`block_angle` R² 0.183 vs 0.50-0.80), and 2 training epochs on PushT against 20 elsewhere. Any of these could produce the same gain ordering | a *confirmed* Stage-0 ordering | §4.5(2) |
+| L4 | **A GO is permission to spend 0.8 GPU-h, not evidence for the mechanism.** The Stage-0 result is used asymmetrically on purpose | the Stage-0 GO verdict | §4.5 (closing) |
+| L5 | **`frameskip=5` may wash out within-step reversals.** The gate sees only the net displacement over 5 env steps; a within-step reversal has a small-norm sum whose direction is set by whichever half was larger | the premise itself, and rule A — hence the `raw`/`first` cross-measurement and the pre-declared MIDDLE downgrade | §4.5(3), §4.1 |
+| L6 | **Only 2 triples per sample at `num_hist=3, num_pred=1`.** Zeroing reversing triples can leave a sample contributing one triple or none, so the *effective* number of constrained triples falls by `frac(w=0)` and the curvature gradient gets noisier over ~123,858 steps. **No early-read check measures this cost directly** — the batch-level pooling of 64 triples mitigates it, and mitigation is not measurement | any Stage-1 GO, and the cost side of the whole term | §7.1 below |
+| L7 | **The gate proxies "the *controlled object* reversed", not "the latent velocity's direction change is action-explained".** PushT actions command the pusher; the latent velocity is dominated by the whole scene including the T-block. High `cos` during a non-contact repositioning move coexists with a latent velocity that is almost pure pusher translation; low `cos` during a re-approach coexists with a static block. Those coincide often on PushT (the pusher is the only actuated object) and **are not the same statement** | the mechanism claim in *every* verdict, GO or otherwise | §7.2 below |
+| L8 | **Batch coupling.** The weighted mean normalizes across the batch, so a sample's contribution depends on the others drawn with it; when `Σ w` is small the gradient is dominated by a few triples. `acs_denom_clamped_frac` and `gate_p10` are logged and the `< 0.01` clamp rule guards the extreme, but the intermediate small-but-unclamped regime is **monitored rather than bounded** | check 1c's pass, and any attribution of a Stage-1 effect | §5.4 |
+| L9 | **Nothing controls for "PushT-specific".** A single-environment result on the one Table 1 cell with headroom in both settings is a single-environment result | any Stage-2 pass | §6, §8.5 |
+| L10 | **The last two interventions on this codebase were negative.** CCR reached a measured negative result at ~26 GPU-h; TMR was shelved before launch on evidence in the paper's own appendix. Weak evidence about the search space, and it should move the prior **down** | the probability estimate in §9 | §9 |
+
+### 7.1 L6, stated where it bites (Requirement 3.7)
+
+At `num_hist=3, num_pred=1` there are exactly **2 curvature triples per sample** and 64 per batch.
+`relu(cos)` zeroes the entire reversing half-space, so a sample can be left contributing a single
+triple, or none. The batch-level weighted mean pools 64 triples and mitigates this, but the
+**effective** number of constrained triples falls by `frac(w=0)`, and a noisier curvature gradient
+sustained over ~123,858 steps is a **real cost that none of checks 0, 1, 1b, 1c, 2a, 2b or 3 measures
+directly.** So any Stage-1 GO is a statement about the measured channels only; the variance cost is
+argued, not measured, and that asymmetry is recorded here rather than discovered later.
+
+This is also the load-bearing risk on the benefit side: **downweighting action-reversing transitions
+removes *some* straightening pressure, and straightening demonstrably works** — the paper's own
+ablation reports that *every* cosine variant beats no-straightening. ACS removes pressure from a
+subset of transitions on a theory about which subset deserves it. If that theory is wrong in detail —
+if the encoder needs uniform pressure to reach a straight solution at all, or if the reversing triples
+are where the most useful gradient lives — then ACS is simply **less straightening, and less
+straightening is worse.** The reallocation partially offsets this (surviving triples get *more*
+pressure than baseline, not the same), but reallocation is not replacement, and there is no argument
+that the reallocated pressure is as useful as what was removed.
+
+### 7.2 L7, stated where it bites (Requirement 3.8)
+
+The gate is `relu(cos(a_t, a_{t+1}))` on the **net commanded pusher displacement**. What the
+hypothesis is about is whether the *latent velocity's* direction change is explained by the action.
+Those are different statements, and the gate implements the first. On PushT they coincide often enough
+for the mechanism story to be plausible — the pusher is the only actuated object — and "often enough
+to be plausible" is the exact strength of the claim, in every verdict. A Stage-1 or Stage-2 pass
+therefore supports "gating on controlled-object reversal helps", **not** "the latent velocity's
+direction change is action-explained".
+
+---
+
+## 8. Novelty positioning — WRITTEN 2026-08-08, BEFORE ANY OUTCOME
+
+Dated so that a win shows the prior art was **disclosed in advance** rather than found by a reviewer,
+and written against our own interest where the evidence goes that way. Everything below is a
+paraphrase with an inline link; no source is quoted at length.
+
+### 8.1 The target paper
+
+*Temporal Straightening for Latent Planning* — [arXiv 2603.12231](https://arxiv.org/abs/2603.12231),
+an **[accepted ICML 2026 poster](https://icml.cc/virtual/2026/poster/64904)** (NYU / Brown / Toronto,
+**Yann LeCun a coauthor**). This is the paper ACS modifies, and its acceptance status is recorded here
+so nobody later treats it as a preprint of unknown standing. Its cell we target is the one **it
+reports as its weakest straightening gain** (PushT, +7.33 OL).
+
+### 8.2 Iso-FM — the closest prior art, and it lands on the *sibling*, not on ACS
+
+[**Iso-FM**](https://arxiv.org/abs/2604.04491) (ICML 2026) publishes the mathematical object of the
+**on-hold TMR sibling spec**: penalizing acceleration / enforcing constant speed along the trajectory.
+[**OAT-FM**](https://arxiv.org/html/2509.24936) goes further and treats constant-velocity enforcement
+as an *existing baseline it improves on*. TMR's mathematical novelty was therefore limited **before it
+was ever run**, which is why TMR is on hold and ACS supersedes it.
+
+**Why ACS does not collide with it, for one structural reason:** the straightening / flow-matching
+literature is **passive**. Its regularizers are unconditional **by necessity — there is no control
+signal in the setting to condition on**. Iso-FM constrains the *speed profile* of an uncontrolled
+trajectory; ACS changes *which transitions a curvature penalty applies to*, using a signal Iso-FM's
+setting does not contain. There is no published gated form for ACS to collide with. This is recorded
+as a *structural* argument rather than a "we searched and found nothing" argument, because the latter
+is what TMR relied on and it failed.
+
+The passive line, for the record:
+[Hénaff et al. 2019](https://link.springer.com/10.1038/s41593-019-0377-4),
+[V1 straightens natural movie trajectories](https://link.springer.com/10.1038/s41467-021-25939-z),
+[AI-generated video detection via representational straightness](https://arxiv.org/abs/2507.00583),
+[LLM representational curvature](https://arxiv.org/abs/2604.23985),
+[Chirality in Action](https://arxiv.org/html/2509.08502v1) — all treat trajectory straightness as an
+**unconditional** property of a representation.
+
+### 8.3 Temporal-Distance-JEPA — shares the framing, different instrument
+
+[**Temporal-Distance-JEPA**](https://arxiv.org/abs/2607.25337) states our framing directly: JEPA-style
+planners inherit their ranking from embedding geometry (typically latent Euclidean distance), which is
+a byproduct of representation learning rather than a cost mined from logged experience. The related
+[TRM](https://arxiv.org/abs/2605.22164) and the quasimetric GCRL line do the same.
+
+**The instrument is different: they add a learned cost head; ACS adds no head, no module, no
+parameter and no buffer.** ACS changes a reduction inside an existing regularizer and touches nothing
+downstream — `plan.py`, `planning/*` and `datasets/*` are frozen by the scope guard. Shared intuition,
+different object, different failure modes. Their independent arrival at the framing is weak positive
+evidence that reviewers will recognize the framing; it is **not** evidence about the success rate.
+
+### 8.4 Action-conditioned representation learning, and the Koopman / equivariant line
+
+[CAPE](https://arxiv.org/abs/2606.07304),
+[action-conditional self-predictive RL](https://arxiv.org/html/2406.02035v1),
+[SCAR](https://arxiv.org/pdf/2605.16412) and
+[latent-action world models](https://arxiv.org/html/2512.10016) all condition representation learning
+on actions — but every one does it by **predicting or discriminating action outcomes**: the action
+enters as an *input to a predictive objective*. **None gates a geometric regularizer on the action.**
+In ACS the action enters no prediction at all; it is a **weight on a geometric penalty**, and it
+carries **no gradient**.
+
+[KEEC](https://arxiv.org/abs/2312.01544),
+[Koopman operators for interactive dynamics](https://arxiv.org/html/2306.11941v4) and
+[Koopman Dreamer](https://arxiv.org/html/2607.19719) share the intuition that the action induces a
+transformation on the latent state, but they **parameterize the dynamics**: the action selects or
+indexes a linear operator the *predictor* applies. ACS leaves the dynamics model entirely alone — no
+predictor call is added, `models/vit.py` and `models/dino.py` are frozen — and uses the action to
+modulate a **regularizer on the encoder's trajectory geometry**. A dynamics parameterization and a
+geometric regularizer are different contributions; this paragraph exists so the distinction is on
+record before a reviewer draws it.
+
+### 8.5 The defensible claim, stated conservatively — and what it does NOT include
+
+> The novelty is **conditioning a straightening prior on the control signal**, motivated by the
+> observation that the hypothesis the prior derives from was formulated for *passive observation* and
+> is applied here to an *actively controlled* agent.
+
+What that claim does **not** include:
+
+- It does **not** claim to explain the Table 1 gain ordering. The correlation is `n = 4`, across
+  environments carrying differently-typed action variables (L2), with confounds (L3), and cannot
+  establish a mechanism. Under a **MIDDLE** Stage-0 verdict the claim is downgraded further, to "the
+  gate is a useful inductive bias", and the writeup **must not** claim the explanation.
+- It does **not** claim novelty in "using actions in representation learning" — §8.4 is crowded.
+- It does **not** claim the gate function is new mathematics. `relu(cos)` is the simplest object
+  satisfying the stated requirements; the contribution is *what it weights and why*, not the weight.
+- It does **not** claim the latent velocity's direction change is action-explained — only that the
+  *controlled object* reversed (L7).
+- It does **not** generalize beyond PushT. Nothing in the plan controls for PushT-specific effects
+  (L9), and an extension to Wall / UMaze / Medium would necessarily be open-loop-only.
+
+**The bar, recorded as a difficulty statement.** We propose to beat an accepted ICML 2026 paper's own
+reported cell by **+4 OL / +5 MPC** by changing **one reduction** inside **one existing loss term**, on
+the cell the authors themselves report as their weakest straightening gain. That is hard, and nothing
+in §8 makes it easier.
+
+**Novelty and beating the number are separate axes.** If ACS clears the acceptance gate it publishes
+on the success-rate result plus the mechanism finding, whatever the related work says. If it does not,
+novelty is moot and the **Stage-0 measurements are the deliverable** (N1, N2) at zero GPU-hours. The
+literature search changed the *framing*, not the experimental plan.
+
+---
+
+## 9. Honest probability assessment — recorded before any measurement
+
+**Probability of clearing the operational bar (+4 OL *and* +5 MPC on 3-seed means): 25-35%.**
+
+**Why that number, specifically.** It is higher than the on-hold TMR arm (8-13%) and the MCA arm
+(12-18%) **for one reason, not a general feeling: ACS is the first intervention on this codebase whose
+predicted effect on the *causal channel* — prediction loss — is positive rather than negative.** Every
+prior intervention pushed that channel the wrong way and lost: CCR degraded prediction by +16.9% (8/8
+consecutive matched rows, sign test p ≈ 0.004) and success fell −2.0 OL / −8.0 MPC at matched budget;
+TMR's most likely failure mechanism was the same channel, which is why its check 1 was a *guard*. ACS's
+check 1 is a *prediction*, and a confirmed directional result there at 8k is the strongest early signal
+available in this project.
+
+**And why it is not higher.** +4 / +5 is still most of what the entire *first-order* effect delivered —
+straightening itself bought +7.33 OL / +6.66 MPC on this cell. Asking a second-order refinement for
+~60% of the first-order effect is a large ask. L10 (two consecutive negative rounds on this codebase)
+moves the prior **down**, not sideways.
+
+| bar | probability |
+|---|---|
+| **Stage 0 returns GO or MIDDLE (the premise is not refuted)** | **~55-65%** |
+| Given GO/MIDDLE, ACS *improves* prediction loss vs the matched control at 8k (check 1) | ~50% |
+| Given GO/MIDDLE, ACS clears the whole early-read gate | ~40% |
+| ACS beats our baseline on open-loop (point estimate, full run) | ~45% |
+| ACS beats our baseline on MPC (point estimate, full run) | ~40% |
+| **ACS clears +4 OL and +5 MPC** | **25-35%** |
+| ACS yields a defensible open-loop-only improvement | ~40% |
+| The Stage-0 measurements (N1, N2) are obtained regardless of outcome | ~98% |
+| The rotational-state prediction (check 2b) is confirmed | ~35% |
+
+**Why the "GO or MIDDLE" row is only ~55-65%.** Stage 0 is a genuine test and the motivating
+observation is currently an **argument, not a measurement**. PushT's control could well be smooth at
+the 5-substep aggregation level even though the task requires circling and re-approaching: the pusher
+may turn *gradually* over several latent steps rather than reversing within one (L5). That is measured
+directly, and it is why ~40% of the mass sits on a STOP.
+
+**The risk the design has closed rather than guarded:** "the relaxation could be mimicked by lowering
+λ." The weighted mean is invariant to uniform gate rescaling, so there is no λ-reduction component to
+control for, and the λ-matched control is the existing baseline at **zero** cost. The risk the design
+has **not** closed is L6/§7.1 — less straightening may simply be worse.
+
+---
+
+## 10. Placeholders — filled in as the measurements land, not before
+
+Each subsection below is empty by design. Filling one in **before** its measurement exists would
+defeat the purpose of this file.
+
+### 10.1 Stage-0 measured statistics — _NOT YET MEASURED_
+
+To be filled from `probe_outputs/acs_actions_{pusht,wall,point_maze,point_maze_medium}.json`, train
+split headline with validation as cross-check, all three reductions, `n_triples` / `n_windows` beside
+every number.
+
+| env | reduction | mean cos | median cos | `frac(cos<0)` | `frac(cos<0.5)` | `mean(w)` | `frac(w=0)` | **`R`** | `n_triples` | `n_windows` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| pusht | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| pusht | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| pusht | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| wall | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| wall | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| wall | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| point_maze (umaze) | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| point_maze (umaze) | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| point_maze (umaze) | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| point_maze_medium | sum | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| point_maze_medium | raw | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| point_maze_medium | first | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+
+- 20-bin histograms over `[-1, 1]`: _tbd (from the JSON reports; do not summarize to two moments)_
+- validation-split cross-check agreement: _tbd_
+- 32-window bitwise check of the action-only loader against `dset[idx][1]`: _tbd (task 4.2, run at 5.1)_
+- `sum` vs `raw` comparison for the Requirement 3.6 downgrade: _tbd_
+
+### 10.2 Which Stage-0 rule fired, and the exact numbers — _NOT YET READ_
+
+Written **before** anything downstream is launched (Requirement 16.4).
+
+- Rule A verdict: _tbd_ — driving numbers: _tbd_ (PushT `frac(cos<0)` = _tbd_; margin over the largest
+  of the other three = _tbd_ x; UMaze lowest? _tbd_)
+- Rule B verdict: _tbd_ — PushT `R` = _tbd_
+- Combined verdict: _tbd_
+- If **MIDDLE** on rule A: the downgraded mechanism claim, recorded at the moment the verdict was read:
+  _tbd_
+- If **MIDDLE** on rule B: the pre-declared remedy (`acs_gate=hard` or a sharpened gate) and the
+  statement that the expected effect size is small: _tbd_
+- If **STOP** on either rule: MCA_Fallback selected as the next arm, tasks 6.x **not executed**, N1 and
+  N2 written up regardless: _tbd_
+
+### 10.3 Gate verdict — _NOT YET READ_
+
+| check | threshold (from §5) | measured | verdict |
+|---|---|---|---|
+| 0 — step rate | `it_per_s >= 2.72` (ref 2.862) | _tbd_ | _tbd_ |
+| 1 — prediction (INVERTED) | GO `<= 0.013196` + 15/20; STRONG GO `<= 0.012536`; STOP `> 0.014516` or 15/20 worse | _tbd_ | _tbd_ |
+| 1b — curvature share | `[65%, 80%]`, control 73.741% | _tbd_ @200, _tbd_ @8000 | _tbd_ |
+| 1b — prediction share | `>= 11.75%` | _tbd_ | _tbd_ |
+| 1b — collapse check | no term below threshold in first 1,000 iters | _tbd_ | _tbd_ |
+| 1b — `curvature_loss_unweighted` vs control @200 | `rtol = 0.05` | _tbd_ | _tbd_ |
+| 1c — `acs_gate_tv` | `>= 0.08` **and** within 1.5x of Stage-0 `R` | _tbd_ | _tbd_ |
+| 1c — `acs_denom_clamped_frac` | `< 0.01` | _tbd_ | _tbd_ |
+| 1c — gate distribution | `gate_mean`, `p10/p50/p90`, `zero_frac` vs Stage 0 | _tbd_ | _tbd_ |
+| 2a — `w = 0` bucket | arm curvature **higher** than control (held-out, n=192) | _tbd_ | _tbd_ |
+| 2a — `w >= 0.5` bucket | arm curvature **equal or lower** than control | _tbd_ | _tbd_ |
+| 2b — `block_angle` R² | must not degrade beyond noise (n=192) | _tbd_ | _tbd_ |
+| 3 — matched-budget eval | catastrophe detector only, `±10` (control 16.0 OL / 18.0 MPC) | _tbd_ | _tbd_ |
+
+Also to be recorded here: the curvature-share **drift** across multiple iterations rather than a single
+row (Requirement 16.14); whether the check-1b scale-preservation prediction held (16.7); whether the
+check-1 directional prediction on the causal channel held (16.8); and the training-time `acs_gate_tv`
+against the Stage-0 `R` estimate **including when the arm succeeds** (16.6).
+
+### 10.4 Findings N1 / N2 / N3 — _NOT YET WRITTEN_
+
+- **N1 — when does temporal straightening help? A dataset property, measured.** The per-environment
+  action-similarity distributions (all statistics of §10.1, all three reductions, train and validation)
+  set against Table 1's straightening gains **+50.00 / +10.67 / +10.67 / +7.33**. Zero GPU-hours;
+  stands whether ACS is built or not. **Must be reported with L1, L2 and L3 attached in the same
+  paragraph.** _tbd_
+- **N2 — how much of the paper's curvature penalty falls on action-reversing transitions.** `R` per
+  environment plus `frac(w = 0)`: a quantitative statement about the target paper's own objective, from
+  its own data, for zero GPU time. _tbd_
+- **N3 — does removing straightening pressure at direction changes recover rotational state?** The
+  measured direction of the `block_angle` R² change against the matched control at `--num-windows 192`.
+  A confirmation turns `PROGRESS_CCR.md` §6f from a limitation into a general statement about
+  curvature-family regularizers; a refutation bounds §6f to unconditional penalties. **Either is a
+  result.** _tbd_
+
+### 10.5 Stage-2 evaluation — _NOT YET RUN_
+
+Per-seed values, never means alone (Requirement 16.15).
+
+| setting | seed 100 | seed 200 | seed 300 | mean ± std | bar | verdict |
+|---|---|---|---|---|---|---|
+| open-loop | _tbd_ | _tbd_ | _tbd_ | _tbd_ | 79.33 | _tbd_ |
+| MPC | _tbd_ | _tbd_ | _tbd_ | _tbd_ | 87.00 | _tbd_ |
+
+---
+
+## 11. Errors made — every one, including the ones that cost only minutes
+
+CCR's convention (Requirement 16.9). An empty list here after the work is done would mean the log was
+not kept, not that no mistakes were made.
+
+| # | date | error | cost | how it was caught |
+|---|---|---|---|---|
+| — | — | _none recorded yet; this file was created before any ACS measurement_ | — | — |
+
+Inherited errors worth not repeating, carried from `PROGRESS_CCR.md`:
+
+1. **A derived constant instead of a measured one.** `rho = 0.05` was reasoned to, not measured, and
+   the probe failed against it (§5a). ACS's structural answer: Stage 0 calls the **shipped**
+   `reduce_action` and `action_gate`, so the Stage-0 `R` and the training-time `acs_gate_tv` are the
+   same quantity computed by the same code, and check 1c compares them mechanically.
+2. **A rule corrected after meeting its data.** The λ-selection rule named the wrong quantity and was
+   fixed afterwards (§6a). ACS's answer is this file, written first.
+3. **Calling loss shares "converged" off two data points.** They moved for another 120,000 steps (§4).
+   ACS records **drift**, never a single row (§10.3).
+4. **A wait loop that missed a zombie driver.** `ps -p <pid>` succeeds on a `Z` / `<defunct>` process;
+   any wait loop must check `ps -p <pid> -o stat=` for `Z`.
+
+---
+
+## 12. If ACS stops
+
+`MCA_Fallback` — `VWorldModel.compute_mca`, already written, reviewed, **never run**. No new module, no
+new parameter, `<0.1%` overhead, **0.8 GPU-h to a verdict, zero new code.** It targets an orthogonal
+gap: straightening is applied in the 128-d aggregated space while `planning/objectives.py` scores MSE
+in the 1568-d patch space, and `encoder.agg` (1568→512→512→128 MLP with a terminal LayerNorm) is
+neither an isometry nor injective. It is also **rotation-neutral**, so the §6f rotational-state
+objection does not reach it. That is the named fallback on a Stage-0 STOP or an early-read-gate STOP.
+
+Longer list: `PLAN_B_ALTERNATIVES.md`.
+
+---
+
+## 13. Implementation deviations from `design.md`
+
+Appended during implementation. Nothing above this heading is edited: the pre-registered thresholds,
+rules, limitations and the dated novelty positioning are evidence and stay as written. This section
+records only where the shipped code differs from the design's literal text, and why.
+
+### 13.1 `reduce_action` / `action_gate` take an explicit `env_action_dim` (tasks 3.1, 3.2)
+
+Design §7.1/§7.2 write `reduce_action(self, act)` and `action_gate(self, act)`. **That signature is
+not implementable.** `act` is `(b, t, f·d)` — `(b, t, 10)` at the PushT target cell — and `10` cannot
+distinguish 5 substeps × 2 dims from 2 × 5. The environment action dimension never reaches the model:
+`train.py` forwards `action_dim=action_emb_dim`, and `action_encoder.in_chans` is the already-packed
+`f·d`. Guessing `d` would return a plausibly-shaped tensor with every gate weight wrong, which is the
+F4 failure mode one level down.
+
+Shipped signatures:
+
+```python
+def reduce_action(self, act, env_action_dim=None)
+def action_gate(self, act, mask=None, env_action_dim=None)
+```
+
+Resolution order, in `_resolve_env_action_dim`: the explicit `env_action_dim` argument → an optional
+`self.acs_env_action_dim` attribute a caller sets once from the dataset → `ValueError` naming
+`act.shape[-1]` and the accepted remedy. **It never guesses.** `acs_action_reduce='raw'` needs no
+dimension and short-circuits before the resolution.
+
+Carried forward: **task 6.1 (`compute_acs`) and task 8.3 must thread the same argument**, and 8.3
+supplies the value from the dataset's own `action_dim` (`dset.dataset.action_dim`, 2 on PushT) rather
+than from a config constant. Requirement 5.15 ("resolve the substep count from `act.shape[-1]` and the
+environment action dimension of the batch rather than from a configuration constant") is satisfied by
+this threading, not weakened by it.
+
+### 13.2 `action_gate` takes the static mask, because `permuted` needs it
+
+The `permuted` null control (Requirement 13.4) shuffles `w` across the batch's **unmasked** triples,
+so it has to see the mask `_cos_curvature_terms` returns. `mask` is therefore a parameter of
+`action_gate`, read *only* by `permuted`; every other gate is elementwise and ignores it.
+`mask=None` shuffles across the whole `(b, t-2)` tensor, which is the same thing when nothing is
+masked. Masked entries keep their own values, so no dead position can absorb weight belonging to a
+live triple.
+
+### 13.3 `cos` is clamped to `[-1, 1]` before the gate dispatch
+
+`F.cosine_similarity` can return values a few ulps outside `[-1, 1]` in float32, which would put
+`relu_cos` and `affine_cos` marginally above `1` on near-parallel actions and make Requirement 5.4
+(`0 <= w <= 1` elementwise) hold only approximately. One `clamp(-1, 1)` makes it exact. This is a
+numerical guard on a mathematically-bounded quantity, not a threshold, exponent or sharpness constant,
+so Requirement 5.17 is untouched. Zero-norm handling is unchanged: `cosine_similarity`'s own `eps`
+still yields `cos = 0` (E10).
+
+### 13.4 What `permuted` preserves *exactly*, and what it preserves to an ulp
+
+Requirement 13.5 and task 9.4 ask for exact preservation of `mean(w)`, the weight distribution and
+`gate_tv`. What the implementation guarantees exactly is the **multiset of unmasked weights** — the
+permutation is a gather-shuffle-scatter over exactly the unmasked index set. Scalars *derived* from
+that multiset by a float reduction are exact only up to summation order, because reordering the same
+addends is not bitwise-neutral in float32. Measured at implementation time, 50 draws at
+`b=16, t=5` (64–80 unmasked triples):
+
+| quantity | max `|Δ|` vs `relu_cos` | exact on sorted values |
+|---|---|---|
+| multiset of `w[mask]` | 0 (bitwise) | — |
+| `mean(w[mask])` | `8.94e-08` | yes |
+| `gate_tv` | `1.19e-07` | yes |
+
+So task 9.4 must assert multiset equality on **sorted** values (bit-exact) and compare `mean(w)` /
+`gate_tv` either on sorted inputs or within a stated fp32 tolerance. This is a statement about float
+arithmetic, not a weakening of the null control: no weight is created, destroyed or rescaled, and
+Requirement 13.7's "match within batch noise" check at the telemetry level is unaffected — the
+discrepancy is ~7 orders of magnitude below batch noise.

@@ -21,13 +21,28 @@ This is the model side of the model-based tests:
   ``VWorldModel.rollout`` after the ``_rollout_latents`` extraction against
   :func:`reference_rollout`.
 
-Do **not** "improve", simplify, reformat or extend this file. Its only value is
-being a faithful frozen snapshot of the pre-feature behaviour. If the frozen
-behaviour ever needs to change, the base commit comment above must change with
-it.
+Do **not** "improve", simplify, reformat or extend the two functions frozen at
+``d73b9c6``. Their only value is being a faithful frozen snapshot of the
+pre-feature behaviour. If the frozen behaviour ever needs to change, the base
+commit comment above must change with it.
+
+Second snapshot: the pre-ACS curvature path
+-------------------------------------------
+
+The functions in the *"Curvature path frozen at ``d3c3ce5``"* section below are a
+**second, independent** frozen snapshot, taken at a later commit and covering a
+different code path. They exist because the ACS feature refactors
+``_cos_curvature`` into ``_cos_curvature_terms`` / ``_agg_velocities``, and
+Property 1 (default-off bitwise) and Property 12 (unweighted diagnostic bitwise)
+need something to compare the refactored code against. The two ``d73b9c6``
+functions above keep their names and their bodies: ``tests/test_rollout_refactor.py``
+and ``tests/test_agg_zero_bitwise.py`` read them, so this addition is purely
+additive. The same rule applies to the second snapshot: it is a copy, not a
+maintained implementation.
 """
 
 import torch
+import torch.nn.functional as F
 
 
 def reference_forward_loss(model, obs, act):
@@ -161,3 +176,108 @@ def reference_rollout(model, obs_0, act):
     z = torch.cat([z, z_new], dim=1)
     z_obses, z_acts = model.separate_emb(z)
     return z_obses, z
+
+# ---------------------------------------------------------------------------
+# Curvature path frozen at ``d3c3ce5``
+# ---------------------------------------------------------------------------
+#
+# Base commit: ``d3c3ce5`` ("Implement aggregated-space planning cost
+# (L_plan = L_spatial + w*L_agg)", full SHA
+# ``d3c3ce55120912b650970f4fb52c75f47f08b0ea``).
+#
+# The three functions below are **verbatim copies** of
+# ``VWorldModel._cos_curvature``, ``VWorldModel.total_curvature`` (both the
+# ``cos`` and the ``aggcos`` branch) and the straightening tail of
+# ``VWorldModel.forward`` in ``models/visual_world_model.py`` as they exist at
+# that commit, rewritten only so that they are standalone functions taking the
+# model as their first argument (every ``self.`` became ``model.``). Nothing
+# else was changed: the same operations, the same order, the same dtypes, the
+# same ``eps`` and ``step_thresh`` defaults, the same ``mask`` construction, the
+# same ``loss_components`` keys.
+#
+# They are frozen *before* the ACS refactor splits ``_cos_curvature`` into
+# ``_cos_curvature_terms`` / ``_agg_velocities``, so:
+#
+# - **Property 1** (the disabled path is bitwise the baseline) compares the
+#   refactored ``VWorldModel._cos_curvature`` / ``VWorldModel.total_curvature``
+#   and the ``aggcos`` forward tail against :func:`reference_cos_curvature`,
+#   :func:`reference_total_curvature` and
+#   :func:`reference_curvature_forward_tail`.
+# - **Property 12** (the unweighted diagnostic is the baseline's number) compares
+#   ``curvature_loss_unweighted`` against
+#   ``reference_total_curvature(model, model.visual_only(z), mode="aggcos")``.
+#
+# Note the one difference against the ``d73b9c6`` snapshot above:
+# :func:`reference_forward_loss` writes only
+# ``curvature_loss_used_for_training``, because ``curvature_loss_scaled`` did not
+# exist at ``d73b9c6``. :func:`reference_curvature_forward_tail` is the current
+# tail and writes **both** keys. Use the tail below, not the one embedded in
+# :func:`reference_forward_loss`, when the comparison is against present-day
+# ``loss_components``.
+#
+# Do **not** "improve", simplify or reformat these three functions either.
+
+
+def reference_cos_curvature(model, v1, v2, eps=1e-6, step_thresh=1e-6):
+    """Frozen copy of ``VWorldModel._cos_curvature`` at commit ``d3c3ce5``."""
+    cos = F.cosine_similarity(v1, v2, dim=-1, eps=eps)
+    loss = 1.0 - cos
+    if step_thresh > 0:
+        step1 = v1.norm(dim=-1)
+        step2 = v2.norm(dim=-1)
+        mask = (step1 > step_thresh) & (step2 > step_thresh)
+        loss = loss[mask]
+    return loss.mean()
+
+
+def reference_total_curvature(model, features, mode="cos"):
+    """Frozen copy of ``VWorldModel.total_curvature`` at commit ``d3c3ce5``.
+
+    Both the ``aggcos`` branch (velocities in the aggregated space produced by
+    ``encoder.agg``) and the ``cos`` branch (patch-wise velocities) are copied,
+    together with the two ``ValueError`` guards.
+    """
+    if features.shape[1] < 3:
+        raise ValueError(f"Features must have at least 3 frames for curvature calculation, got {features.shape[1]}")
+
+    if mode == "aggcos":
+        if not hasattr(model.encoder, "agg"):
+            raise ValueError("curvature mode 'aggcos' requires encoder.agg().")
+        b, t, p, d = features.shape
+        tokens = features.reshape(b * t, p, d)
+        z = model.encoder.agg(tokens).reshape(b, t, -1)
+        v1 = z[:, 1:-1] - z[:, :-2]
+        v2 = z[:, 2:] - z[:, 1:-1]
+    elif mode == "cos":
+        v1 = features[:, 1:-1] - features[:, :-2]
+        v2 = features[:, 2:] - features[:, 1:-1]
+    else:
+        raise ValueError(f"Unknown curvature mode '{mode}'. Use 'cos' or 'aggcos'.")
+
+    return reference_cos_curvature(model, v1, v2)
+
+
+def reference_curvature_forward_tail(model, z, loss, loss_components):
+    """Frozen copy of ``VWorldModel.forward``'s straightening tail at ``d3c3ce5``.
+
+    The block is ``if self.straighten and self.straighten_scale > 0:`` inside
+    ``forward``. It is reproduced verbatim, including its comment, with the
+    curvature call routed through :func:`reference_total_curvature` so that the
+    frozen tail stays independent of the ACS refactor of ``_cos_curvature``.
+
+    ``loss_components`` is mutated in place, exactly as ``forward`` mutates its
+    own dict; the updated ``loss`` is returned because ``loss`` is a value, not a
+    container.
+    """
+    if model.straighten and model.straighten_scale > 0:
+        feats = model.visual_only(z)
+        curvature_loss = reference_total_curvature(model, feats, mode=model.curvature_mode)
+        loss = loss + curvature_loss * model.straighten_scale
+        loss_components["curvature_loss_used_for_training"] = curvature_loss
+        # Telemetry only: the scaled value makes the baseline curvature term
+        # comparable against ccr_loss_scaled in loss shares. Adding a key does not
+        # change the loss.
+        loss_components["curvature_loss_scaled"] = (
+            curvature_loss * model.straighten_scale
+        )
+    return loss

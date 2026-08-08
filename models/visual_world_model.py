@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +18,21 @@ log = logging.getLogger(__name__)
 #   'logged'    -- perturb recorded normalized actions only; the training window caps L
 #   'synthetic' -- keep and perturb the recorded prefix, synthesize actions past the edge
 CCR_ACTION_SOURCES = ("logged", "synthetic")
+
+# Permitted values for `training.acs_action_reduce` -- how the `f` env actions of one
+# latent step are reduced to the single action vector the gate compares.
+#   'sum'   -- net commanded displacement over the substeps (the pre-registered default)
+#   'raw'   -- the concatenated block itself, no reduction
+#   'first' -- the first substep only
+ACS_ACTION_REDUCTIONS = ("sum", "raw", "first")
+
+# Permitted values for `training.acs_gate` -- how consecutive-action similarity becomes a
+# per-triple weight. Closed enum, not a continuous sharpness constant, so there is nothing
+# to calibrate ('permuted' is the null-control arm).
+ACS_GATES = ("relu_cos", "affine_cos", "hard", "permuted")
+
+# Accepted forms of `training.straighten`, quoted in the parser's error message.
+STRAIGHTEN_FORMS = ("False", "cos<scale>", "aggcos<scale>", "acsaggcos<scale>")
 
 
 class VWorldModel(nn.Module):
@@ -50,6 +67,8 @@ class VWorldModel(nn.Module):
         ccr_fast_attention=True,
         ccr_action_source="synthetic",
         mca_weight=0.0,
+        acs_action_reduce="sum",
+        acs_gate="relu_cos",
         **kwargs,
     ):
         super().__init__()
@@ -80,15 +99,70 @@ class VWorldModel(nn.Module):
                 f"Only encoder VCReg is supported, got vcreg_apply_to='{vcreg_apply_to}'."
             )
 
-        if isinstance(straighten, str):
-            if straighten.startswith("aggcos"):
-                suffix = straighten.replace("aggcos", "")
-                self.straighten_scale = float(suffix) if suffix else 1.0
-                self.curvature_mode = "aggcos"
+        # `training.straighten` parser. `False`, `None` and the empty string mean "off",
+        # exactly as before; every other non-empty string either selects a known mode or
+        # raises here, before the first training step.
+        #
+        # Prefix order is specificity order: 'acsaggcos' is tested before 'aggcos' and
+        # 'aggcos' before 'cos'. `"acsaggcos1e-1".startswith("aggcos")` happens to be
+        # False, so the branches cannot actually shadow one another, but the order is the
+        # one a reader has to be able to trust when a mode string is added later.
+        if isinstance(straighten, str) and straighten != "":
+            if straighten.startswith("acsaggcos"):
+                suffix = straighten.replace("acsaggcos", "", 1)
+                mode = "acsaggcos"
+            elif straighten.startswith("aggcos"):
+                suffix = straighten.replace("aggcos", "", 1)
+                mode = "aggcos"
             elif straighten.startswith("cos"):
-                suffix = straighten.replace("cos", "")
-                self.straighten_scale = float(suffix) if suffix else 1.0
-                self.curvature_mode = "cos"
+                suffix = straighten.replace("cos", "", 1)
+                mode = "cos"
+            else:
+                # Before this branch existed an unrecognized string fell straight through
+                # to `curvature_mode = None`, so a typo like 'acsagcos1e-1' trained a full
+                # run with no curvature term at all while logging "Straightening disabled"
+                # in a wall of startup lines. Raising is a bug fix on a path that was
+                # already broken: no shipped config uses an unrecognized string.
+                raise ValueError(
+                    f"training.straighten={straighten!r} matches no known curvature mode; "
+                    f"expected one of {', '.join(STRAIGHTEN_FORMS)} "
+                    f"(e.g. False, 'cos1e-1', 'aggcos1e-1', 'acsaggcos1e-1')."
+                )
+            try:
+                scale = float(suffix) if suffix else 1.0
+            except ValueError:
+                raise ValueError(
+                    f"training.straighten={straighten!r} has a non-numeric scale suffix "
+                    f"{suffix!r}; expected one of {', '.join(STRAIGHTEN_FORMS)} "
+                    f"(e.g. '{mode}1e-1')."
+                ) from None
+            # `float()` accepts 'nan', 'inf' and '-inf', so this check has to come *before*
+            # the sign check: `nan <= 0` is False, so a non-finite scale slips past it and
+            # then `self.straighten = ... and self.straighten_scale > 0` evaluates
+            # `nan > 0` as False. That reproduces F4 exactly -- `curvature_mode ==
+            # "cos"` while the run logs "Straightening disabled" and trains with no
+            # curvature term -- which is the hole the `else: raise` above was added to
+            # close. `cosinf` is the other half: it parses, enables the term, and makes
+            # the loss infinite on the first step.
+            if not math.isfinite(scale):
+                raise ValueError(
+                    f"training.straighten={straighten!r} parses to a non-finite curvature "
+                    f"scale of {scale} (float() accepts 'nan', 'inf' and '-inf'); a "
+                    "non-finite scale either silently disables the term while naming a "
+                    "curvature mode or makes the loss non-finite. Use "
+                    "training.straighten=False to disable straightening, or one of "
+                    f"{', '.join(STRAIGHTEN_FORMS)} with a finite positive scale "
+                    f"(e.g. '{mode}1e-1')."
+                )
+            if scale <= 0:
+                raise ValueError(
+                    f"training.straighten={straighten!r} parses to a curvature scale of "
+                    f"{scale}, which disables the term while naming it; use "
+                    "training.straighten=False to disable straightening, or a positive "
+                    f"scale (e.g. '{mode}1e-1')."
+                )
+            self.straighten_scale = scale
+            self.curvature_mode = mode
 
         self.straighten = self.curvature_mode is not None and self.straighten_scale > 0
 
@@ -127,6 +201,17 @@ class VWorldModel(nn.Module):
         )
         self.mca_weight = float(0.0 if mca_weight is None else mca_weight)
 
+        # --- Action-Conditioned Straightening (selected by straighten=acsaggcos<scale>) ---
+        # Plain Python strings, for the same reason as the CCR knobs above: no module, no
+        # parameter, no buffer may be created here. Both are closed enums with
+        # pre-registered defaults rather than continuous constants, so there is nothing to
+        # calibrate. train.py forwards them with `self.cfg.training.get(key)`, so an absent
+        # yaml key arrives as None and means "use the default".
+        self.acs_action_reduce = str(
+            "sum" if acs_action_reduce is None else acs_action_reduce
+        )
+        self.acs_gate = str("relu_cos" if acs_gate is None else acs_gate)
+
         for _name, _value in (
             ("lambda_cf", self.lambda_cf),
             ("ccr_rho", self.ccr_rho),
@@ -141,6 +226,20 @@ class VWorldModel(nn.Module):
             raise ValueError(
                 f"training.ccr_action_source must be one of {CCR_ACTION_SOURCES}, "
                 f"got {self.ccr_action_source!r}."
+            )
+        # Same precedent, same reason, and deliberately unconditional: these are validated
+        # even on a plain `aggcos1e-1` baseline run, so a typo in a knob this run does not
+        # read cannot survive until the run that enables it. String comparisons only, so
+        # the off path gains no tensor work.
+        if self.acs_action_reduce not in ACS_ACTION_REDUCTIONS:
+            raise ValueError(
+                f"training.acs_action_reduce must be one of {ACS_ACTION_REDUCTIONS}, "
+                f"got {self.acs_action_reduce!r}."
+            )
+        if self.acs_gate not in ACS_GATES:
+            raise ValueError(
+                f"training.acs_gate must be one of {ACS_GATES}, "
+                f"got {self.acs_gate!r}."
             )
         # L + 2 is the curvature window, and total_curvature needs at least 3 frames.
         if self.ccr_rollout_len < 1:
@@ -173,6 +272,12 @@ class VWorldModel(nn.Module):
             )
         else:
             log.info("Straightening disabled")
+        if self.curvature_mode == "acsaggcos":
+            log.info(
+                "ACS gate config: action_reduce=%s, gate=%s",
+                self.acs_action_reduce,
+                self.acs_gate,
+            )
         log.info("Stop-grad enabled: %s", self.stop_grad)
         log.info(
             "VCReg enabled: %s, apply_to=enc, std_coeff=%s, cov_coeff=%s",
@@ -404,28 +509,60 @@ class VWorldModel(nn.Module):
         assert n == m
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
-    def _cos_curvature(self, v1, v2, eps=1e-6, step_thresh=1e-6):
+    def _agg_velocities(self, features):
+        """Consecutive latent velocities in the paper's aggregated space.
+
+        `features` is `(b, t, p, d)` -- what `visual_only(z)` returns. The patch
+        tokens of every frame are pooled by `encoder.agg` into the aggregated
+        space, and the two consecutive velocity fields are differenced out of it.
+        Returns `(v1, v2)`, each `(b, t - 2, agg_dim)`.
+
+        This is the *single* implementation of the aggregated velocities: both
+        `total_curvature(mode="aggcos")` and the action-conditioned term read it,
+        so the two cannot drift apart. The operations, their order and their
+        dtypes are the pre-refactor `aggcos` branch's, verbatim, which is what
+        keeps the baseline path bitwise identical.
+        """
+        if not hasattr(self.encoder, "agg"):
+            raise ValueError("curvature mode 'aggcos' requires encoder.agg().")
+        b, t, p, d = features.shape
+        tokens = features.reshape(b * t, p, d)
+        z = self.encoder.agg(tokens).reshape(b, t, -1)
+        v1 = z[:, 1:-1] - z[:, :-2]
+        v2 = z[:, 2:] - z[:, 1:-1]
+        return v1, v2
+
+    def _cos_curvature_terms(self, v1, v2, eps=1e-6, step_thresh=1e-6):
+        """Per-triple curvature `1 - cos(v1, v2)` and the static-velocity mask.
+
+        Returns `(loss, mask)`, both `(b, t - 2)`. `loss[mask].mean()` is exactly
+        the pre-refactor `_cos_curvature` return value, which is why the split is
+        bitwise neutral; a gated term forms a weighted mean over the same two
+        tensors instead of averaging them uniformly.
+
+        `step_thresh <= 0` disables the mask, and the all-true mask returned in
+        that case reproduces the old unmasked `loss.mean()`.
+        """
         cos = F.cosine_similarity(v1, v2, dim=-1, eps=eps)
         loss = 1.0 - cos
         if step_thresh > 0:
             step1 = v1.norm(dim=-1)
             step2 = v2.norm(dim=-1)
             mask = (step1 > step_thresh) & (step2 > step_thresh)
-            loss = loss[mask]
-        return loss.mean()
+        else:
+            mask = torch.ones_like(loss, dtype=torch.bool)
+        return loss, mask
+
+    def _cos_curvature(self, v1, v2, eps=1e-6, step_thresh=1e-6):
+        loss, mask = self._cos_curvature_terms(v1, v2, eps=eps, step_thresh=step_thresh)
+        return loss[mask].mean()
 
     def total_curvature(self, features, mode="cos"):
         if features.shape[1] < 3:
             raise ValueError(f"Features must have at least 3 frames for curvature calculation, got {features.shape[1]}")
 
         if mode == "aggcos":
-            if not hasattr(self.encoder, "agg"):
-                raise ValueError("curvature mode 'aggcos' requires encoder.agg().")
-            b, t, p, d = features.shape
-            tokens = features.reshape(b * t, p, d)
-            z = self.encoder.agg(tokens).reshape(b, t, -1)
-            v1 = z[:, 1:-1] - z[:, :-2]
-            v2 = z[:, 2:] - z[:, 1:-1]
+            v1, v2 = self._agg_velocities(features)
         elif mode == "cos":
             v1 = features[:, 1:-1] - features[:, :-2]
             v2 = features[:, 2:] - features[:, 1:-1]
@@ -433,6 +570,221 @@ class VWorldModel(nn.Module):
             raise ValueError(f"Unknown curvature mode '{mode}'. Use 'cos' or 'aggcos'.")
 
         return self._cos_curvature(v1, v2)
+
+    def _resolve_env_action_dim(self, act, env_action_dim=None):
+        """The environment action dimension `d` for *this* batch, and the substep count.
+
+        `act` is `(b, t, f * d)`: `datasets/traj_dset.py` packs the `f = frameskip`
+        env actions of one latent step with `rearrange(act, "(n f) d -> n (f d)")`,
+        so `act.shape[-1]` alone cannot tell `f * d` apart from `d * f`. `d` is a
+        protocol value of the batch (`dset.dataset.action_dim`, 2 on PushT), so it
+        is supplied by the caller -- explicitly, or through the optional
+        `acs_env_action_dim` attribute a caller may set once from the dataset --
+        and **never** read from a config constant. Guessing it would corrupt every
+        gate value while still returning a plausibly-shaped tensor.
+
+        Returns `(f, d)`.
+        """
+        if env_action_dim is None:
+            env_action_dim = getattr(self, "acs_env_action_dim", None)
+        if env_action_dim is None:
+            raise ValueError(
+                "reduce_action needs the environment action dimension to split "
+                f"act.shape[-1]={act.shape[-1]} into substeps for "
+                f"acs_action_reduce={self.acs_action_reduce!r}; pass "
+                "env_action_dim=<dset.dataset.action_dim> (2 on PushT). It is a "
+                "protocol value of the batch and must not be inferred from a config "
+                "constant."
+            )
+        d = int(env_action_dim)
+        total = int(act.shape[-1])
+        if d <= 0:
+            raise ValueError(
+                f"env_action_dim must be positive, got {d} (act.shape[-1]={total})."
+            )
+        if total % d != 0:
+            # E5. Reshaping silently here would mix dimension j of one substep with
+            # dimension j+1 of the next, so every cos(a_t, a_{t+1}) -- and therefore
+            # every gate weight -- would be wrong while nothing looked wrong.
+            raise ValueError(
+                f"act.shape[-1]={total} is not divisible by the environment action "
+                f"dim {d}, so the {total} channels do not split into whole substeps "
+                f"for acs_action_reduce={self.acs_action_reduce!r}; this is a "
+                "frameskip / action_dim mismatch between the batch and the caller."
+            )
+        return total // d, d
+
+    def reduce_action(self, act, env_action_dim=None):
+        """Reduce each latent step's `f` env actions to the one vector the gate compares.
+
+        `act` is `(b, t, f * d)` with channel `s * d + j` holding dimension `j` of
+        substep `s` (`traj_dset.py`'s `rearrange("(n f) d -> n (f d)")`, F1), so
+        `act[:, t]` is exactly the control that produces `v_t = z_{t+1} - z_t`.
+
+        Per `self.acs_action_reduce`:
+
+        - ``'sum'``   -> `(b, t, d)`, `out[..., j] = sum_s act[..., s * d + j]`: the
+          net commanded displacement over the latent step, which is the action
+          variable whose direction change the gate is a hypothesis about. A new
+          tensor.
+        - ``'first'`` -> `act[..., :d]`, the first substep only. A **view** of `act`,
+          as `visual_only` also returns; the gate only reads it.
+        - ``'raw'``   -> `act` **itself**, an identity. Documented, so no caller
+          assumes a copy or a fresh tensor to write into.
+
+        Neither ``'sum'`` nor ``'first'`` mutates `act`.
+
+        `mean` is deliberately not offered: `mean = sum / f` is a single positive
+        scalar applied to both vectors of the cosine and `cos(alpha u, alpha v) ==
+        cos(u, v)` for `alpha > 0`, so it is the *same gate* as ``'sum'`` (P5).
+
+        `env_action_dim` resolves the substep count together with `act.shape[-1]`;
+        a non-divisible pair raises rather than reshaping silently (E5).
+        """
+        if self.acs_action_reduce == "raw":
+            # Identity on purpose: the 10-d profile cosine is a different (measured
+            # at Stage 0, not selected) question, and returning `act` keeps that
+            # arm free of a copy.
+            return act
+        f, d = self._resolve_env_action_dim(act, env_action_dim)
+        if self.acs_action_reduce == "first":
+            return act[..., :d]
+        if self.acs_action_reduce == "sum":
+            # unflatten gives a view; sum allocates the (b, t, d) result, so `act`
+            # is untouched. f == 1 degenerates to a copy of `act`, which is correct.
+            return act.unflatten(-1, (f, d)).sum(dim=-2)
+        # Unreachable: __init__ validates the enum eagerly against
+        # ACS_ACTION_REDUCTIONS. Kept so a future enum member cannot fall through
+        # to a silently wrong reduction -- the F4 failure mode, one level down.
+        raise ValueError(
+            f"acs_action_reduce must be one of {ACS_ACTION_REDUCTIONS}, "
+            f"got {self.acs_action_reduce!r}."
+        )
+
+    def _permute_gate(self, w, mask=None):
+        """Permute `w` across the batch's unmasked triples ('permuted' null control).
+
+        The attribution arm (Requirement 13.4) needs a gate that keeps *everything*
+        about the weight population and destroys *only* which triple each weight
+        lands on. So the unmasked entries are gathered, shuffled among themselves
+        and scattered back; masked entries keep their own values, because they are
+        dropped by the same mask before the weighted mean and their positions must
+        not absorb weight that belongs to a live triple.
+
+        Consequences, which are what make the arm interpretable and are themselves
+        a check on it (Requirement 13.5): the multiset of unmasked weights is
+        preserved *exactly*, hence so are `mean(w)`, the quantiles and `gate_tv` --
+        up to the float summation order of the scalars derived from them, which
+        reordering the same addends can move by an ulp. Compare sorted values, not
+        reduction outputs, when the assertion has to be bit-exact.
+
+        `mask is None` permutes across the whole `(b, t - 2)` tensor, which is the
+        same thing when nothing is masked.
+        """
+        if mask is not None and tuple(mask.shape) != tuple(w.shape):
+            raise ValueError(
+                f"action_gate mask shape {tuple(mask.shape)} must match the gate "
+                f"shape {tuple(w.shape)} elementwise; the permuted arm shuffles "
+                "weights across exactly the unmasked triples the weighted mean "
+                "sums over."
+            )
+        flat = w.reshape(-1)
+        if mask is None:
+            index = torch.arange(flat.numel(), device=flat.device)
+        else:
+            index = mask.reshape(-1).nonzero(as_tuple=True)[0]
+        out = flat.clone()
+        if index.numel() > 1:
+            perm = torch.randperm(int(index.numel()), device=flat.device)
+            out[index] = flat[index][perm]
+        return out.reshape(w.shape)
+
+    def action_gate(self, act, mask=None, env_action_dim=None):
+        """Per-triple action-similarity weights `w`, shape `(b, t - 2)`, in `[0, 1]`.
+
+        `w[b, k]` gates the curvature triple `(z_k, z_{k+1}, z_{k+2})` by how
+        similar the two controls that produced its velocities are:
+
+            a     = reduce_action(act)                       # (b, t, d)
+            cos_a = cosine_similarity(a[:, :-2], a[:, 1:-1]) # (b, t - 2)
+            w     = gate_fn(cos_a)
+
+        Dispatch on `self.acs_gate`, a closed four-member enum validated eagerly in
+        `__init__`:
+
+        - ``'relu_cos'``   -> `relu(cos)`. The pre-registered default: the whole
+          action-reversing half-space gets exactly zero pressure, and the surviving
+          mass stays graded.
+        - ``'affine_cos'`` -> `(1 + cos) / 2`. The softer fallback; note it gives
+          `0.5` at orthogonality and reaches `0` only at exact antiparallelism.
+        - ``'hard'``       -> `1[cos > 0]`. Same support as `relu_cos`, grading
+          thrown away.
+        - ``'permuted'``   -> `relu(cos)` shuffled across the batch's unmasked
+          triples (Requirement 13.4). The null control: same weight multiset, same
+          `mean(w)`, same `gate_tv`, no correspondence to the triple it gates.
+
+        `mask` is the static-velocity mask from `_cos_curvature_terms`, `(b, t - 2)`
+        bool. It is read *only* by ``'permuted'``, to shuffle over the same set the
+        weighted mean reduces over; every other gate is elementwise and ignores it.
+
+        Two contracts the term's attributability rests on (design 4.2):
+
+        1. `w` is computed from the **raw `act` tensor of the batch**, never from
+           `self.action_encoder(act)`. `act` is data, so nothing the encoder can
+           learn moves `w`; an encoded-action gate would let the trained
+           `action_encoder` drive `w -> 0` on hard triples and lower total
+           straightening pressure without improving any geometry -- the
+           λ-reduction confound back again, adaptive and invisible.
+        2. `w` is `.detach()`ed anyway, as an executable contract:
+           `w.requires_grad is False` and `w.grad_fn is None` (P4). The only
+           descent direction `L_acs` offers is the trajectory geometry.
+
+        `cos` is clamped to `[-1, 1]` before the gate, so `0 <= w <= 1` holds
+        elementwise (Requirement 5.4) rather than up to `cosine_similarity`'s
+        float32 slop. No threshold, exponent or sharpness constant is introduced
+        (Requirement 5.17).
+
+        A zero-norm reduced action block -- a latent step commanding no net motion
+        -- falls out as `w = 0` for `relu_cos` and `hard` through
+        `cosine_similarity`'s own `eps`, which floors the norms and returns `0`
+        instead of dividing by zero. No raise (E10); it is the same semantics as
+        `step_thresh` masking near-static *latent* steps. (`affine_cos` maps that
+        same `cos = 0` to `0.5` by its own definition; special-casing it would be
+        the threshold constant Requirement 5.17 forbids.)
+
+        `env_action_dim` is threaded to `reduce_action`, which needs it to split
+        `act.shape[-1] = f * d` into substeps and refuses to guess.
+        """
+        t = int(act.shape[1])
+        if t < 3:
+            # E6, and the same requirement total_curvature states for `z`: a
+            # curvature triple spans 3 frames, so it needs 3 action blocks.
+            raise ValueError(
+                f"action_gate needs at least 3 frames to form a curvature triple, "
+                f"got act.shape[1]={t}."
+            )
+        a = self.reduce_action(act, env_action_dim=env_action_dim)
+        # eps left at cosine_similarity's default on purpose: it is what turns a
+        # zero-norm action block into cos = 0 rather than a division by zero (E10).
+        cos_a = F.cosine_similarity(a[:, :-2], a[:, 1:-1], dim=-1)
+        cos_a = cos_a.clamp(-1.0, 1.0)
+        gate = self.acs_gate
+        if gate in ("relu_cos", "permuted"):
+            w = F.relu(cos_a)
+        elif gate == "affine_cos":
+            w = (1.0 + cos_a) * 0.5
+        elif gate == "hard":
+            w = (cos_a > 0).to(cos_a.dtype)
+        else:
+            # Unreachable: __init__ validates against ACS_GATES eagerly. Kept so a
+            # future enum member cannot fall through to a silently wrong gate.
+            raise ValueError(
+                f"acs_gate must be one of {ACS_GATES}, got {self.acs_gate!r}."
+            )
+        w = w.detach()
+        if gate == "permuted":
+            w = self._permute_gate(w, mask)
+        return w
 
     def forward(self, obs, act):
         """
