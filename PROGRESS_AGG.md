@@ -300,3 +300,54 @@ noted that (b) would by itself explain the paper's open-loop collapse.
 
 Suite after 11.3b: **383 passed, 12 skipped, 3 failed** (the 3 are the pre-existing CUDA-only SDPA equivalence
 cases). `tests/test_agg_long_horizon_attention.py`: 14 passed.
+
+### 7.4 The scope was defeated by an inner scope — error 3, and a prediction of mine that was wrong
+
+**The run OOM'd again, and the "not verified" clause above did not explain it.** Recorded plainly because the
+clause was a pre-registered diagnosis and it was the wrong one.
+
+The second attempt printed `[plan_agg] attention implementation: sdpa (long horizon, goal_H=50)`,
+`protocol_ok=True`, `horizon=long`, wrote its manifest, and then died in **13 seconds** at
+`models/vit.py:100` — `dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale`, which is the **`else`**
+branch. So `Attention.use_sdpa` was `False` at the predictor call. Not a backend fallback: the fast branch was
+never entered at all.
+
+**Cause.** `VWorldModel._predict_maybe_checkpointed` wraps every `predict` in
+`with sdpa_attention(fast_attention)`, and `_rollout_latents` defaulted `fast_attention=False`. So each of the
+ten predictor calls opened an **inner** scope that set the switch to an absolute `False`, overriding the outer
+scope `plan_agg.attention_scope` had just opened. The general shape: *a context manager that sets an absolute
+value cannot be nested by a caller that only wants to opt in.* The inner scope was written for a good reason —
+the CCR docstring explains it must sit inside the checkpointed callable, because a checkpointed segment is
+recomputed in backward long after an enclosing `with` has exited — and that reason is untouched by the fix.
+
+**Fix.** `VWorldModel.resolve_fast_attention`: `fast_attention=None` now means **inherit** the ambient
+`Attention.use_sdpa`, and it is the default for `_predict_maybe_checkpointed` and `_rollout_latents`. The
+ambient value is read at *forward* time and passed on as an explicit bool, so the forward/backward pinning the
+CCR docstring depends on still holds. `compute_ccr` is the only caller that passes an explicit value
+(`fast_attention=self.ccr_fast_attention`) and is unaffected; the class switch still ships `False`, so
+`rollout`, `plan.py`, `planning/*` and `Trainer.openloop_rollout` take the materialised path exactly as before.
+`models/visual_world_model.py` was already an allowlist member, so the Scope_Guard needs no new entry, and
+`models/vit.py`, `plan.py`, `planning/` and `datasets/` are still untouched.
+
+**Why the 11.3b tests did not catch it.** They pinned the gating — short stays `materialized`, long enters the
+scope, the scope restores on exception, the manifest records the choice — and every one of those statements was
+true. None of them pinned the **composition**: that the switch the scope sets is the switch the predictor
+*reads*. The 14 tests tested my half of the mechanism and stopped at the seam. Now closed by six more, the
+load-bearing ones being `test_predict_observes_the_ambient_switch_when_not_asked` (drives the real
+`_predict_maybe_checkpointed` against a `predict` spy and asserts the observed branch equals the ambient one)
+and `test_checkpointed_recomputation_is_pinned_to_the_forward_branch` (asserts the backward recomputation runs
+on the branch the forward took, after the scope has exited). The spy's `predict` returns `h * h` over an
+intermediate on purpose: with `z * 1` nothing inside the segment is saved, no recomputation runs, and the test
+would have passed vacuously.
+
+| # | date | error | cost | how it was caught |
+|---|---|---|---|---|
+| 3 | 2026-08-08 | **An inner `sdpa_attention(False)` scope silently overrode the outer one**, so the long-horizon deviation had no effect and the run OOM'd in the materialised branch anyway. My §7.3 "a repeat OOM is a `math`-backend fallback" prediction was **wrong** — the traceback line number (`vit.py:100`, the `else` branch) is what ruled it out immediately | 13 s, ~0.004 GPU-h | The second task-11.4 launch. **Why 11.3b's own tests missed it:** they covered the gating end of the mechanism and never that the flag the scope writes is the flag the predictor reads. Fixed with `resolve_fast_attention` and six composition tests |
+
+Suite after the fix: **389 passed, 12 skipped, 3 failed** (the same pre-existing CUDA-only cases).
+`tests/test_agg_long_horizon_attention.py`: 20 passed.
+
+**The §7.2 arithmetic is still unconfirmed.** It predicted ~50 GB against a 45312 MiB slice on the materialised
+path, and both OOMs are consistent with it, but no run has yet demonstrated that removing the score matrices is
+sufficient — because no run has yet actually removed them. The next launch is the first real test of both the
+estimate and the fix, and the §7.3 backend-fallback clause remains live and unverified rather than refuted.

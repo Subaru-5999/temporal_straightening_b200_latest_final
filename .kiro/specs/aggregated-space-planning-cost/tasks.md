@@ -556,6 +556,31 @@ Task labels:
       scope restores it **including on exception**, that both settings' manifests record the implementation and
       its reason, and that the reason text carries the unverified backend risk and the reading-(b) fallback.
       Suite: **383 passed, 12 skipped, 3 failed** — the 3 are the pre-existing CUDA-only SDPA equivalence cases
+    - **Gating alone was not sufficient: the outer scope was defeated by an inner one**
+      (`PROGRESS_AGG.md` §7.4). The first launch after this task printed
+      `attention implementation: sdpa` and then OOM'd in **13 s** at `models/vit.py:100`, the **materialised**
+      `else` branch. `_predict_maybe_checkpointed` wraps every `predict` in
+      `with sdpa_attention(fast_attention)` and `_rollout_latents` defaulted `fast_attention=False`, so ten
+      inner scopes set the switch to an absolute `False` and overrode the outer one. A context manager that
+      sets an absolute value cannot be nested by a caller that only wants to opt in
+    - **Fixed with `VWorldModel.resolve_fast_attention`:** `fast_attention=None` means **inherit** the ambient
+      `Attention.use_sdpa` and is now the default for `_predict_maybe_checkpointed` and `_rollout_latents`. The
+      ambient value is read at *forward* time and passed on as an explicit bool, so the forward/backward
+      pinning the CCR docstring depends on still holds — a checkpointed segment is recomputed in backward, long
+      after any enclosing `with` has exited. `compute_ccr` is the only caller that passes an explicit value and
+      is unaffected; the class switch still ships `False`, so `rollout`, `plan.py`, `planning/*` and
+      `Trainer.openloop_rollout` take the materialised path exactly as before.
+      `models/visual_world_model.py` is already an allowlist member, so the Scope_Guard needs no new entry and
+      `models/vit.py`, `plan.py`, `planning/` and `datasets/` stay untouched
+    - **Six more tests pin the composition — the seam the first fourteen stopped at.** They covered the gating
+      and never that the switch the scope *writes* is the switch the predictor *reads*, which is precisely
+      where the bug was. Added: `resolve_fast_attention` inherits when asked and forces when given a bool; the
+      real `_predict_maybe_checkpointed`, driven against a `predict` spy, observes the ambient branch; an
+      explicit `False` still forces the materialised branch; and a checkpointed segment's backward
+      recomputation runs on the branch the **forward** took, after the scope has exited. The spy returns
+      `h * h` over an intermediate deliberately — with `z * 1` nothing inside the segment is saved, no
+      recomputation runs, and that last test would pass vacuously. **20 passed**; suite **389 passed, 12
+      skipped, 3 failed**
     - _Requirements: 8.6, 9.2, 11.7_
 
   - [ ] 11.4 [GPU RUN] Positive_Control: reproduce the paper's long-horizon combined-cost gain

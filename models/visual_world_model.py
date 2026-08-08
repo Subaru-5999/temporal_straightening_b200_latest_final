@@ -10,7 +10,7 @@ import logging
 from torchvision import transforms
 from einops import rearrange, repeat
 
-from models.vit import sdpa_attention
+from models.vit import Attention, sdpa_attention
 
 log = logging.getLogger(__name__)
 
@@ -919,7 +919,37 @@ class VWorldModel(nn.Module):
         return z
 
 
-    def _predict_maybe_checkpointed(self, z, checkpoint, fast_attention=False):
+    @staticmethod
+    def resolve_fast_attention(fast_attention):
+        """Resolve the ``fast_attention`` argument to the bool the scope is entered with.
+
+        Three values, and the third is the one this function exists for:
+
+        * ``True`` / ``False`` -- force that branch, whatever the ambient class switch is.
+          Every caller inside this file passes an explicit bool, so nothing here changes.
+        * ``None`` -- **inherit** the ambient ``Attention.use_sdpa``, i.e. respect an
+          enclosing ``sdpa_attention`` scope opened by a caller outside this file.
+
+        Why ``None`` had to exist (aggregated-space feature, task 11.3b).  Before it,
+        ``_rollout_latents`` defaulted ``fast_attention=False`` and ``_run`` entered
+        ``sdpa_attention(False)`` unconditionally, so an **inner** scope forced the switch
+        off and silently defeated any outer one.  ``plan_agg.attention_scope`` opened an
+        outer scope for the long-horizon planning run, reported ``sdpa``, and then OOM'd in
+        the materialised branch at ``models/vit.py:100`` -- the switch was never on where it
+        mattered.  Defaulting to ``None`` makes "nobody asked for a branch" mean "leave the
+        ambient value alone" instead of "force the slow one".
+
+        The ambient value is read **here**, at forward time, and passed on as an explicit
+        bool rather than left for the scope to look up later.  That keeps the invariant
+        ``_predict_maybe_checkpointed``'s docstring depends on: a checkpointed segment is
+        recomputed during backward, long after any enclosing ``with`` has exited, so the
+        recomputation must be pinned to the branch the forward actually took.
+        """
+        if fast_attention is None:
+            return bool(Attention.use_sdpa)
+        return bool(fast_attention)
+
+    def _predict_maybe_checkpointed(self, z, checkpoint, fast_attention=None):
         """``predict``, optionally recomputed in backward instead of stored.
 
         A single ``predict`` call at the PushT target-cell shapes stores about **8 GB**
@@ -951,16 +981,24 @@ class VWorldModel(nn.Module):
         **backward**, long after an enclosing ``with`` block would have exited, and a
         recomputation on the other branch would silently produce activations that do not
         match the ones the forward recorded.
+
+        ``fast_attention=None`` (the default) **inherits** the ambient
+        ``Attention.use_sdpa`` -- see :meth:`resolve_fast_attention` for why that value
+        exists and what defaulting to ``False`` here silently broke.  It is resolved to an
+        explicit bool *now*, before the checkpointed callable is built, so the
+        forward/backward pinning above still holds.
         """
+        resolved_fast_attention = self.resolve_fast_attention(fast_attention)
+
         def _run(z_in):
-            with sdpa_attention(fast_attention):
+            with sdpa_attention(resolved_fast_attention):
                 return self.predict(z_in)
 
         if not checkpoint or not torch.is_grad_enabled():
             return _run(z)
         return torch.utils.checkpoint.checkpoint(_run, z, use_reentrant=False)
 
-    def _rollout_latents(self, z, action, checkpoint=False, fast_attention=False):
+    def _rollout_latents(self, z, action, checkpoint=False, fast_attention=None):
         """Predictor rollout body.
 
         Identical tensor ops, in identical order, to the previous ``rollout`` loop.
@@ -973,8 +1011,15 @@ class VWorldModel(nn.Module):
                     the original path unchanged (Property 7).  Only ``compute_ccr``
                     passes True.
                 fast_attention: run these predictor calls through
-                    ``scaled_dot_product_attention``.  Also default False for the same
-                    reason, and also only ever True from ``compute_ccr``.
+                    ``scaled_dot_product_attention``.  ``True`` only from ``compute_ccr``.
+                    Default **None**, meaning inherit the ambient ``Attention.use_sdpa``
+                    rather than force it off -- see
+                    :meth:`VWorldModel.resolve_fast_attention`.  The class switch ships
+                    ``False``, so ``rollout``, ``plan.py``, ``planning/*`` and
+                    ``Trainer.openloop_rollout`` still take the original materialised path
+                    unchanged (Property 7); the difference is only that a caller which
+                    deliberately opens an outer ``sdpa_attention`` scope is no longer
+                    silently overridden.
         output: z: (b, n+t+1, num_patches, emb_dim)
         """
         t = 0

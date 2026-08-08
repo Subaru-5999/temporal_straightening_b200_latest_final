@@ -178,3 +178,129 @@ def test_the_sdpa_reason_records_what_is_not_verified():
     assert "attn_mask" in reason
     # And the fallback, so the next decision is already written down.
     assert "reading (b)" in reason
+
+
+# ---------------------------------------------------------------------------
+# The other half of the mechanism: the rollout must INHERIT the outer scope
+# ---------------------------------------------------------------------------
+#
+# The gating above is necessary and was not sufficient. `plan_agg.attention_scope` opened the
+# outer scope, printed `sdpa`, and the long-horizon run still OOM'd in the *materialised*
+# branch at `models/vit.py:100`. Cause: `_predict_maybe_checkpointed` wraps every `predict`
+# in `with sdpa_attention(fast_attention)`, and `_rollout_latents` defaulted
+# `fast_attention=False`, so an **inner** scope forced the switch off on every predictor call
+# and silently overrode the outer one. A context manager that sets an absolute value cannot be
+# nested by a caller that only wants to opt in, which is the general shape of the bug.
+#
+# Fixed by `VWorldModel.resolve_fast_attention`: `None` means inherit. These tests pin the
+# composition, because nothing else does and the symptom was a 13-second OOM whose traceback
+# said nothing about the switch.
+
+
+def test_resolve_fast_attention_inherits_the_ambient_switch(vit_attention):
+    """`None` means inherit. This is the single line whose absence caused the OOM."""
+    from models.visual_world_model import VWorldModel
+
+    vit_attention.use_sdpa = False
+    assert VWorldModel.resolve_fast_attention(None) is False
+    vit_attention.use_sdpa = True
+    assert VWorldModel.resolve_fast_attention(None) is True
+
+
+def test_resolve_fast_attention_honours_an_explicit_bool(vit_attention):
+    """Explicit values still force their branch, so `compute_ccr`'s call site is unchanged."""
+    from models.visual_world_model import VWorldModel
+
+    for ambient in (False, True):
+        vit_attention.use_sdpa = ambient
+        assert VWorldModel.resolve_fast_attention(True) is True
+        assert VWorldModel.resolve_fast_attention(False) is False
+
+
+class _PredictSpy:
+    """Minimal stand-in for ``VWorldModel``: records the switch each ``predict`` observes.
+
+    Only the two members ``_predict_maybe_checkpointed`` touches. Deliberately not a real
+    ``VWorldModel``: ``Attention.__init__`` calls ``.to('cuda')``, so constructing the real
+    predictor needs a GPU and this check needs none.
+    """
+
+    resolve_fast_attention = staticmethod(
+        __import__("models.visual_world_model", fromlist=["VWorldModel"])
+        .VWorldModel.resolve_fast_attention
+    )
+
+    def __init__(self):
+        self.observed = []
+
+    def predict(self, z):
+        import models.vit as vit
+
+        self.observed.append(vit.Attention.use_sdpa)
+        # An *intermediate* whose backward needs it, so a non-reentrant checkpoint actually
+        # recomputes this callable. `z * 1` would not: multiplying by a constant saves
+        # nothing from inside the segment, nothing is unpacked, and no recomputation runs --
+        # which would make the recomputation test vacuous rather than failing.
+        h = z.exp()
+        return h * h
+
+
+def _predict_once(spy, *, checkpoint, fast_attention, requires_grad=False):
+    import torch
+
+    from models.visual_world_model import VWorldModel
+
+    z = torch.zeros(2, 2, requires_grad=requires_grad)
+    out = VWorldModel._predict_maybe_checkpointed(
+        spy, z, checkpoint, fast_attention
+    )
+    return out
+
+
+@pytest.mark.parametrize("ambient", [False, True])
+def test_predict_observes_the_ambient_switch_when_not_asked(vit_attention, ambient):
+    """The regression test proper: an outer scope now reaches the predictor call."""
+    pytest.importorskip("torch")
+    spy = _PredictSpy()
+
+    vit_attention.use_sdpa = ambient
+    _predict_once(spy, checkpoint=False, fast_attention=None)
+
+    assert spy.observed == [ambient]
+
+
+def test_explicit_false_still_forces_the_materialised_branch(vit_attention):
+    """CCR's `fast_attention=False` configuration keeps forcing off, ambient notwithstanding."""
+    pytest.importorskip("torch")
+    spy = _PredictSpy()
+
+    vit_attention.use_sdpa = True
+    _predict_once(spy, checkpoint=False, fast_attention=False)
+
+    assert spy.observed == [False]
+
+
+def test_checkpointed_recomputation_is_pinned_to_the_forward_branch(vit_attention):
+    """The ambient value is resolved at forward time, not looked up again in backward.
+
+    A checkpointed segment is recomputed during backward, long after the enclosing `with` has
+    exited. If the branch were resolved lazily, the recomputation would run on the *other*
+    implementation and produce activations that do not match the ones the forward recorded.
+    """
+    torch = pytest.importorskip("torch")
+    spy = _PredictSpy()
+
+    vit_attention.use_sdpa = False
+    with plan_agg.attention_scope(LONG):
+        out = _predict_once(spy, checkpoint=True, fast_attention=None, requires_grad=True)
+
+    # Scope has exited; the ambient switch is back to the shipped default.
+    assert vit_attention.use_sdpa is False
+    out.sum().backward()
+
+    # Two observations: the forward and the backward recomputation. Both on the branch the
+    # forward took, not the one that happens to be ambient at backward time.
+    assert len(spy.observed) == 2, spy.observed
+    assert spy.observed == [True, True]
+    assert not isinstance(out, tuple)
+    assert isinstance(out, torch.Tensor)
