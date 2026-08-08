@@ -228,3 +228,75 @@ the two dicts changed key shape. Nothing outside `plan_agg.py` referenced them, 
 
 Suite after 11.3 and 9.2: **369 passed, 12 skipped, 3 failed** — up from 309 passed; the 3 failures are
 the pre-existing CUDA-only `tests/test_vit_sdpa_equivalence.py` cases.
+
+---
+
+## 7. Task 11.4 blocked twice, and the two fixes (2026-08-08)
+
+The Positive_Control's first launch failed for two unrelated reasons. Neither is a result; both are recorded
+because they changed how the job is run.
+
+### 7.1 The MPC leg: a command shape the driver cannot express
+
+`SETTINGS=both ... planner.n_taken_actions=50` aborted with a `ProtocolError` on the MPC leg. A positional
+override reaches **both** seed loops, but the long-horizon columns pin `n_taken_actions` 50 open-loop and **5**
+MPC. The gate did exactly what it exists for: it named the field, the expected value and the resolved one, and
+aborted before any load. Task 11.4's own text already authorised the fix — run the settings as separate
+`SETTINGS=ol` / `SETTINGS=mpc` invocations — so the control is **four** jobs, and the two MPC legs pass no
+`n_taken_actions` override at all and take the shipped 5.
+
+### 7.2 The open-loop leg: reading (a) does not fit the slice
+
+`torch.OutOfMemoryError` at `models/vit.py:100`, the materialised `q @ k.T`. **Confirmed not a leak** before
+anything else: the slice showed **16 MiB of 45312 MiB** in use, no live processes, no stray python.
+
+The arithmetic, done before recommending anything, because two unverified arguments already failed on this
+project today (`PROGRESS_ACS.md` N-series and finding M2 below):
+
+`VWorldModel._rollout_latents` makes exactly `sub_planner.horizon // frameskip` predictor calls, and
+`planning/gd.py` runs one `total_loss.backward()` per optimizer step over the **whole** rollout, so every
+call's activations are retained in a single graph and the total scales linearly in the call count — **10 calls
+at `goal_H 50` against 5 at `goal_H 25`**. At the Target_Cell shapes (`n_evals 50`, `heads 16`, `depth 6`,
+`T = num_frames * num_patches = 3 * 196 = 588`, bf16) the softmax output alone is
+`50 * 16 * 588**2 * 2 B = 553 MB` per layer per call. The first two calls are shorter because the context
+window is still filling (`T` 196, 392, then 588):
+
+| | retained score matrices | rest (qkv, projection inputs, FFN GELU) | total |
+|---|---|---|---|
+| `goal_H 25`, 5 calls | `(0.061 + 0.246 + 3*0.553) * 6` = **11.8 GB** | ~9.5 GB | **~21 GB** — fits, and did |
+| `goal_H 50`, 10 calls | `(0.061 + 0.246 + 8*0.553) * 6` = **28.4 GB** | ~22 GB | **~50 GB** — exceeds 45312 MiB |
+
+The score matrices are **57%** of what a `T=588` call retains. Removing them puts the long-horizon run at
+~22 GB. The margin is not tight, which is why this is the fix rather than a coin flip against reading (b).
+
+### 7.3 The fix, and the deviation it is
+
+`plan_agg.attention_scope(regime)` wraps the single `plan.planning_main` call. `short` yields `materialized`
+and **touches nothing at all** — no import, no class-attribute write. `long` enters the existing
+`models.vit.sdpa_attention` context manager. **No file is edited:** `models/vit.py` already shipped the
+`Attention.use_sdpa` switch and its scoping context manager for the CCR rollout, so `plan.py`'s bytes,
+`planning/`, `datasets/` and the Scope_Guard assertion all still hold, and no allowlist entry is added.
+
+**It is keyed on the horizon regime for one reason.** Every recorded number on this platform was measured on
+the materialised path — the Platform_Baseline in §3 and §4's paired check, which found the wrapper at `w = 0`
+*numerically identical* to frozen `plan.py`. Enabling SDPA everywhere would move the **reported**
+short-horizon result onto a path that identity was never established on, with no error and no visible symptom,
+because SDPA computes the same function. So the reported result keeps the measured path and only the control
+deviates.
+
+Both control arms share the deviation, since both launch through this wrapper at `goal_H 50`, so the
+`w=0` → `w=0.1` delta §6.1 asks for is like-for-like. Only its absolute level could carry an implementation
+effect, and `tests/test_vit_sdpa_equivalence.py` pins the two branches as agreeing to bf16 rounding.
+`attention_impl` and `attention_impl_reason` reach `agg_run_manifest.json` on every run, so the deviation
+travels with the numbers rather than living only here.
+
+**Stated before the run, not after: what is not verified.** `scaled_dot_product_attention` is called with an
+explicit `attn_mask`, which rules out the flash backend. The saving depends on PyTorch selecting the
+memory-efficient backend rather than falling back to `math`, which materialises the same matrix. The CCR arm
+ran this path on this pod at *training* shapes, so a fallback is not the expected outcome, but it has **not**
+been checked at `n_evals 50`. **A repeat OOM is that diagnosis**, and the next move is then §6's reading (b) —
+recorded as **hardware-forced**, not as a re-reading of the paper, since §6 pre-registered (a) and already
+noted that (b) would by itself explain the paper's open-loop collapse.
+
+Suite after 11.3b: **383 passed, 12 skipped, 3 failed** (the 3 are the pre-existing CUDA-only SDPA equivalence
+cases). `tests/test_agg_long_horizon_attention.py`: 14 passed.

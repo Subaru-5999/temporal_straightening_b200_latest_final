@@ -502,6 +502,62 @@ Task labels:
       `plan`
     - _Requirements: 8.1, 8.4, 8.6, 8.7_
 
+  - [x] 11.3b [CODE] Gate the long-horizon run onto memory-light attention, and record it as a deviation
+    - **Why this task exists: reading (a) does not fit the slice.** Task 11.4's first open-loop attempt died
+      with `torch.OutOfMemoryError` at `models/vit.py:100`, the materialised `q @ k.T`. A diagnostic confirmed
+      it is **not a leak** — the slice showed 16 MiB of 45312 MiB in use, no live processes, no stray python.
+      Horizon 50 genuinely does not fit
+    - **The arithmetic, because two unverified arguments already failed on this project and a guess is not
+      good enough.** `VWorldModel._rollout_latents` makes exactly `sub_planner.horizon // frameskip` predictor
+      calls, and `planning/gd.py` runs one `total_loss.backward()` per optimizer step over the *whole* rollout,
+      so every call's activations are retained in one graph and the total scales linearly in the call count:
+      **10 calls at `goal_H 50` against 5 at `goal_H 25`**. At the Target_Cell shapes — `n_evals 50`,
+      `heads 16`, `depth 6`, `T = num_frames * num_patches = 3 * 196 = 588`, bf16 — the softmax output alone is
+      `50 * 16 * 588**2 * 2 B = 553 MB` per layer per call, and the first two calls are shorter because the
+      context window is still filling (`T` 196, 392, then 588):
+
+      | | retained score matrices | rest (qkv, projection inputs, FFN GELU) | total |
+      |---|---|---|---|
+      | `goal_H 25`, 5 calls | `(0.061 + 0.246 + 3*0.553) * 6 = 11.8 GB` | ~9.5 GB | **~21 GB — fits, and did** |
+      | `goal_H 50`, 10 calls | `(0.061 + 0.246 + 8*0.553) * 6 = 28.4 GB` | ~22 GB | **~50 GB — exceeds 45312 MiB** |
+
+      The score matrices are 57% of what a `T=588` call retains, so removing them takes the long-horizon run
+      to ~22 GB. **The margin is not tight**, which is why this is the fix rather than a coin flip
+    - **The change: `plan_agg.attention_scope(regime)` around the one `plan.planning_main` call.** `short`
+      yields `materialized` and touches nothing at all — no import, no class-attribute write — so the reported
+      short-horizon path is not merely restored afterwards but never modified. `long` enters the existing
+      `models.vit.sdpa_attention` context manager. **No file is edited**: `models/vit.py` already ships the
+      `Attention.use_sdpa` switch and its scoping context manager, so `plan.py`'s bytes, `planning/`,
+      `datasets/` and the Scope_Guard assertion all still hold, and this feature adds no allowlist entry
+    - **Why it is keyed on the regime and not enabled globally.** Every recorded number on this platform was
+      measured on the materialised path — the Platform_Baseline (75.33 / 82.00) and task 11.1's paired check,
+      which found the wrapper at `w=0` *numerically identical* to frozen `plan.py` (same 50-element boolean
+      vector, `state_dist` equal to 8 significant figures). Enabling SDPA everywhere would move the
+      **reported** result (Requirement 7.2) onto a path that identity was never established on, with no error
+      and no visible symptom, since SDPA computes the same function
+    - **Both Positive_Control arms share the path**, since both launch through this wrapper at `goal_H 50`, so
+      the `w=0` → `w=0.1` delta task 11.5 reads is like-for-like. Only its absolute level could carry an
+      implementation effect, and `tests/test_vit_sdpa_equivalence.py` pins the two branches as agreeing to
+      bf16 rounding (CUDA-only, so it is one of the three known local failures)
+    - **Recorded in the manifest, not only in a progress log:** `attention_impl` and
+      `attention_impl_reason` reach `agg_run_manifest.json` on every run, so the deviation travels with the
+      numbers it produced (Requirement 8.6)
+    - **What is NOT verified, stated before the run rather than after.** `scaled_dot_product_attention` is
+      called with an explicit `attn_mask`, which rules out the flash backend; the saving depends on PyTorch
+      choosing the memory-efficient backend rather than falling back to `math`, which materialises the same
+      matrix. The CCR arm ran this path on this pod at training shapes, so a fallback is not expected, but it
+      has not been checked at `n_evals 50`. **A repeat OOM is that diagnosis**, and the fallback is then
+      `PROGRESS_AGG.md` section 6's reading (b), which must be recorded as **hardware-forced** rather than as
+      a re-reading of the paper — section 6 pre-registered (a) and noted that (b) would by itself explain the
+      paper's open-loop collapse
+    - **Local result (recorded):** `tests/test_agg_long_horizon_attention.py` `14 passed`. It pins the short
+      row to `materialized` and the long row to `sdpa`, that an unassigned regime aborts naming the two that
+      exist rather than defaulting, that the short scope leaves `Attention.use_sdpa` untouched, that the long
+      scope restores it **including on exception**, that both settings' manifests record the implementation and
+      its reason, and that the reason text carries the unverified backend risk and the reading-(b) fallback.
+      Suite: **383 passed, 12 skipped, 3 failed** — the 3 are the pre-existing CUDA-only SDPA equivalence cases
+    - _Requirements: 8.6, 9.2, 11.7_
+
   - [ ] 11.4 [GPU RUN] Positive_Control: reproduce the paper's long-horizon combined-cost gain
     - **This is a control, not the reported result.** The reported result remains the short-horizon
       confirmation run in task 14 (Requirements 7.2, 7.5). This task exists to decide what a null short-horizon
@@ -532,24 +588,35 @@ Task labels:
       `gH${goal_H}` is already in the template so the long-horizon runs land in their own tree and cannot
       touch any short-horizon cell:
 
+      **Four invocations, not two — `SETTINGS=both` cannot express this run and the first attempt proved it.**
+      The long open-loop column pins `n_taken_actions 50` and the long MPC column pins `5`, but a positional
+      override reaches *both* seed loops, so `SETTINGS=both ... planner.n_taken_actions=50` aborted with a
+      `ProtocolError` on the MPC leg — correctly, which is the gate doing its job. This task's own fallback
+      clause ("run the two settings as separate `SETTINGS=ol` / `SETTINGS=mpc` invocations rather than working
+      around it") is therefore the shape that runs. The MPC legs pass **no** `n_taken_actions` override at all
+      and take the shipped `5` from `conf/plan_gd_mpc.yaml`:
+
       ```bash
-      # arm A: spatial only, long horizon
+      # arm A, open-loop: spatial only, long horizon
       DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
-        PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS=100 HYDRA_RUN_DIR=agg \
+        PLAN_ENTRY=plan_agg.py SETTINGS=ol SEEDS=100 HYDRA_RUN_DIR=agg \
         bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=0" goal_H=50 \
           planner.sub_planner.horizon=50 planner.n_taken_actions=50
 
-      # arm B: combined cost, long horizon, paper-literal weight
+      # arm A, MPC: no n_taken_actions override; the shipped 5 is the pinned long-MPC value
       DATASET_DIR=/workspace/arun/data FOREGROUND=1 \
-        PLAN_ENTRY=plan_agg.py SETTINGS=both SEEDS=100 HYDRA_RUN_DIR=agg \
-        bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=0.1" goal_H=50 \
-          planner.sub_planner.horizon=50 planner.n_taken_actions=50
-      ```
+        PLAN_ENTRY=plan_agg.py SETTINGS=mpc SEEDS=100 HYDRA_RUN_DIR=agg \
+        bash run_ccr_pilot.sh eval "$CKPT" "+agg_weight=0" goal_H=50 \
+          planner.sub_planner.horizon=50
 
-      The MPC leg takes `n_taken_actions=5`, which `SETTINGS=both` supplies from `conf/plan_gd_mpc.yaml`; the
-      override above applies to the open-loop leg. If the driver cannot express a per-setting
-      `n_taken_actions`, run the two settings as separate `SETTINGS=ol` / `SETTINGS=mpc` invocations rather
-      than working around it
+      # arm B: the same two invocations with "+agg_weight=0.1", the paper-literal value
+      ```
+    - **Runs on memory-light attention (task 11.3b), and that is a recorded deviation.** Reading (a) OOM'd the
+      slice on the materialised path; `plan_agg.attention_scope` enters `models.vit.sdpa_attention` for the
+      `long` regime only, so the reported short-horizon path is untouched and both arms here share one
+      implementation. Every run records `attention_impl` in its manifest. If a leg OOMs **again**, the
+      diagnosis is a `math`-backend fallback and the next move is reading (b) recorded as hardware-forced —
+      not a re-reading of the paper
     - ~1.5 h for the four runs at one seed. Strictly serial, one job at a time on the `1g.45gb` MIG slice
       (Requirements 9.1, 9.2). Not agent-executable: needs the pod, the dataset and the Target_Cell checkpoint
     - _Requirements: 9.1, 9.2, 9.6, 10.4, 11.2_
@@ -823,21 +890,22 @@ Task labels:
     { "id": 9, "tasks": ["11.1"] },
     { "id": 10, "tasks": ["11.2"] },
     { "id": 11, "tasks": ["11.3"] },
-    { "id": 12, "tasks": ["11.4"] },
-    { "id": 13, "tasks": ["11.5"] },
-    { "id": 14, "tasks": ["12.1"] },
-    { "id": 15, "tasks": ["12.2"] },
-    { "id": 16, "tasks": ["12.3"] },
-    { "id": 17, "tasks": ["12.4"] },
-    { "id": 18, "tasks": ["12.5"] },
-    { "id": 19, "tasks": ["12.6"] },
-    { "id": 20, "tasks": ["12.7"] },
-    { "id": 21, "tasks": ["12.8"] },
-    { "id": 22, "tasks": ["14.1"] },
-    { "id": 23, "tasks": ["14.2"] },
-    { "id": 24, "tasks": ["14.3"] },
-    { "id": 25, "tasks": ["15.1"] },
-    { "id": 26, "tasks": ["16.1"] }
+    { "id": 12, "tasks": ["11.3b"] },
+    { "id": 13, "tasks": ["11.4"] },
+    { "id": 14, "tasks": ["11.5"] },
+    { "id": 15, "tasks": ["12.1"] },
+    { "id": 16, "tasks": ["12.2"] },
+    { "id": 17, "tasks": ["12.3"] },
+    { "id": 18, "tasks": ["12.4"] },
+    { "id": 19, "tasks": ["12.5"] },
+    { "id": 20, "tasks": ["12.6"] },
+    { "id": 21, "tasks": ["12.7"] },
+    { "id": 22, "tasks": ["12.8"] },
+    { "id": 23, "tasks": ["14.1"] },
+    { "id": 24, "tasks": ["14.2"] },
+    { "id": 25, "tasks": ["14.3"] },
+    { "id": 26, "tasks": ["15.1"] },
+    { "id": 27, "tasks": ["16.1"] }
   ]
 }
 ```

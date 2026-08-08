@@ -71,6 +71,7 @@ Requirements: 3.1, 3.5, 4.2, 8.1, 8.2, 8.3, 8.4, 8.6, 8.7
 
 from __future__ import annotations
 
+import contextlib
 import json
 import numbers
 import os
@@ -127,6 +128,10 @@ __all__ = [
     "PROTOCOL_EXPECTED_SOURCE",
     "PROTOCOL_FIELDS",
     "OPT_STEPS_FIELD",
+    "ATTENTION_IMPL_BY_REGIME",
+    "ATTENTION_IMPL_REASON",
+    "attention_impl_for_regime",
+    "attention_scope",
     "ProtocolDeviation",
     "ProtocolError",
     "ProtocolRecord",
@@ -462,6 +467,130 @@ class ProtocolError(RuntimeError):
     Always raised **before** any load: no checkpoint, no dataset, no env, no DINOv2 download
     (Requirement 8.7).
     """
+
+
+# ---------------------------------------------------------------------------
+# Attention implementation per horizon regime (task 11.3b) -- a RECORDED DEVIATION
+# ---------------------------------------------------------------------------
+
+#: Which attention implementation each horizon regime runs the predictor through.
+#:
+#: **This is a hardware-forced deviation, and it is deliberately keyed on the regime so it cannot
+#: reach the reported result.** ``short`` keeps ``materialized``, the path every recorded number was
+#: measured on -- the Platform_Baseline (75.33 open-loop / 82.00 MPC), and task 11.1's paired
+#: zero-weight check, which found ``plan_agg.py`` at ``w=0`` *numerically identical* to frozen
+#: ``plan.py`` (same 50-element boolean vector, ``state_dist`` equal to 8 significant figures).
+#: Enabling SDPA everywhere would silently move the short-horizon path off the implementation that
+#: identity was established on, so it is not enabled everywhere.
+#:
+#: ``long`` needs ``sdpa`` because reading (a) does not fit in the ``1g.45gb`` MIG slice on the
+#: materialised path. The arithmetic, since the first attempt OOM'd at ``models/vit.py:100`` and a
+#: guess is not good enough: ``VWorldModel._rollout_latents`` makes exactly
+#: ``sub_planner.horizon // frameskip`` predictor calls, and ``planning/gd.py`` keeps every one of
+#: them in a single autograd graph (one ``total_loss.backward()`` per optimizer step over the whole
+#: rollout), so retained activations scale linearly in the number of calls -- 10 at ``goal_H 50``
+#: against 5 at ``goal_H 25``. At the Target_Cell shapes (``n_evals 50``, ``heads 16``, ``depth 6``,
+#: ``T = num_frames * num_patches = 3 * 196 = 588``, bf16) the softmax output alone is
+#: ``50 * 16 * 588**2 * 2 B = 553 MB`` per layer per call. Summed over the call sequence, whose first
+#: two calls are shorter because the context window is still filling (``T`` 196, 392, then 588):
+#:
+#:   * ``goal_H 25``: ``(0.061 + 0.246 + 3 * 0.553) * 6 = 11.8 GB`` of score matrices
+#:   * ``goal_H 50``: ``(0.061 + 0.246 + 8 * 0.553) * 6 = 28.4 GB`` of score matrices
+#:
+#: with roughly another 9.5 / 22 GB in ``qkv``, the projection inputs and the FFN's GELU output.
+#: ~21 GB fits the 45312 MiB slice and demonstrably did; ~50 GB does not and demonstrably did not.
+#: SDPA never forms the ``T x T`` matrix, which is 57% of what a ``T=588`` call retains, taking the
+#: long-horizon run to ~22 GB. **The margin is not tight**, which is why this is the chosen fix
+#: rather than a coin flip against reading (b).
+#:
+#: **What is NOT verified.** ``F.scaled_dot_product_attention`` is called with an explicit
+#: ``attn_mask``, which rules out the flash backend; the memory saving depends on PyTorch selecting
+#: the memory-efficient backend rather than falling back to ``math``, which materialises the same
+#: matrix. The CCR arm ran this path on this pod at training shapes, so the fallback is not the
+#: expected outcome -- but it has not been checked at ``n_evals 50``. If the long-horizon run OOMs
+#: *again*, that is the diagnosis, and the fallback is ``PROGRESS_AGG.md`` section 6's reading (b),
+#: which must then be recorded as hardware-forced rather than as a re-reading of the paper.
+#:
+#: **Both arms of the Positive_Control share this path**, because both are launched through this
+#: wrapper at ``goal_H 50``. The ``w=0`` -> ``w=0.1`` delta task 11.5 reads is therefore a
+#: like-for-like comparison; only its absolute level could carry an implementation effect, and
+#: ``tests/test_vit_sdpa_equivalence.py`` pins the two branches as agreeing to bf16 rounding.
+ATTENTION_IMPL_BY_REGIME: Dict[str, str] = {
+    HORIZON_REGIMES[SHORT_GOAL_H]: "materialized",
+    HORIZON_REGIMES[LONG_GOAL_H]: "sdpa",
+}
+
+#: Carried into every manifest next to :data:`ATTENTION_IMPL_BY_REGIME`'s choice, so the deviation
+#: travels with the numbers it produced instead of living only in a progress log.
+ATTENTION_IMPL_REASON: Dict[str, str] = {
+    "materialized": (
+        "The original materialised attention path. Every recorded number on this platform was "
+        "measured on it -- the Platform_Baseline (75.33 open-loop / 82.00 MPC) and task 11.1's "
+        "paired zero-weight check, which found this wrapper at agg_weight=0 numerically identical "
+        "to frozen plan.py. The short horizon is the REPORTED result (Requirement 7.2), so it is "
+        "held on this path and no deviation applies to it"
+    ),
+    "sdpa": (
+        "HARDWARE-FORCED DEVIATION, recorded rather than silent. Attention runs through "
+        "F.scaled_dot_product_attention via models.vit.sdpa_attention, which computes the same "
+        "function without materialising the (b, heads, T, T) score matrix. Reason: at reading (a) "
+        "the open-loop long-horizon run OOM'd the 1g.45gb MIG slice at models/vit.py:100. "
+        "planning/gd.py backpropagates through the whole rollout in one graph, so retained "
+        "activations scale with the predictor call count -- 10 calls at goal_H 50 against 5 at 25 -- "
+        "and at n_evals 50, heads 16, depth 6, T 588, bf16 the score matrices alone are ~28.4 GB of "
+        "an estimated ~50 GB, against ~21 GB for the 25-step run that fits. SDPA removes that term. "
+        "Both Positive_Control arms (w=0 and w=0.1) run through it, so the delta task 11.5 reads is "
+        "like-for-like; the two branches agree to bf16 rounding "
+        "(tests/test_vit_sdpa_equivalence.py). NOT verified: that PyTorch selects the "
+        "memory-efficient backend rather than falling back to math for this explicit attn_mask at "
+        "these shapes. A repeat OOM is that diagnosis, and the fallback is reading (b), which would "
+        "then be hardware-forced and must be recorded as such"
+    ),
+}
+
+
+def attention_impl_for_regime(regime: Any) -> str:
+    """The attention implementation :data:`ATTENTION_IMPL_BY_REGIME` assigns to ``regime``.
+
+    Aborts naming the regimes that exist rather than defaulting, for the same reason
+    :func:`horizon_regime` does: a silent default here would put the reported short-horizon result
+    on an implementation no recorded number was measured on.
+    """
+    try:
+        return ATTENTION_IMPL_BY_REGIME[str(regime)]
+    except KeyError:
+        raise ProtocolError(
+            f"no attention implementation is assigned to horizon regime {regime!r}; "
+            f"plan_agg.ATTENTION_IMPL_BY_REGIME covers "
+            f"{sorted(ATTENTION_IMPL_BY_REGIME)}. Assign one explicitly rather than defaulting: "
+            f"the short-horizon regime is the reported result and is held on the materialised path "
+            f"every recorded number was measured on."
+        ) from None
+
+
+@contextlib.contextmanager
+def attention_scope(regime: Any):
+    """Scope the predictor's attention implementation for one horizon regime.
+
+    Yields the implementation name. For ``materialized`` this touches nothing at all -- no import,
+    no class-attribute write -- so the short-horizon path is not merely restored afterwards but
+    never modified, which is what keeps task 11.1's numerical-identity result standing.
+
+    For ``sdpa`` it enters ``models.vit.sdpa_attention``, a context manager rather than an
+    assignment specifically so a raised exception cannot leave the fast path enabled for a later
+    call in the same process. ``models.vit`` is imported lazily, inside the branch that needs it,
+    so this module's importability contract (no hydra, no torch, no CUDA above the entry point)
+    still holds.
+    """
+    impl = attention_impl_for_regime(regime)
+    if impl == "materialized":
+        yield impl
+        return
+
+    from models.vit import sdpa_attention
+
+    with sdpa_attention(enabled=True):
+        yield impl
 
 
 @dataclass(frozen=True)
@@ -999,6 +1128,8 @@ def build_manifest(
         "width_warnings": list(getattr(head, "width_warnings", ()) or ()),
     }
 
+    attention_impl = attention_impl_for_regime(protocol.horizon_regime)
+
     manifest: Dict[str, Any] = {
         "feature": FEATURE_NAME,
         "config_name": protocol.config_name,
@@ -1008,6 +1139,13 @@ def build_manifest(
         # run rather than a detail of the protocol check.
         "horizon_regime": protocol.horizon_regime,
         "goal_H": protocol.goal_H,
+        # Which attention implementation the predictor ran through, and why (task 11.3b). Recorded
+        # in the manifest and not only in the progress log, because it is a deviation from the path
+        # every other number on this platform was measured on and it must travel with the numbers
+        # it produced. `materialized` for the reported short horizon, `sdpa` for the long-horizon
+        # Positive_Control, which does not fit the MIG slice otherwise.
+        "attention_impl": attention_impl,
+        "attention_impl_reason": ATTENTION_IMPL_REASON.get(attention_impl, MISSING),
         "agg_weight": float(agg_weight),
         "objective_target": OBJECTIVE_TARGET,
         "seed": _plain(_cfg_get(cfg, "seed", MISSING)),
@@ -1160,7 +1298,17 @@ def delegate_to_plan(
             head=head,
         )
         # 8. Requirement 2.1: the frozen entry, called with the wrapper's dict and nothing else.
-        return plan.planning_main(cfg_dict)
+        # The attention scope wraps the call rather than editing anything: for the reported short
+        # horizon it is a no-op that touches no module, and for the long-horizon Positive_Control it
+        # enters `models.vit.sdpa_attention` for the duration of this one call (task 11.3b). No file
+        # is edited, so `plan.py`'s bytes and the Scope_Guard assertion both still hold.
+        with attention_scope(protocol.horizon_regime) as attention_impl:
+            print(
+                f"[plan_agg] attention implementation: {attention_impl} "
+                f"({protocol.horizon_regime} horizon, goal_H={protocol.goal_H})",
+                flush=True,
+            )
+            return plan.planning_main(cfg_dict)
     finally:
         # 9. Requirement 5.4. Restore first, so a failing flush cannot leave the rebind in place;
         # `flush_and_clear` never raises, and returns what it managed to write.
