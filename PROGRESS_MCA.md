@@ -65,14 +65,18 @@ shown to suppress `block_angle`.
 | Arm selected | **yes — `PROGRESS_ACS.md` §12, on the ACS Stage-0 STOP** |
 | `compute_mca` implemented | **yes, pre-existing.** Reviewed, never run, `training.mca_weight` already wired |
 | Rung-1 gate pre-registered (§4) | **written 2026-08-08, before any measurement** |
-| Rung-1 readout `--readout aggmetric` | _not started_ |
-| Rung-1 probe run | **_NOT RUN — see §10.1_** |
-| Rung-1 verdict | **_NOT READ — see §10.2_** |
-| Rung-2 gate pre-registered (§5) | **_NOT WRITTEN — must precede the pilot launch_** |
-| Rung-2 pilot (~0.8 GPU-h) | _not launched_ |
-| Rung 3 | _not reachable_ |
+| Rung-1 readout `--readout aggmetric` | complete — `_mca_terms` extracted bitwise-neutral, probe calls the shipped code |
+| Rung-1 probe run | **RUN 2026-08-08, 53.1 s CPU — see §6.1** |
+| Rung-1 verdict | **STOP, clause `4.3-stop-positive` — see §6.2. `ρ = +0.487`, the sign my §4.2 argument said was impossible** |
+| Rung-2 gate pre-registered (§5) | **not written, and will not be** |
+| Rung-2 pilot (~0.8 GPU-h) | **NOT LAUNCHED — rung 2 not permitted** |
+| Rung 3 | not reached |
 
-**GPU-hours spent on MCA so far: 0.**
+> **THIS ARM IS CLOSED AT RUNG 1. `ρ(r, ‖Δpatch‖) = +0.487` — `encoder.agg` *expands* large motions
+> rather than compressing them, which §4.3 pre-registered as a STOP at any magnitude. MCA is not
+> piloted. Total GPU-hours spent: 0. Total CPU: 53 seconds. The return is findings M1 and M2 (§6.4).**
+
+**GPU-hours spent on MCA: 0. Wall-clock spent: 53.1 s of CPU.**
 
 **Pre-registered probability of clearing the operational bar: 12–18%**, recorded in `PROGRESS_ACS.md` §9
 before this arm was selected — *below* ACS's 25–35% and above TMR's 8–13%. Carried here unchanged rather
@@ -203,14 +207,78 @@ automatically — **zero new code**, as §12 promised.
 
 ## 6. Placeholders — filled in as the measurements land, not before
 
-### 6.1 Rung-1 measured statistics — _NOT YET MEASURED_
+### 6.1 Rung-1 measured statistics — MEASURED 2026-08-08
 
-Per §4.4: `CV(r)` trained and pristine; `ρ(r, ‖Δpatch‖)`; `r` by `‖Δpatch‖` decile; 20-bin histogram of
-`r/r̄`; per-state-dimension-tercile breakdown; rank-disagreement rate; `n_pairs` / `n_windows` throughout.
+Pod `/workspace/arun/ccr`, commit `b5a852c`, checkpoint
+`pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05/checkpoints/model_2.pth`
+(sha256 `4d68b528…`, epoch 2, **UNCHANGED** after the run), `agg_out_dim = 128` read from `hydra.yaml`.
+512 validation windows, **1,536 velocity pairs** (3 per window), seed 0. **53.1 s, CPU, 0 GPU-h.**
+Report: `probe_outputs/mca_aggmetric_pusht.json` (pod-local, gitignored — `AGENT_MEMORY_2.0.md` §5.1).
 
-### 6.2 Rung-1 verdict — _NOT YET READ_
+**Check A — distortion magnitude. Reported, never gating.**
 
-Check B's `ρ` and the firing row of §4.3, written **before** rung 2 is launched.
+| statistic | trained | pristine |
+|---|---|---|
+| `CV(r)` | **0.588598** | 0.093670 |
+| `compute_mca = CV(r)²` | 0.346447 | 0.008774 |
+| `mean(r)` | 0.085255 | 0.242782 |
+| `n_pairs` / `n_windows` | 1536 / 512 | 1536 / 512 |
+
+`CV²` vs the shipped `compute_mca`: relative residual **1.27e-07** against a 1e-4 tolerance — the
+§4.1 single-implementation guarantee **HOLDS**, verified per window. Training moved `agg`
+**away** from similarity by 6.3× in `CV(r)`, and made it compress everything 2.85× more overall.
+
+**`r` by decile of `‖Δpatch‖` — the direct saturation picture, and it runs the wrong way.**
+
+| decile | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `‖Δpatch‖` mean | 2.94 | 3.95 | 4.65 | 5.30 | 5.88 | 6.50 | 7.36 | 8.66 | 10.82 | 14.68 |
+| mean `r` | 0.0535 | 0.0577 | 0.0672 | 0.0753 | 0.0741 | 0.0888 | 0.1057 | 0.1038 | 0.1097 | **0.1173** |
+
+**Monotone increasing across all ten deciles** (one flat step, 4→5), total **2.19×**. §4.2 predicted a
+decrease.
+
+**Histogram of `r/r̄`**, 20 bins over the fixed `[0, 4]`, `r̄ = 0.085255`, nothing outside the range:
+`30, 129, 251, 257, 257, 171, 139, 93, 53, 34, 43, 32, 13, 10, 9, 9, 1, 3, 2, 0`. Unimodal, right-skewed,
+mode at `r/r̄ ∈ [0.4, 1.0]`, a tail to ~3.8× the mean.
+
+**Per state-dimension tercile** (top third of windows by `|state_d[last] − state_d[first]|`, 513 pairs
+and 171 windows each, `SE(ρ) = 0.0442`):
+
+| dimension | `agent_x` | `agent_y` | `block_x` | `block_y` | `block_angle` |
+|---|---|---|---|---|---|
+| `CV(r)` | 0.5725 | 0.5721 | 0.5283 | 0.5303 | 0.5058 |
+| `ρ` | +0.357 | **+0.541** | +0.365 | +0.395 | +0.380 |
+
+**Every channel is positive**, 8–12σ each. The sign is not an artifact of one dimension, which is exactly
+what §4.4's disaggregation existed to test.
+
+**Rank-disagreement rate (§4.5, reported, never gating): 0.1856 — EXHAUSTIVE** over all 1,178,880 pairs,
+351 tied. *"Straightening ranks motions differently than the planner does, on 18.6% of pairs."*
+
+### 6.2 Rung-1 verdict — READ 2026-08-08
+
+## RUNG-1 VERDICT: STOP, clause `4.3-stop-positive`. RUNG 2 NOT PERMITTED. MCA IS NOT PILOTED.
+
+- **`ρ(r, ‖Δpatch‖) = +0.486982`**, `n_pairs = 1536`, `SE(ρ) = 0.0255` — **19σ from zero, and positive.**
+- **Pristine reference `ρ = −0.019829`** — indistinguishable from zero. Reported, not gating.
+- `ρ > 0` was pre-registered as a STOP **at any magnitude**, on the stated ground that it would mean the
+  architecture is not understood. That ground is now demonstrated, not hypothetical: see §6.4 M2 and the
+  error logged as §7.1.
+
+**Honesty about the gate itself, recorded because it is a flaw in my rule and not only in my model.**
+`L_mca` penalises *any* deviation of `r` from constant; it is **sign-agnostic**. So a large positive `ρ`
+is just as much "a systematic bias to correct" as a large negative one would have been, and on that
+reading the `ρ > 0` branch **over-fires**: it conflates two distinct questions — *is the distortion
+systematic?* (which `|ρ|` answers, and the answer is emphatically yes) and *does my architectural story
+hold?* (which the sign answers, and it does not). A two-sided gate would have returned GO.
+
+**The STOP stands anyway, and is honored.** Rewriting §4.3 now, having seen `ρ`, is precisely the §0
+failure mode — an arbitrary threshold fixed in advance is a test; the same threshold revised afterwards is
+a fit. The lesson belongs to the *next* pre-registration, which should ask "is the distortion systematic"
+two-sidedly and keep "does my mechanism story hold" as a separate, explicitly labelled sanity check
+rather than fusing them into one gate. **If MCA is ever piloted it must be as an openly post-hoc decision
+with the 12–18% prior revised downward, not by editing this section.**
 
 ### 6.3 Novelty positioning — _NOT YET WRITTEN, AND REQUIRED BEFORE ANY WRITEUP_
 
@@ -224,11 +292,44 @@ method's regularizer and that same method's planner. A real prior-art search mus
 before any claim is made, and if it lands on an existing paper, that is a `STOP` and it is cheaper to
 discover now than after 14 GPU-hours.
 
-### 6.4 Findings — _NOT YET WRITTEN_
+### 6.4 Findings M1 and M2 — WRITTEN 2026-08-08
 
-Rung 1 produces a reportable statement whether or not MCA is piloted: **how far the aggregation head this
-paper straightens in is from being a similarity, and whether that distortion is systematic.** Zero
-GPU-hours, from the paper's own trained checkpoint.
+**M1 — the aggregation head this paper straightens in is strongly non-metric, and *training made it
+so*.** On the paper's own trained PushT checkpoint, the velocity-norm ratio `r = ‖Δagg‖/‖Δpatch‖` has
+`CV = 0.589` against **0.094** for an otherwise identical untrained head — training increased the
+distortion **6.3×**. It is not noise: `ρ(r, ‖Δpatch‖) = +0.487` at `SE = 0.0255` (19σ), and mean `r`
+rises **monotonically across all ten deciles** of `‖Δpatch‖`, `0.0535 → 0.1173`. So the trained `agg`
+**expands large motions relative to small ones** while compressing everything 2.85× more overall than the
+untrained head does. The untrained reference is metric-neutral in this respect (`ρ = −0.020`), so the
+expansion is **learned, not architectural**. Consequence, stated in one line: the two spaces order motions
+differently on **18.6% of pairs** (exhaustive over 1,178,880), so straightness enforced in the 128-d
+aggregated space demonstrably does not transfer to the 1568-d patch space `planning/objectives.py` scores
+in. Zero GPU-hours, 53 s of CPU, from a checkpoint that already existed.
+**Limitations, attached here.** One checkpoint, one environment (PushT), one epoch count (2), one
+`agg_out_dim` (128); `‖Δpatch‖` between consecutive frames is a monotone proxy for what the planner
+measures and not the planner's own pairs; and `agg` is also **non-injective** (1568 → 128), a second
+failure mode this measurement says nothing about.
+**The interpretive turn, and it cuts against MCA.** A distortion that training *created* and made
+monotone in motion size looks less like a defect and more like something the objective found useful —
+plausibly contrast enhancement, spending aggregated dynamic range on the large motions. If so, forcing
+`agg` toward a similarity would **destroy** that, and MCA was attacking the wrong side of the gap. The
+better-motivated direction is to make the planner score in the space the regularizer already acts in,
+which is what `aggregated-space-planning-cost` does — it renders the distortion irrelevant instead of
+correcting it, and requires no claim about whether the distortion is good or bad.
+
+**M2 — a methodological finding, and the reason to publish the negative result rather than bury it: an
+asymptotic bound that never binds explains nothing.** §4.2 argued that `encoder.agg`'s terminal
+`nn.LayerNorm(128)` pins outputs to a shell of radius `√128 ≈ 11.31`, capping `‖Δagg‖` at `≈ 22.63`, and
+concluded that a bounded numerator over an unbounded 1568-d denominator **must** make `r` decrease with
+`‖Δpatch‖`. The measurement falsified the sign. The diagnosis is exact: the typical `‖Δagg‖` is
+`r̄ · ‖Δpatch‖ ≈ 0.085 × 7.07 ≈ 0.603`, which is **38× below** the ceiling the bound describes. The
+constraint is real and simply never engages, so it governs nothing and the learned MLP behaviour dominates
+completely. **The error was invoking a limiting constraint without checking which regime the data occupies
+—** and it is the same shape of error as the one ACS Stage 0 exposed a few hours earlier, where UMaze's
+`mean cos = 0.0027` "obviously" meant no structure until the 20-bin histogram showed a 2-D arcsine law.
+In both cases a plausible one-line argument about a scalar was wrong, and in both cases the
+**disaggregated** view settled it — the histogram there, the decile table here. That is now two
+independent confirmations of `SHORT_BUDGET_PILOTS.md` §4 within one day, at a combined cost of 0 GPU-hours.
 
 ---
 
@@ -236,4 +337,5 @@ GPU-hours, from the paper's own trained checkpoint.
 
 | # | date | error | cost | how it was caught |
 |---|---|---|---|---|
-| — | — | _none yet; this file was created before any MCA measurement_ | — | — |
+| 1 | 2026-08-08 | **§4.2's LayerNorm saturation argument was wrong, and it was the argument the whole gate was built around.** It reasoned that a terminal `nn.LayerNorm(128)` bounds `‖Δagg‖` at `≈ 22.63` while `‖Δpatch‖` is unbounded, so `r` must *decrease* with `‖Δpatch‖`. Measured `ρ = +0.487` — the opposite sign, at 19σ, monotone across all ten deciles and positive in all five state channels. The bound is real but sits **38× above** the typical `‖Δagg‖ ≈ 0.603`, so it never engages and constrains nothing | 53 s of CPU and one probe implementation; **0 GPU-h.** The pre-registered gate converted a wrong prediction into a cheap, recorded STOP instead of a 0.8 GPU-h pilot chasing a mechanism that does not exist in the claimed direction | The rung-1 probe itself, on its first run. §4.3 had pre-registered `ρ > 0` as a distinct STOP whose stated meaning was "the architecture is not understood" — written before the data, and it turned out to be the branch that fired. The disaggregated decile table (§4.4, mandatory) made the direction unmistakable rather than arguable |
+| 2 | 2026-08-08 | **The `ρ > 0` branch of my own gate conflates two questions and therefore over-fires.** `L_mca` is sign-agnostic, so a large positive `ρ` is as much a systematic bias to correct as a large negative one; a two-sided gate would have returned GO. The rule fused "is the distortion systematic?" with "does my architectural story hold?" | none yet — the STOP is honored as written rather than revised, so the cost is a possibly-forgone arm, not a wrong action | Noticed while writing §6.2 up, immediately after reading the verdict. Recorded there rather than acted on: editing §4.3 after seeing `ρ` is the §0 failure mode. The fix belongs to the next pre-registration — ask the systematic question two-sidedly, keep the mechanism-story check separate and explicitly labelled |
