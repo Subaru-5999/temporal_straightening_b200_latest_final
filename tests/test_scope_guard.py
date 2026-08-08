@@ -156,6 +156,12 @@ ALLOWED_FILES = frozenset(
         # Recorded in the allowlist rather than left as an untracked violation because the alternative is
         # that the lesson lives only in a chat log.
         "AGENT_MEMORY_2.0.md",
+        # The aggregated-space arm's measurement log, on the model of `PROGRESS_CCR.md` above: prose
+        # only, no training, planning or dataset code. Required rather than ad-hoc for two reasons.
+        # Task 11.2 is "[HUMAN] Record the paired zero-weight verdict" and there was nowhere to record
+        # it; and Requirement 10 obliges every success rate to be reported with its binomial SE and
+        # every claim with its caveats, which is a document, not a log line.
+        "PROGRESS_AGG.md",
     }
 )
 
