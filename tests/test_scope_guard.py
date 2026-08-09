@@ -75,6 +75,12 @@ ALLOWED_FILES = frozenset(
         # training and planning images stay unchanged.
         "requirements-dev.txt",
         "pytest.ini",
+        # Project-direction document, added 2026-08-09. The north-star record of what the project is chasing
+        # (the ICLR objective, the real acceptance predicate, the closed arms, and the rules earned by the
+        # failures logged in the PROGRESS_*.md files). Documentation only: imported by nothing, executed by
+        # nothing, and read by no source file, so it cannot influence a measured number. It is allowlisted
+        # because losing it to a scope violation is exactly the context loss it exists to prevent.
+        "RESEARCH_GOAL.md",
         # Required addition, not in the Requirement 5.6 prose: the repo's .gitignore ignores "*.sh" with an
         # explicit per-script negation allowlist, so `run_ccr_pilot.sh` could not be tracked at all without
         # adding a `!run_ccr_pilot.sh` line. That single line is enabling infrastructure for a file the
@@ -169,6 +175,12 @@ ALLOWED_FILES = frozenset(
 ALLOWED_PREFIXES = (
     "tests/",  # Requirement 5.6.
     ".kiro/specs/",  # Spec documents for this feature.
+    # Project-direction documents, added 2026-08-09. `.kiro/steering/` holds the always-loaded objective
+    # summary (`research-goal.md`), whose whole purpose is to survive context loss between sessions; the
+    # existing `product.md` / `structure.md` / `tech.md` already live here and predate any arm. Documentation
+    # only: no steering file is imported, executed or read by any source file, so nothing here can change a
+    # measured number. Kept as a prefix rather than a file entry because steering is inherently a growing set.
+    ".kiro/steering/",
     # Pre-existing additions that predate this feature branch and are not part of it: the extracted paper
     # sources (cited by the requirements introduction) and the short-budget-pilot notes. They were already
     # untracked in the working tree before any CCR work started, so failing the guard on them would report a
