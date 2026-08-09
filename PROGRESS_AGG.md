@@ -44,9 +44,10 @@ distortion is good.
 | Task 11.3 — long-horizon protocol column | **complete** — `PROTOCOL_EXPECTED` keyed on `(config_name, goal_H)`; short columns unweakened; `goal_H` now pinned. See §6 |
 | Task 9.2 — driver-contract test | **complete, promoted out of optional** — §5's recommendation, acted on |
 | Task 11.3b — long-horizon attention deviation | **complete** — gated on the horizon regime; the inner-scope override that defeated it is fixed. See §7.3, §7.4 |
-| Task 11.4 — Positive_Control (~2.5 GPU-h, revised) | **3 of 4 runs done** — arm A open-loop **0.16** (§8), arm A MPC **0.16** (§8.3), arm B open-loop **0.16**, delta **+0.00**, identical success vector (§8.5). **Arm B MPC is the decisive leg** and is outstanding |
-| Task 11.5 — Positive_Control verdict | _not read_ — needs the `w=0` → `w=0.1` delta, so all four runs |
-| Section 12 — the 6-arm weight sweep (~4 GPU-h) | **not launched; gated on BOTH 11.1 and 11.4** |
+| Task 11.4 — Positive_Control (~2.5 GPU-h) | **complete, all 4 runs** — 16.00 / 16.00 open-loop, 16.00 / 16.00 MPC (§8, §8.3, §8.5, §9) |
+| Task 11.5 — Positive_Control verdict | **read: FAILED on the decisive MPC leg.** Delta **+0.00** against the paper's +9.33; McNemar p = 1.000 on 4 discordant pairs. See §9 |
+| Section 12 — the 6-arm weight sweep (~4 GPU-h) | **BLOCKED by 11.5's pre-registered branch — does not launch.** §9.2 |
+| Next decision | §9.3 — four candidate explanations; two are rung-1 offline, two cost GPU. **Awaiting a recorded choice (Requirement 11.7)** |
 | Acceptance gate | not reached |
 
 **GPU-hours spent on this arm so far: ~0.05** (two 85-second evaluations).
@@ -507,3 +508,80 @@ are very likely to return the Baseline_Arm's vector exactly, making 2 of the 6 a
 construction. Caveat: that is an extrapolation *across regimes*, and the short horizon has a different loss
 scale and a far higher baseline, so it is a prediction to check rather than a reason to change the grid. The
 grid stays as pre-registered.
+
+---
+
+## 9. Task 11.5 — Positive_Control verdict: **FAILED on the decisive leg. Section 12 does not launch.**
+
+All four runs complete, seed 100, `n_evals = 50`, `goal_H = 50`, reading (a), `attention_impl=sdpa`,
+`protocol_ok=True` on every run. ~2.5 GPU-h.
+
+| long-horizon PushT, seed 100 | spatial only (`w=0`) | combined (`w=0.1`) | **our delta** | paper's delta |
+|---|---|---|---|---|
+| open-loop | 16.00 | 16.00 | **+0.00** | +6.67 |
+| **MPC** | **16.00** | **16.00** | **+0.00** | **+9.33** |
+
+Binomial SE ~5.2 points per cell. Paper reference: 13.33 ± 3.77 / 24.00 ± 6.53 spatial-only,
+20.00 ± 0.00 / 33.33 ± 4.16 combined.
+
+### 9.1 The paired structure, which says more than the equal rates
+
+| | open-loop | MPC |
+|---|---|---|
+| candidate-only wins | **0** | **2** (episodes 3, 42) |
+| baseline-only wins | **0** | **2** (episodes 41, 48) |
+| matching outcomes | **50** | **46** |
+| McNemar exact, two-sided | — | **p = 1.000** |
+| mean `state_dist` | 80.66 → 82.19 (+1.53) | 120.58 → 133.43 (+12.85) |
+| episodes ending closer / farther | 19 / 31 | 21 / 29 |
+
+**Open-loop is a bit-identical outcome vector.** MPC does move outcomes — but only **4 of 50 episodes changed
+at all**, and they split exactly 2-2. That is the informative part: a true +9.33 effect is ~4.7 net episodes out
+of 50, which would require roughly 5-6 candidate-only wins against ~1 the other way. Observing a total of four
+discordant pairs, evenly split, means the term barely reaches the decision boundary in either direction. So
+this is not "a noisy null" — it is a null with a visible mechanism.
+
+**Direction, stated with its uncertainty.** Both settings drift slightly *worse* in mean final distance
+(+1.53 open-loop, +12.85 MPC) and slightly more episodes end farther from the goal (31/50 and 29/50, p≈0.14 and
+p≈0.32 two-sided). Neither is significant. This is noise around zero and must not be reported as a
+degradation.
+
+### 9.2 The verdict, per the branch pre-registered in task 11.5 before any of this ran
+
+Task 11.5's text: *"MPC delta near zero or negative: the wrapper does not reproduce the paper's own result, so a
+null at short horizon would be uninterpretable — it could be our plumbing. **Do not proceed to task 12.**"*
+
+**Honored. Section 12 is blocked and no sweep job runs.** The whole reason the Positive_Control was worth
+~2.5 GPU-h is that it makes the short-horizon sweep readable, and it has come back saying the sweep would not
+be. Reading the sweep anyway would be the §0 failure mode — deciding what the gate means after seeing which way
+it fell.
+
+**What this does NOT establish.** It is not evidence that the paper is wrong. One seed, `n = 50`, a checkpoint
+that is our own reproduction rather than the paper's artifact, and a long-horizon planner protocol the paper
+never states (§6, reading (a), recorded in advance as a guess). Any of those can account for a missing +9.33.
+
+### 9.3 The four candidate explanations, and what each would cost to check
+
+Ranked by what the evidence already points at, not by convenience.
+
+1. **The term is too weak at `w = 0.1` — the leading hypothesis, and already measured.** §8.4: `0.1 · L_agg` is
+   **1.5-2.0%** of `L_spatial`. A 2% perturbation moved every plan slightly and flipped 4 of 50 outcomes
+   symmetrically, which is exactly what a too-weak term looks like. Cost: **already paid**. Note the
+   uncomfortable implication — if this is the explanation, the paper's own `w = 0.1` should not have produced
+   +9.33 on their platform either, unless their `L_agg`/`L_spatial` scale ratio differs materially from ours.
+   That is a checkable claim about their setup, not about ours.
+2. **Wrong `agg` head / wrong checkpoint row.** Whether `pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14` is
+   the cell the paper's `+ Proj` with `L_curv` ✓ row was measured on. Cost: **offline, minutes** —
+   `REPRODUCTION.md` plus the run-directory naming.
+3. **Wrong long-horizon protocol.** §6 rejected reading (b) in advance. Our spatial-only open-loop of 16.00
+   against the paper's 13.33 is a good match, which *supports* (a) for open-loop; but our MPC spatial-only is
+   16.00 against 24.00, **8 points low**, which is the one place our reproduction of the paper's own
+   spatial-only row is weakest. Cost: **offline to re-read, ~2.4 GPU-h to re-run a variant.**
+4. **A real one-seed miss.** The paper's MPC delta is ~1.5 SE at one seed, so a single seed cannot exclude it.
+   Cost: **~4.8 GPU-h** for seeds 200 and 300 across all four runs.
+
+Task 11.5 also pre-registered that an ambiguous control is resolved by adding the two remaining Reporting_Seeds
+**or** by recording it as ambiguous — never by reading a one-seed delta as confirmation. Per
+`SHORT_BUDGET_PILOTS.md` §1, options 2 and 3 are rung-1 offline checks and come before either GPU option.
+
+**Nothing further runs until the branch is chosen and recorded (Requirement 11.7).**

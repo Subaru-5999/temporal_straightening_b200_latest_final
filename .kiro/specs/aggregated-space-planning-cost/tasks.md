@@ -583,7 +583,7 @@ Task labels:
       skipped, 3 failed**
     - _Requirements: 8.6, 9.2, 11.7_
 
-  - [ ] 11.4 [GPU RUN] Positive_Control: reproduce the paper's long-horizon combined-cost gain
+  - [x] 11.4 [GPU RUN] Positive_Control: reproduce the paper's long-horizon combined-cost gain
     - **This is a control, not the reported result.** The reported result remains the short-horizon
       confirmation run in task 14 (Requirements 7.2, 7.5). This task exists to decide what a null short-horizon
       result *means*
@@ -646,7 +646,31 @@ Task labels:
       (Requirements 9.1, 9.2). Not agent-executable: needs the pod, the dataset and the Target_Cell checkpoint
     - _Requirements: 9.1, 9.2, 9.6, 10.4, 11.2_
 
-  - [ ] 11.5 [HUMAN] Record the Positive_Control verdict and what it licenses
+  - [x] 11.5 [HUMAN] Record the Positive_Control verdict and what it licenses
+    - **VERDICT (2026-08-09): FAILED on the decisive MPC leg. Recorded in `PROGRESS_AGG.md` §9.** All four runs
+      completed at seed 100, `goal_H 50`, reading (a), `protocol_ok=True`, ~2.5 GPU-h. Open-loop 16.00 → 16.00
+      and MPC 16.00 → 16.00, so both deltas are **+0.00** against the paper's +6.67 / **+9.33**
+    - **The paired structure is the substantive finding, not the equal rates.** Open-loop returned a
+      **bit-identical** 50-element success vector while `state_dist` changed on 50 of 50 episodes — the term
+      moved every plan and crossed no decision boundary. MPC changed **4 of 50** outcomes, split exactly 2-2
+      (candidate-only 3, 42; baseline-only 41, 48), McNemar exact two-sided **p = 1.000**. A true +9.33 is ~4.7
+      net episodes and would need roughly 5-6 wins against ~1 loss, so four evenly-split discordant pairs is a
+      null with a visible mechanism rather than a noisy one
+    - **Consequence, per this task's own pre-registered branch: section 12 does NOT launch.** The
+      Positive_Control existed to make a short-horizon null interpretable; it has returned the answer that the
+      null would not be. Reading the sweep anyway would decide what the gate meant after seeing which way it
+      fell, which is the failure mode `PROGRESS_MCA.md` §0 exists to prevent
+    - **Not evidence the paper is wrong.** One seed, `n=50`, our own reproduction checkpoint rather than the
+      paper's artifact, and a long-horizon protocol the paper never states (§6 reading (a), recorded as a guess
+      before the run). Four candidate explanations are ranked in `PROGRESS_AGG.md` §9.3 with costs: the
+      term-magnitude ratio (**already measured at 1.5-2.0% of L_spatial** — the leading hypothesis), the
+      `agg`-head/checkpoint-row identity (offline, minutes), the long-horizon protocol reading (offline to
+      re-read; ~2.4 GPU-h to vary), and a genuine one-seed miss (~4.8 GPU-h for seeds 200 and 300)
+    - **Recorded per this task:** step-0 ratio `0.1·L_agg / L_spatial` = **0.0154**, step-99 = **0.0196**
+      (`PROGRESS_AGG.md` §8.4). This is the number the paper never reports, and it is what distinguishes "too
+      weak to matter" from "dominated and broke the planner" — it is unambiguously the former
+    - **Nothing further runs until the branch is chosen and recorded (Requirement 11.7)**
+    - _Requirements: 10.4, 11.2, 11.5, 11.7_
     - **Read the delta, not the absolute.** The platform's own short-horizon reproduction is 75.33 / 82.00
       against the paper's printed 77.33 / 85.33, so the long-horizon spatial-only arm should not be expected to
       land on 13.33 / 24.00 exactly either. The pass condition is the **direction and rough magnitude of the
@@ -675,6 +699,18 @@ Task labels:
     - _Requirements: 10.4, 11.2, 11.5, 11.7_
 
 - [ ] 12. Weight sweep on the Tuning_Seed (6 non-zero open-loop arms, strictly serial, ~35 min total)
+  - > **BLOCKED 2026-08-09 by task 11.5's pre-registered branch. Do not launch any arm of this section.**
+    > The Positive_Control returned a **+0.00** MPC delta against the paper's +9.33 (`PROGRESS_AGG.md` §9), and
+    > 11.5 states that in this branch a short-horizon null is uninterpretable — it could be the plumbing rather
+    > than the method. Unblocking requires one of the §9.3 explanations to be resolved **and** a recorded
+    > Requirement 11.7 approval. Two further notes recorded before this section was blocked, so they are not
+    > hindsight if it is ever unblocked: (1) the measured term-magnitude ratio means `SWEEP_GRID`'s six weights
+    > span contributions of only ~0.2% to ~59% of `L_spatial` and **never reach dominance**, which would need
+    > `w ≈ 5-6.5`, so a flat sweep could not separate "no effect anywhere" from "the useful weight is above the
+    > grid" (`PROGRESS_AGG.md` §8.4); (2) at long horizon `w = 0.1` could not flip a single episode of 50, so
+    > the two smallest grid weights are likely to reproduce the Baseline_Arm vector exactly and be
+    > uninformative by construction (§8.5). Neither observation has been acted on: the grid and
+    > `AGG_WEIGHT_MAX` stay exactly as pre-registered in task 2.1.
   - Every arm:
 
     ```bash
