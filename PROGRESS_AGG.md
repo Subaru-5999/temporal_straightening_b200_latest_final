@@ -44,7 +44,7 @@ distortion is good.
 | Task 11.3 — long-horizon protocol column | **complete** — `PROTOCOL_EXPECTED` keyed on `(config_name, goal_H)`; short columns unweakened; `goal_H` now pinned. See §6 |
 | Task 9.2 — driver-contract test | **complete, promoted out of optional** — §5's recommendation, acted on |
 | Task 11.3b — long-horizon attention deviation | **complete** — gated on the horizon regime; the inner-scope override that defeated it is fixed. See §7.3, §7.4 |
-| Task 11.4 — Positive_Control (~2 GPU-h, revised) | **1 of 4 runs done** — arm A open-loop = **0.16**, see §8. Arm A MPC and both arm B legs outstanding |
+| Task 11.4 — Positive_Control (~2.5 GPU-h, revised) | **2 of 4 runs done** — arm A open-loop **0.16** (§8), arm A MPC **0.16** (§8.3). Both arm B legs outstanding |
 | Task 11.5 — Positive_Control verdict | _not read_ — needs the `w=0` → `w=0.1` delta, so all four runs |
 | Section 12 — the 6-arm weight sweep (~4 GPU-h) | **not launched; gated on BOTH 11.1 and 11.4** |
 | Acceptance gate | not reached |
@@ -399,3 +399,61 @@ materialising and re-reading a 553 MB score matrix per layer.
   confidence and a reader arriving at §8 should not have to infer that it was superseded.
 - **The §7.2 arithmetic was right about the ordering** (25 fits, 50 does not, attention is the dominant term)
   but is still not confirmed numerically. It is being carried as supported-not-verified.
+
+### 8.3 Arm A MPC — RAN (2026-08-08)
+
+| field | value |
+|---|---|
+| arm / setting / seed | `agg_weight=0` / MPC / 100 |
+| protocol | `protocol_ok=True`, `horizon_regime=long`, `goal_H 50`, `sub_planner.horizon 50`, `n_taken_actions 5`, `max_iter 20`, `objective.mode staged` |
+| attention | `attention_impl=sdpa` |
+| **success rate** | **0.16** = 8/50, binomial SE **~5.2 points** |
+| successful episodes (0-indexed) | 1, 10, 28, 29, 37, 41, 45, 48 |
+| `perform_planning_s` | 4096.8 (68 min; 20 replans at ~197 s each) |
+| records | `outcome_rows=21` (`plan0`-`plan19` + `output_final`), `record_failures=0` |
+
+Paper cell: **24.00 ± 6.53**. Measured **16.00** — 8 points low, ~1.2 SE at one seed and inside the paper's own
+3-seed spread. Per §6.1 and task 11.5 the pass condition is the *delta*, not the absolute, so this is the
+control's reference point and not a failure to reproduce. The `n_taken_actions 5` in the manifest is the
+confirmation that the separate `SETTINGS=mpc` invocation used the shipped MPC value; the combined
+`SETTINGS=both` form is what the §7.1 `ProtocolError` was protecting against.
+
+**Two details worth keeping.** MPC and open-loop landed on the *same rate* from **different episodes**: 5 of
+the 8 overlap (28, 29, 37, 41, 48), open-loop won 6/31/39 alone, MPC won 1/10/45 alone. And MPC's trajectory
+was flat at 0.00 through iteration 7, first success at iteration 8, then **plateaued at 0.16 from iteration 15
+to 19** — the last five replans bought nothing. Both are recorded because they are the kind of structure a
+single scalar hides, and disaggregating is what caught the sign errors in `PROGRESS_ACS.md` and
+`PROGRESS_MCA.md`.
+
+### 8.4 The term-magnitude ratio — the number the paper never reports
+
+From arm A open-loop's `agg_instrumentation.json` (`agg_weight=0`, so L_agg is *measured but not in the sum*):
+
+| | `l_spatial` | `l_agg` | raw `l_agg / l_spatial` | contribution at the paper's `w = 0.1` |
+|---|---|---|---|---|
+| step 0 (0 updates) | 0.95589 | 0.14759 | 0.1544 | **1.5%** |
+| step 99 (99 updates) | 0.12196 | 0.023866 | 0.1957 | **2.0%** |
+
+`step_boundary_mismatch: false`, `record_failures: 0`, and the ratio field is `0.0` at `w = 0` with the raw
+L_agg still recorded — Requirement 5.5 observed on real tensors.
+
+**What this predicts, written down before arm B runs.** At the paper-literal `w = 0.1` the aggregated term is
+**1.5-2.0% of the spatial term**. If arm B moves the success rate materially, a ~2% perturbation of the
+objective did it, which would be a strong and slightly surprising claim about the *conditioning* of the
+landscape rather than about the size of the term. If arm B is flat, "the term was too weak to matter at this
+weight" is the reading the instrumentation already supports, and that is exactly the distinction task 11.5 says
+this number exists to make.
+
+**What it says about the pre-registered Sweep_Grid, which is not what I would have guessed.**
+`SWEEP_GRID = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0)` spans contributions of roughly **0.15% to 59%** of L_spatial
+(using the step-99 ratio). So the grid brackets *negligible* through *comparable* — it **never reaches the
+regime where L_agg dominates**, which would need `w ≈ 5-6.5`. The grid is therefore one-sided with respect to
+the failure mode task 11.5 names ("the term dominated and broke the planner"): a flat sweep across all six
+weights could not distinguish "no effect anywhere" from "the useful weight is above 3.0".
+
+**This is recorded, not acted on.** The grid and `AGG_WEIGHT_MAX = 3.0` were pre-registered in task 2.1 before
+any of this was measured, and changing them now — after seeing the ratio — is precisely the §0 failure mode
+that `PROGRESS_MCA.md` §7.2 caught me at. Any extension needs the Requirement 11.7 recorded approval **before**
+a job runs, and task 12.8 already handles the boundary-selection case. Caveat on the number itself: it comes
+from the `w = 0` run, so the optimizer trajectory is the spatial-only one; at nonzero weight the ratio can
+drift because the actions being optimized differ.
