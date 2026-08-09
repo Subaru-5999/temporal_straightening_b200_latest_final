@@ -1157,18 +1157,148 @@ def state_readout(m):
             "feature_dim": int(agg.shape[-1])}
 
 
+#: Suffix marking a state dimension as an **angle**, i.e. periodic.
+#:
+#: Why this exists (rotation-straightening direction, 2026-08-09). `state_readout` fits a
+#: *linear* ridge from the latent onto each raw state value. For a periodic target that is
+#: mis-specified by construction: a network that encodes orientation the natural way, as
+#: `(cos t, sin t)`, cannot be read linearly onto `t` because `t` jumps by a full period at
+#: the wrap point while the representation moves continuously. So a low
+#: `state_readout_r2["block_angle"]` is ambiguous between "the representation discards
+#: orientation" and "the probe cannot read orientation".
+#:
+#: That ambiguity is load-bearing: `PROGRESS_CCR.md` section 6f built a mechanism claim on
+#: `block_angle` = 0.183 against 0.50-0.80 for the four positional dimensions, and section 6e's
+#: own robustness check had already downgraded the matched-control part of that claim to
+#: "mostly noise" at `--num-windows 192`. Before any GPU is spent on the claim, the probe has
+#: to be shown to measure the representation rather than its own specification.
+ANGULAR_DIM_SUFFIX = "_angle"
+
+
+def _infer_angle_period(theta):
+    """`(period, unit)` for an angular state dimension, inferred from its own range.
+
+    Radians unless the observed magnitude exceeds `2*pi`, which no radian-valued angle can do
+    once wrapped. Recorded in the report rather than assumed, because reading degrees as
+    radians would make the circular readout silently meaningless -- the same class of error as
+    invoking a bound without checking which regime the data occupies.
+    """
+    import numpy as np
+
+    span = float(np.nanmax(np.abs(theta))) if theta.size else 0.0
+    if span > 2.0 * np.pi + 1e-6:
+        return 360.0, "degrees"
+    return 2.0 * np.pi, "radians"
+
+
+def circular_state_readout(m):
+    """Wrap-aware readout for the angular state dimensions. Purely additive.
+
+    Predicts `(cos t, sin t)` from the same latent, on the **same window split** as
+    `state_readout`, then scores with the circular analogue of R^2:
+
+        circular_r2 = 1 - sum(1 - cos(t - t_hat)) / sum(1 - cos(t - t_circmean))
+
+    `1 - cos` is the wrap-aware error, and the denominator is the same error against the best
+    constant predictor (the circular mean), so the quantity keeps R^2's meaning: 0 is
+    "no better than a constant", 1 is exact.
+
+    `state_readout` is left untouched, so every previously recorded
+    `state_readout_r2` stays reproducible and this adds a second, better-specified reading
+    beside it rather than replacing a number the progress logs already cite.
+    """
+    import numpy as np
+
+    names = [n for n in STATE_DIM_NAMES if n.endswith(ANGULAR_DIM_SUFFIX)]
+    out = {"angular_dims": names, "per_dim": {n: None for n in names}}
+    if not names or m["windows"] < 4:
+        return out
+
+    agg, state = m["agg"], m["state"]
+    n = agg.shape[0]
+    n_train = max(1, min(n - 1, int(round(RIDGE_TRAIN_FRACTION * n))))
+    x_train = agg[:n_train].reshape(-1, agg.shape[-1])
+    x_test = agg[n_train:].reshape(-1, agg.shape[-1])
+    s_train = state[:n_train].reshape(-1, state.shape[-1])
+    s_test = state[n_train:].reshape(-1, state.shape[-1])
+
+    for name in names:
+        d = STATE_DIM_NAMES.index(name)
+        th_tr, th_te = s_train[:, d], s_test[:, d]
+        period, unit = _infer_angle_period(np.concatenate([th_tr, th_te]))
+        k = 2.0 * np.pi / period
+
+        y_tr = np.stack([np.cos(k * th_tr), np.sin(k * th_tr)], axis=-1)
+        pred = _ridge_predict(x_train, y_tr, x_test)
+        resid = k * th_te - np.arctan2(pred[:, 1], pred[:, 0])
+
+        err = 1.0 - np.cos(resid)
+        circ_mean = np.arctan2(np.sin(k * th_te).mean(), np.cos(k * th_te).mean())
+        base = 1.0 - np.cos(k * th_te - circ_mean)
+        total = float(base.sum())
+
+        out["per_dim"][name] = {
+            "circular_r2": 0.0 if total < 1e-12 else float(1.0 - err.sum() / total),
+            "period": period,
+            "unit": unit,
+            "mean_abs_angular_error_rad": float(
+                np.abs(np.arctan2(np.sin(resid), np.cos(resid))).mean()
+            ),
+            "n_test_frames": int(th_te.size),
+        }
+    return out
+
+
 def readouts_from_measurement(m):
     """Both readouts for one model, in the report's shape (minus the reference)."""
     curvature = curvature_readout(m)
     state = state_readout(m)
+    circular = circular_state_readout(m)
     return {
         "curvature_gap": {"aggregate": curvature["aggregate"],
                           "per_dim": curvature["per_dim"]},
         "state_readout_r2": {"aggregate": state["aggregate"],
                              "per_dim": state["per_dim"]},
+        # Additive (rotation direction, 2026-08-09): the wrap-aware reading of the angular
+        # dimensions, beside the linear one rather than instead of it.
+        "state_readout_circular": circular,
+        "orientation_readable": _orientation_readable(state, circular),
         "_curvature_detail": curvature,
         "_state_detail": state,
     }
+
+
+def _orientation_readable(state, circular):
+    """`max(linear, circular)` per angular dimension -- the decision-relevant quantity.
+
+    **Neither readout dominates, and that is measured, not assumed**
+    (`tests/test_circular_state_readout.py`): on synthetic latents where the ground truth is
+    known, a `(cos t, sin t)` encoding read *linearly* scores ~0.60, while a raw-angle encoding
+    read *circularly* scores ~0.50, because a linear map can produce neither `t` from
+    `(cos t, sin t)` nor `cos t` from `t`. Each readout is blind to the other's encoding.
+
+    So a single low number proves nothing. Only **both** readouts being low is evidence that the
+    representation does not carry orientation in any linearly-recoverable form, and that is the
+    quantity any claim about orientation loss has to be built on.
+
+    Calibration worth carrying beside the result: an exactly `(cos, sin)`-encoded angle read
+    linearly gives ~0.60, i.e. it lands inside the 0.50-0.80 band the four positional dimensions
+    occupy. `PROGRESS_CCR.md` section 5c's observed `block_angle` = 0.183 is far below that, so
+    it is **not** explained by the linear readout's mis-specification alone.
+    """
+    out = {}
+    for name, entry in circular.get("per_dim", {}).items():
+        linear = state.get("per_dim", {}).get(name)
+        circ = None if entry is None else entry.get("circular_r2")
+        candidates = [v for v in (linear, circ) if v is not None]
+        out[name] = {
+            "linear_r2": linear,
+            "circular_r2": circ,
+            "best_r2": max(candidates) if candidates else None,
+            "which": None if not candidates
+            else ("circular" if circ is not None and circ == max(candidates) else "linear"),
+        }
+    return out
 
 
 # --------------------------------------------------------------------------

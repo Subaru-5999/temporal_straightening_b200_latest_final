@@ -81,6 +81,11 @@ ALLOWED_FILES = frozenset(
         # nothing, and read by no source file, so it cannot influence a measured number. It is allowlisted
         # because losing it to a scope violation is exactly the context loss it exists to prevent.
         "RESEARCH_GOAL.md",
+        # Progress log for the rotation direction, added 2026-08-09. Same category as the other
+        # PROGRESS_*.md files: measurements, pre-registered gates and errors, read by no source file.
+        # It holds the rung-1 gate that must exist before the probe runs, so it lands with the code
+        # rather than after it.
+        "PROGRESS_ROT.md",
         # Required addition, not in the Requirement 5.6 prose: the repo's .gitignore ignores "*.sh" with an
         # explicit per-script negation allowlist, so `run_ccr_pilot.sh` could not be tracked at all without
         # adding a `!run_ccr_pilot.sh` line. That single line is enabling infrastructure for a file the
