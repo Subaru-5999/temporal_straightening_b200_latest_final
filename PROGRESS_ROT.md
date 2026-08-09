@@ -420,3 +420,76 @@ just probed for readouts — so it depends on `checkpoints_off_full` finishing.
 
 GPU-hours spent on this arm: **0** for every measurement so far. The only spend is the OFF training
 pair (~13 GPU-h), of which the 8k half is already done.
+
+---
+
+## 10. OFF @ 8k — the matched control. `best_r2 = 0.871` against ON's 0.394
+
+`probe_outputs/rot_rung2_off8k.json`, `checkpoints_off8k/test/pusht_False_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05`
+(sha256 `c2ad85d3…` UNCHANGED), `--num-windows 192`.
+
+| arm | linear | circular | **best** | which |
+|---|---|---|---|---|
+| **OFF @ 8k** (`straighten=False`, lr 1e-5) | 0.663520 | **0.870666** | **0.870666** | circular |
+| ON @ 8k (`aggcos1e-1`, lr 1e-5) | 0.394319 | 0.343252 | 0.394319 | linear |
+| ON @ 124k (`aggcos1e-1`, lr 1e-5) | 0.166436 | **−0.021162** | 0.166436 | linear |
+
+**Matched on everything but the straightening term**: same env, encoder, `lr 1e-5`, batch, 8,000 steps,
+CCR and MCA off in both. The ON arm is the bitwise 8k prefix of the baseline run. So the
+**+0.477** difference is caused by the term, not by budget, lr or data — the same matched-control
+logic `PROGRESS_CCR.md` §6e used.
+
+### 10.1 The mechanism, read off the `which` column
+
+Without straightening the model encodes orientation the natural way — as `(cos θ, sin θ)` — and the
+circular readout recovers it at **0.871**, while the linear readout sees only 0.664, exactly the
+under-reporting the calibration predicts for that encoding. Turn straightening on and the circular
+reading **collapses**: 0.871 → 0.343 → **−0.021**.
+
+**Straightening destroys the circular structure of the orientation code specifically.** That is a
+sharper and more mechanistic statement than "orientation is poorly encoded", and it is visible only
+because the probe reads both specifications — the linear-only view would have shown 0.664 → 0.394 →
+0.166 and missed that the *periodic* component is what dies.
+
+Combined with §9.1(a) — rotation concentrated in ~10% of latent steps — the account is now: a uniform
+`1 − cos(v_t, v_{t+1})` penalty bears on the heavy-tailed minority of transitions that rotate, and
+what it removes is the circular code those transitions carry.
+
+### 10.2 My §7.2 gate asks the wrong question, and I am not rewriting it
+
+§7.2's CONFIRMED branch tests the **interaction** `(OFF_full − ON_full) − (OFF_8k − ON_8k) ≥ 0.15`,
+written on the assumption — from the 0.394 → 0.166 trajectory — that the effect would be *small at 8k
+and accumulate*. It is not small at 8k. It is **0.477** at 8k.
+
+Consequences, stated plainly:
+
+- The **REFUTED** branch required `OFF_8k ≈ ON_8k`. That is now decisively false, so refutation
+  cannot fire.
+- The **interaction** may well come out below 0.15 even though the causal claim is strongly supported,
+  because the main effect is nearly saturated at 8k. Reaching interaction ≥ 0.15 needs
+  `OFF_full ≥ 0.793`.
+- **The causal claim is carried by the matched 8k pair, not by the interaction.** At matched budget
+  and lr with only straightening differing, 0.871 vs 0.394 *is* the causal test.
+
+**This observation was made after seeing the data, so it does not get to relabel the gate.** When
+`OFF_full` lands I will report the §7.2 interaction verdict as whatever it computes to, and report the
+matched-8k main effect separately as the quantity that actually bears on causation. The lesson for the
+*next* pre-registration: when a mechanism's time-course is unknown, gate on the **main effect at
+matched budget** and treat the interaction as a secondary, descriptive question.
+
+### 10.3 Required before this means what it looks like: is the effect specific to `block_angle`?
+
+The console output was truncated before the `state_readout_r2` table, so the four positional
+dimensions for OFF @ 8k are unread. **If OFF reads *every* dimension far better, straightening
+degrades state readability in general and `block_angle` is not special** — which would still be a
+finding, but a different and much weaker one than the arm's claim.
+
+Reference points for that comparison, ON @ 8k at n=192 (`probe_outputs/rot_rung2_ctrl8k.json`) and at
+n=64 (`PROGRESS_CCR.md` §6e: agent_x 0.747, agent_y 0.535, block_x 0.869, block_y 0.712,
+aggregate 0.701). Both JSONs are already on disk; the comparison costs nothing.
+
+**Pre-registered reading, written before the positional rows are looked at:** the claim is
+*specificity*. If `block_angle` improves by ≥0.30 when straightening is removed while **no positional
+dimension improves by more than 0.15**, the effect is orientation-specific and the arm's mechanism
+stands. If the positional dimensions improve comparably, the finding degrades to "straightening
+reduces linear state decodability across the board" and the rotation story is not supported.
