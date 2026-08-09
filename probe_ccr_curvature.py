@@ -1608,6 +1608,15 @@ def build_report(args, ckpt_path, cfg_path, before, after, train_cfg, measuremen
                 "reference_per_dim": _round_map(
                     references["state_readout_r2"]["per_dim"]),
             },
+            # Additive (rotation direction, 2026-08-09). Deliberately carries **no reference**:
+            # `resolve_references` covers the two pre-existing readout names, and the pristine
+            # reference is empirically unstable on this dimension -- `PROGRESS_CCR.md` §6c
+            # recorded pristine `block_angle` at -0.995 where this run reports +0.510, from a
+            # fresh random init each time. Attaching a reference here would invite a comparison
+            # that cannot bear weight. The load-bearing comparison is within-run, against the
+            # four positional dimensions.
+            "state_readout_circular": readouts.get("state_readout_circular"),
+            "orientation_readable": readouts.get("orientation_readable"),
         },
         "curvature_unperturbed": {
             "aggregate": _round(readouts["_curvature_detail"]["unperturbed_aggregate"]),
@@ -1641,6 +1650,32 @@ def _fmt(value, width=12, places=6):
     if value is None:
         return f"{'n/a':>{width}}"
     return f"{value:>{width}.{places}f}"
+
+
+def _print_orientation_block(readable):
+    """The angular dimensions read twice, plus the `max` that any claim must rest on.
+
+    Printed rather than left in the JSON because the number this decides -- whether a low
+    `state_readout_r2["block_angle"]` means "orientation is absent" or "the linear probe cannot
+    read it" -- is the one a reader of the console output will otherwise take from the linear
+    table alone, which is exactly the ambiguity this block exists to remove.
+    """
+    if not readable:
+        return
+    print()
+    print("orientation_readable   (angular dims read twice; best_r2 is the decision quantity)")
+    print(THIN)
+    print(f"  {'dimension':<14}{'linear':>12}{'circular':>12}{'best':>12}   which")
+    for dim, entry in sorted(readable.items()):
+        if not isinstance(entry, dict):
+            continue
+        print(f"  {dim:<14}{_fmt(entry.get('linear_r2'))}"
+              f"{_fmt(entry.get('circular_r2'))}{_fmt(entry.get('best_r2'))}"
+              f"   {entry.get('which') or 'n/a'}")
+    print("  (calibration, tests/test_circular_state_readout.py: an exactly (cos,sin)-encoded")
+    print("   angle read LINEARLY scores ~0.60, and a raw-angle encoding read CIRCULARLY scores")
+    print("   ~0.50 -- each readout is blind to the other's encoding, so only BOTH being low is")
+    print("   evidence that orientation is not represented)")
 
 
 def print_report(report):
@@ -1678,6 +1713,8 @@ def print_report(report):
         if name == "curvature_gap":
             print("  (per-dimension values are restricted to the top-tercile motion "
                   "subset for that dimension)")
+
+    _print_orientation_block(r.get("orientation_readable") or {})
 
     gate = report["gate"]
     print()
