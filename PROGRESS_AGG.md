@@ -47,7 +47,8 @@ distortion is good.
 | Task 11.4 — Positive_Control (~2.5 GPU-h) | **complete, all 4 runs** — 16.00 / 16.00 open-loop, 16.00 / 16.00 MPC (§8, §8.3, §8.5, §9) |
 | Task 11.5 — Positive_Control verdict | **read: FAILED on the decisive MPC leg.** Delta **+0.00** against the paper's +9.33; McNemar p = 1.000 on 4 discordant pairs. See §9 |
 | Section 12 — the 6-arm weight sweep (~4 GPU-h) | **BLOCKED by 11.5's pre-registered branch — does not launch.** §9.2 |
-| Next decision | §9.3 — four candidate explanations; two are rung-1 offline, two cost GPU. **Awaiting a recorded choice (Requirement 11.7)** |
+| Rung-1 offline checks | **done, 0 GPU-h (§9.4)** — explanation 2 (wrong checkpoint row) **ruled out**; explanation 3 (protocol) **unresolvable from the paper**; and the control is shown to have been **underpowered by design** against the paper's mean MPC effect of +4.00 |
+| Next decision | §9.4/§9.5 — the wrapper is now validated by four things other than the control, but 11.5's branch was pre-registered. **Awaiting an explicit recorded choice (Requirement 11.7)** |
 | Acceptance gate | not reached |
 
 **GPU-hours spent on this arm so far: ~0.05** (two 85-second evaluations).
@@ -585,3 +586,90 @@ Task 11.5 also pre-registered that an ambiguous control is resolved by adding th
 `SHORT_BUDGET_PILOTS.md` §1, options 2 and 3 are rung-1 offline checks and come before either GPU option.
 
 **Nothing further runs until the branch is chosen and recorded (Requirement 11.7).**
+
+### 9.4 Rung-1 offline checks (2026-08-09, 0 GPU-h) — explanation 2 ruled out, explanation 3 unresolvable, and a power problem in our own control
+
+**Explanation 2 — wrong `agg` head / wrong checkpoint row: RULED OUT.** `REPRODUCTION.md` §2a and §3 use
+`pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05` as *the* PushT **✓ run** — `encoder=dino_channel`
+(DINOv2 patch + proj 14×14×8), `training.straighten=aggcos1e-1`, `encoder_lr=1e-5`, 2 epochs — whose paper
+target is 77.33 / 85.33. That is the `+ Proj` with `L_curv` ✓ row. Right checkpoint, right row, right training
+recipe. No further doubt here.
+
+**Explanation 3 — the long-horizon protocol: confirmed unresolvable from the paper.** `paper_tex/sec/1_main.tex`
+Long-horizon paragraph read in full: it says only *"a longer-horizon setting where the target is 50 steps away"*
+and gives **no planner value at all**. `paper_tex/sec/2_appendix.tex` Table (`Subplanner horizon 25`,
+`# Executed actions 25`, footnoted *"This is for open-loop. If using MPC, we execute the first 5 actions"*) is
+the short-horizon protocol, exactly as §6 recorded. So reading (a) stays a recorded guess; it cannot be
+promoted or refuted by reading, only by spending GPU on reading (b). §6's pre-registration stands unamended.
+
+**The finding that actually matters — our paired SE, and the paper's own effect-size distribution.**
+
+I quoted ~5.2 points per cell earlier. That is the *marginal* SE and it is the wrong statistic here: both arms
+draw identical episodes at the same seed, so the delta is a **paired** quantity and its SE comes from the
+discordant pairs alone.
+
+| our delta | discordant | SE(delta) | 95% CI | paper's value | verdict |
+|---|---|---|---|---|---|
+| open-loop **+0.00** | 0 of 50 | — | ~[−6.00, +6.00] (rule of three) | +6.67 | just **outside** |
+| MPC **+0.00** | 4 of 50 (2-2) | **4.00** | **[−7.84, +7.84]** | +9.33 | **2.33 SE, p = 0.020** |
+
+So the control is *sharper* than I said: it gives moderate evidence against a `+9.33` effect on this
+checkpoint, not merely "a null".
+
+**But now the paper's own table, all four combined-cost cells, with SE of the 3-seed mean:**
+
+| cell | spatial → combined | delta | SE | |delta|/SE |
+|---|---|---|---|---|
+| PushT `+ Proj` ✓ **MPC** | 24.00 → 33.33 | **+9.33** | 4.47 | **2.09** |
+| PushT ResNet ✓ MPC | 33.33 → 36.00 | +2.67 | 4.20 | 0.64 |
+| Medium `+ Proj` ✓ MPC | 88.00 → 92.00 | +4.00 | 3.59 | 1.11 |
+| Medium ResNet ✓ MPC | 98.67 → 98.67 | **+0.00** | 1.28 | 0.00 |
+| PushT `+ Proj` ✓ OL | 13.33 → 20.00 | +6.67 | 2.18 | 3.06 |
+| PushT ResNet ✓ OL | 10.67 → 13.33 | +2.67 | 3.93 | 0.68 |
+| Medium `+ Proj` ✓ OL | 68.00 → 66.67 | **−1.33** | 6.63 | 0.20 |
+| Medium ResNet ✓ OL | 76.00 → 68.67 | **−7.33** | 4.47 | 1.64 |
+
+**MPC deltas: mean +4.00**, range +0.00 to +9.33 — **one** cell clears 2 SE and three sit inside noise, one of
+them an *exact tie at ceiling* (98.67 → 98.67), which the paper's phrase "improves over using the spatial cost
+alone across all models under MPC" does not describe. **Open-loop deltas: mean +0.17**, two of four negative.
+
+**Three consequences, and the third is about our own design.**
+
+1. Our MPC CI [−7.84, +7.84] **contains the paper's mean MPC effect of +4.00**. So our result is inconsistent
+   with the single largest cell in their table and perfectly consistent with their typical one. We happened to
+   target the outlier.
+2. Our open-loop **+0.00** is dead-centre of the paper's own open-loop distribution (mean +0.17). On open-loop
+   our result **agrees** with their evidence taken as a whole, and disagrees only with the one PushT cell.
+3. **Recorded against myself:** task 11.4 designed a control whose only detectable target was the paper's
+   largest and least typical cell. At a paired SE of 4.00, `+4.00` — their mean effect — is a 1.0 SE
+   quantity, i.e. undetectable. Adding seeds 200 and 300 (the option 11.5 offers) cuts SE to ~2.3, making +4.00
+   a ~1.7 SE quantity: **still underpowered**, for ~4.8 GPU-h. Reaching 80% power on +4.00 needs SE ≈ 1.4, so
+   roughly 9 seeds or `n_evals ≈ 400` — on the order of **15 GPU-h of MPC legs**. The control as specified could
+   never have validated the wrapper against the effect size the paper actually reports, and I did not notice
+   that when writing §6.1's "the control can detect a gross wiring failure, not a small effect" — which said the
+   right thing without following it to its conclusion.
+
+### 9.5 What the wrapper is now validated by, independent of the control
+
+The concern 11.5 raised was "the wrapper is subtly wrong somewhere the CPU property tests cannot reach". Four
+pieces of evidence now bear on that directly, none of which is the control:
+
+1. **Task 11.1**: at `w = 0` the wrapper is *numerically identical* to frozen `plan.py` — same 50-element
+   boolean vector, `state_dist` equal to 8 significant figures. The plumbing around the objective is exact.
+2. **`L_agg` is minimised by the optimizer**: 0.1476 → 0.0239 across the 100 GD steps, an **84% reduction**,
+   against L_spatial's 0.956 → 0.122 (87%). A malformed or wrongly-targeted term would not descend comparably
+   to the term the planner is built around. This is the check that most directly rules out a sign or
+   wrong-goal error, and it comes free from `agg_instrumentation.json`.
+3. **The term reaches the actions**: at `w = 0.1`, 50 of 50 episodes have different `state_dist`, and 4 of 50
+   MPC outcomes flip. It is live, differentiable and consequential.
+4. **Properties 1 and 3** (tasks 4.2, 4.3): bitwise-zero identity over `inf`/`nan`/denormals, and exact reuse
+   of the frozen staged dispatch and per-frame coefficients.
+
+So "our plumbing is broken" is now a **narrow** residual risk rather than the leading hypothesis. The leading
+hypothesis is §9.3 item 1 — the term contributes 1.5-2.0% of the objective at `w = 0.1` — combined with the
+newly-quantified fact that the paper's own typical effect is +4.00 and our control could not have seen it.
+
+**This is a post-hoc re-argument and is marked as such.** It was assembled after seeing the control fail. It
+does **not** by itself unblock section 12: 11.5's branch was pre-registered and only an explicit recorded
+approval (Requirement 11.7) may override it. Recording the argument is legitimate; acting on it silently would
+be the §0 failure mode.
