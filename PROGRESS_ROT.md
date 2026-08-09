@@ -234,3 +234,73 @@ B and C. Measuring the control before the treatments exist is what keeps the ref
 or near the positional band (≳0.35 absolute) while C stays near 0.28. If B comes back near C, the
 mechanism is refuted and I will record that as the arm's outcome rather than looking for a third
 explanation.
+
+---
+
+## 7. Control C measured, and a design correction — 2026-08-09, 0 GPU-h
+
+`probe_outputs/rot_rung2_ctrl8k.json`, `checkpoints_ctrl8k` (straightening **ON**, `lr 1e-5`, 8,000
+steps, sha256 `2c7b7cf5…` UNCHANGED), `--num-windows 192`:
+
+| `block_angle` | linear | circular | **best** |
+|---|---|---|---|
+| **ON @ 8k** (control C) | 0.394319 | 0.343252 | **0.394319** |
+| **ON @ 124k** (§5) | 0.166436 | **−0.021162** | **0.166436** |
+
+**Orientation readability falls 58% across the same training run** (0.394 → 0.166 linear), and the
+circular reading collapses from moderately readable to *worse than a constant predictor*
+(0.343 → −0.021). `PROGRESS_CCR.md` §6f had this as 0.278 → 0.183 on the linear readout at lower
+sampling; measured with both readouts at n=192 it is far sharper. Note the two readouts **agree** at
+8k (0.394 / 0.343) and **diverge** at 124k (0.166 / −0.021), which is itself informative: whatever
+training removes, it removes the circularly-structured part of the orientation code first.
+
+### 7.1 Two problems with the §6 gate, recorded not repaired
+
+**(a) The `B ≥ 0.5·P` clause is non-binding.** At 8k the four positional dimensions read ~0.72
+(`PROGRESS_CCR.md` §6e: 0.747 / 0.535 / 0.869 / 0.712), so `0.5·P ≈ 0.36` and the control's 0.394
+already clears it. The operative threshold is therefore `B − C ≥ 0.15` alone, i.e. `B ≥ 0.544`.
+The §6 numbers stand as written; this records what they actually bind on.
+
+**(b) The 8k-only design is probably underpowered, and this is the task-11.4 error again.** The
+0.394 → 0.166 trajectory says the mechanism is **cumulative over 124k steps**. At 8k straightening
+has acted for 6.5% of the budget, so ON-vs-OFF at 8k can be small even if the mechanism is real —
+exactly the mistake logged in `PROGRESS_AGG.md` §10.3, where a control was powered against the
+largest cell instead of the effect actually expected. Recorded one rung after writing that lesson
+into `RESEARCH_GOAL.md`.
+
+### 7.2 The 2x2, pre-registered before either OFF arm is trained
+
+Half of it already exists at zero cost:
+
+| | 8,000 steps | 123,858 steps |
+|---|---|---|
+| straightening **ON** | **0.394** (have) | **0.166** (have) |
+| straightening **OFF** | needed, ~47 min | needed, ~12 h |
+
+**All four cells at `encoder_lr = 1e-5`, so straightening is the only variable.** The paper's ✗
+protocol uses `lr 1e-6` (Table 3 footnote) and that run is a *separate* need — it is the missing ✗
+baseline for the results table, since `REPRODUCTION.md`'s ✗ checkpoint lived in a tree that no longer
+exists on this pod. It is not part of this causal test, and conflating the two is what §6's arm C was
+guarding against.
+
+Let `ON_8k = 0.394`, `ON_full = 0.166`, and `OFF_8k`, `OFF_full` be the measured
+`orientation_readable.block_angle.best_r2` of the new arms.
+
+| condition | verdict |
+|---|---|
+| **`(OFF_full − ON_full) − (OFF_8k − ON_8k) ≥ 0.15`** — the interaction, i.e. the ON/OFF gap *widens* with training | **CAUSAL CONFIRMED.** Straightening progressively destroys orientation. This is the paper's central claim and its first figure |
+| **`OFF_full` also falls to ≈ `ON_full`** (within 0.08) while `OFF_8k ≈ ON_8k` | **REFUTED — prolonged training destroys orientation regardless of straightening.** Still a real and unreported finding about the architecture, but **not** about straightening, and not the ICLR story. The arm closes and the finding is written up as an analysis note |
+| interaction between 0.05 and 0.15, or signs inconsistent | **MIDDLE.** Record; the decision on further spend is explicit and requires approval |
+
+**Pre-registered prediction, so it can fail:** if straightening is the cause, `OFF_full` should stay
+near or above 0.35 while `ON_full` sits at 0.166, and the 8k cells should differ far less. If
+`OFF_full` lands near 0.166, the mechanism is refuted and that is the recorded outcome — I will not
+go looking for a fourth explanation.
+
+**Cost: ~13 GPU-h** (47 min + 12 h) plus two ~2 min CPU probes. It also yields the full-budget
+straightening-OFF checkpoint this project has never had, which every future comparison needs.
+
+**Still unchecked and still cheap: §5.2 explanation (3).** Whether the logged PushT T-block actually
+rotates enough for orientation to be worth encoding. If its angular variance is negligible, "the
+representation discards orientation" is uninteresting. That is a dataset-only measurement, no GPU, and
+it should be done while the training runs.
