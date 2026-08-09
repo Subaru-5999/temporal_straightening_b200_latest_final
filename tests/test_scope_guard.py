@@ -86,6 +86,12 @@ ALLOWED_FILES = frozenset(
         # It holds the rung-1 gate that must exist before the probe runs, so it lands with the code
         # rather than after it.
         "PROGRESS_ROT.md",
+        # Dataset-only rotation probe, added 2026-08-09. Standalone rather than a fourth `--readout`
+        # in probe_ccr_curvature.py: it needs no checkpoint, no model and no hydra -- it reads
+        # states.pth and does arithmetic -- and keeping it out of that dispatch means it cannot
+        # perturb the three readouts the CCR/ACS/MCA gates were measured with. Reads nothing under
+        # checkpoints/ and writes only probe_outputs/.
+        "probe_pusht_rotation.py",
         # Required addition, not in the Requirement 5.6 prose: the repo's .gitignore ignores "*.sh" with an
         # explicit per-script negation allowlist, so `run_ccr_pilot.sh` could not be tracked at all without
         # adding a `!run_ccr_pilot.sh` line. That single line is enabling infrastructure for a file the

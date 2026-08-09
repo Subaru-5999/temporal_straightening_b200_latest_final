@@ -304,3 +304,50 @@ straightening-OFF checkpoint this project has never had, which every future comp
 rotates enough for orientation to be worth encoding. If its angular variance is negligible, "the
 representation discards orientation" is uninteresting. That is a dataset-only measurement, no GPU, and
 it should be done while the training runs.
+
+---
+
+## 8. DATA GATE — WRITTEN 2026-08-09, BEFORE `probe_pusht_rotation.py` RUNS
+
+Closes §5.2 explanation (3), the last competing explanation that costs nothing to test. Dataset only:
+`states.pth`, no checkpoint, no model, no GPU, no hydra, no video decode.
+
+**Why it can void the arm.** §5 and §7 measure that the trained model barely encodes `block_angle`
+and that readability falls 58% over training. **Both are uninteresting if the block does not rotate.**
+An encoder that reallocates capacity away from a dimension carrying no signal is behaving correctly,
+not destroying information, and the 0.394 → 0.166 trajectory would then be a *success* of training
+rather than a pathology.
+
+Read at the **25-step** horizon, the paper's short goal distance (`goal_H` in `conf/plan_gd.yaml`).
+`m` = median `|Δblock_angle|` in degrees over 25 env steps; `f15` = fraction of 25-step spans with
+`|Δblock_angle| > 15°`.
+
+| condition | verdict |
+|---|---|
+| **`m ≥ 10°` AND `f15 ≥ 0.20`** | **SUBSTANTIAL.** The block rotates materially over a planning horizon, so orientation is information the representation could have kept and did not. §5/§7 stand and the arm proceeds |
+| **`m < 3°` OR `f15 < 0.05`** | **NEGLIGIBLE — the direction is VOID.** There was nothing to discard. §5 and §7 are then facts about a dimension with no signal, the mechanism story collapses, and the arm closes with the 13 GPU-h of §7.2 unspent |
+| otherwise | **MARGINAL.** Rotation present but modest. Recorded; the claim weakens to "orientation carries less signal than position *and* is encoded worse than that gap explains", which needs the variance comparison to carry it, and the decision on further spend is explicit |
+
+The thresholds are also in `probe_pusht_rotation.verdict()` as executable code, so the log and the
+script cannot drift apart.
+
+**Reported alongside, not gating:** block translation over the same spans, so rotation is comparable
+against the motion the model *does* encode; the 5- and 50-step horizons; and the fraction exceeding
+5°/15°/30°/45°/90°. That last distribution is the axis `RESEARCH_GOAL.md` §2.3 needs for the
+within-PushT test — per-episode required rotation against per-episode benefit, n≈150 paired episodes
+instead of n=4 environments — so this run also selects the split point for that test, and selecting
+it from the *data distribution* before any success rate is looked at is what keeps it honest.
+
+**Wrap-awareness is not optional and is tested.** Every angle difference goes through
+`atan2(sin d, cos d)`. A naive difference across the period boundary yields a spurious near-full
+rotation, which would inflate `m` and `f15` and manufacture exactly the `SUBSTANTIAL` verdict the
+arm wants. `tests/test_pusht_rotation_probe.py` pins this: 15 tests including
+`test_naive_difference_would_have_been_wrong`, which records that the naive form reads 6.18 rad where
+the truth is 0.10, and `test_gate_says_negligible_for_a_static_block`, which proves the VOID verdict
+is reachable rather than decorative. Suite: **419 passed**, 12 skipped, 3 pre-existing CUDA-only
+failures.
+
+**Status:** gate written, probe implemented and CPU-validated, **not yet run**. The
+straightening-OFF full run is training concurrently (`checkpoints_off_full`, `pusht_False_..._lr1e-05`,
+~11 h remaining at 2.90 it/s); this probe is CPU-only and reads a different file, so it does not
+contend for the MIG slice.
