@@ -1,5 +1,13 @@
 # PROGRESS — Aggregated-Space Planning Cost
 
+> **ARM CLOSED 2026-08-09 at ~2.5 GPU-h. See §10 for the closing record.**
+> The Positive_Control (task 11.4) returned a **+0.00** MPC delta against the paper's +9.33, and task 11.5's
+> pre-registered branch blocks the sweep in that case. Closed by recorded decision rather than by overriding the
+> gate. **The short-horizon sweep and confirmation were never run, so this arm is closed as *not demonstrated*,
+> not as *refuted*.** Baseline intact; no reported cell was touched.
+> Headline measurement: at the paper's literal `w = 0.1`, `0.1 · L_agg` is **1.5-2.0% of `L_spatial`** — live,
+> well-formed, descends 84% under the planner, perturbs 50 of 50 plans, and flips 4 of 50 outcomes 2-2.
+
 Live state of the aggregated-space arm (`L_plan = L_spatial + w · L_agg`). Written so the work can be
 resumed cold, without the conversation.
 
@@ -49,7 +57,8 @@ distortion is good.
 | Section 12 — the 6-arm weight sweep (~4 GPU-h) | **BLOCKED by 11.5's pre-registered branch — does not launch.** §9.2 |
 | Rung-1 offline checks | **done, 0 GPU-h (§9.4)** — explanation 2 (wrong checkpoint row) **ruled out**; explanation 3 (protocol) **unresolvable from the paper**; and the control is shown to have been **underpowered by design** against the paper's mean MPC effect of +4.00 |
 | Next decision | §9.4/§9.5 — the wrapper is now validated by four things other than the control, but 11.5's branch was pre-registered. **Awaiting an explicit recorded choice (Requirement 11.7)** |
-| Acceptance gate | not reached |
+| Section 14 — confirmation run, the **reported** result (~3 GPU-h) | **never launched.** This is why the arm is closed as *not demonstrated* rather than *refuted* |
+| Acceptance gate | **not reached; arm closed (§10)** |
 
 **GPU-hours spent on this arm so far: ~0.05** (two 85-second evaluations).
 
@@ -673,3 +682,81 @@ newly-quantified fact that the paper's own typical effect is +4.00 and our contr
 does **not** by itself unblock section 12: 11.5's branch was pre-registered and only an explicit recorded
 approval (Requirement 11.7) may override it. Recording the argument is legitimate; acting on it silently would
 be the §0 failure mode.
+
+---
+
+## 10. ARM CLOSED — 2026-08-09, by recorded decision (Requirement 11.7)
+
+**Decision: close the aggregated-space arm. Section 12's sweep, task 14's confirmation and task 15's
+Acceptance_Gate do not run.** Chosen over overriding 11.5's pre-registered branch, over powering the control
+(~15 GPU-h), and over testing reading (b) (~2.4 GPU-h). The deciding consideration: no post-hoc override goes on
+the record, and the arm's honest ceiling did not justify further spend.
+
+**Total cost: ~2.5 GPU-h** (11.1's two 85 s evaluations, 11.4's four runs at 222 s / 4109 s / 221 s / 4107 s, plus
+two 13 s OOM aborts). Plus rung-1 offline work at 0 GPU-h.
+
+### 10.1 The result, stated as a finding rather than a failure
+
+At the paper's own long-horizon setting, on the paper's own `+ Proj` / `L_curv` ✓ PushT checkpoint, at the
+paper's own literal weight `w = 0.1`, the combined planning cost
+`L_plan = L_spatial + 0.1 · L_agg` produced **no change in goal-reaching success**: 16.00 → 16.00 open-loop with
+a **bit-identical** 50-episode outcome vector, and 16.00 → 16.00 MPC with **4 of 50** outcomes flipping, split
+exactly 2-2 (McNemar p = 1.000). Paired SE on the delta is 4.00 points, so the paper's +9.33 sits 2.33 SE away
+(p = 0.020) and its +6.67 open-loop is outside the rule-of-three bound.
+
+**The mechanism is measured, not inferred.** `0.1 · L_agg` is **1.5-2.0%** of `L_spatial` (step-0 ratio 0.0154,
+step-99 0.0196). The term is live and well-formed — it descends 84% under the planner's own optimizer, and it
+perturbs 50 of 50 plans — it is simply far too small at this weight to move a decision boundary. This is the
+number the paper never reports, and it is the arm's most transferable output.
+
+**The paper's own evidence is weaker than its single headline cell.** Across the four combined-cost MPC cells of
+`tab:long_horizon` the deltas are +9.33, +2.67, +4.00 and **+0.00** (mean **+4.00**); only one clears 2 SE, and
+"improves across all models under MPC" includes an exact tie at ceiling (98.67 → 98.67). Open-loop: mean +0.17
+with **two of four negative**. Our measurement is inconsistent with their largest cell and fully consistent with
+their typical one.
+
+### 10.2 What this arm never got to test
+
+The reported result was always going to be section 14: the same formula at the **short** 25-step horizon against
+the real 75.33 ± 6.11 / 82.00 ± 2.00 baseline, with the weight selected on held-out seed 400. **That was never
+run, so this arm says nothing about whether the aggregated cost helps at short horizon.** It is closed as
+*not demonstrated*, not as *refuted*. Baseline intact throughout; no reported cell was touched.
+
+### 10.3 The design lesson, recorded against myself
+
+Task 11.4 specified a control whose only detectable target was the paper's largest and least typical cell. At the
+paired SE of 4.00 that the design implies, the paper's mean effect of +4.00 is a 1.0 SE quantity — undetectable.
+Adding the two remaining Reporting_Seeds, which 11.5 offered as the remedy, would only reach SE ≈ 2.3 and remain
+underpowered. §6.1 wrote "the control can detect a gross wiring failure, not a small effect" and then set a pass
+condition that required detecting a small effect. **A control must be powered against the effect size actually
+reported, not against the largest cell in the table**, and that arithmetic belongs in the design, before the
+GPU-hours.
+
+Second lesson, from §7.4: `sdpa_attention` sets an absolute value, so an inner scope silently defeated the outer
+one and a deviation reported as active was not. **A context manager that sets an absolute value cannot be nested
+by a caller that only wants to opt in.** Fourteen tests covering the gating all passed while the mechanism was
+inert, because none of them checked that the flag the scope writes is the flag the consumer reads.
+
+### 10.4 Errors found in this arm
+
+| # | error | cost | where |
+|---|---|---|---|
+| 1 | `HYDRA_RUN_DIR` emitted unquoted; Hydra's ANTLR grammar rejects `}`. Both call sites broken, and the suite was **pinning the bug** | 1 s, 0 GPU-h | §5 |
+| 2 | `plan_agg.py` never imported `custom_resolvers`; `replace_slash` unregistered | 1 s, 0 GPU-h | §5 |
+| 3 | Inner `sdpa_attention(False)` overrode the outer scope, so the long-horizon deviation was inert and OOM'd anyway. My pre-registered "repeat OOM = math-backend fallback" diagnosis was **wrong** | 13 s | §7.4 |
+
+Three predictions of mine failed and one held. Failed: the backend-fallback diagnosis (§7.3), the LayerNorm
+argument in `PROGRESS_MCA.md` §4.2 carried over as a habit of asserting bounds without checking whether they
+bind, and the implicit assumption that gating tests imply a working mechanism. Held: §8.4's pre-registered
+prediction that a 1.5-2.0% term contribution would leave arm B flat.
+
+### 10.5 Deliverables that outlive the arm
+
+- `plan_agg.py` / `agg_objectives.py`: a planning-time objective wrapper that is **numerically identical** to
+  frozen `plan.py` at `w = 0`, with a strict per-setting × per-horizon protocol gate, per-episode outcome
+  capture and term-magnitude instrumentation. Reusable by any future planning-cost arm.
+- `VWorldModel.resolve_fast_attention`: `fast_attention=None` now inherits the ambient switch, so long-horizon
+  or memory-heavy planning can opt into SDPA from outside without editing frozen paths. This is what makes
+  `goal_H = 50` runnable on a `1g.45gb` slice at all.
+- The measured term-magnitude ratio and the paired-SE arithmetic, both of which any future weight-sweep design
+  on this platform should start from.

@@ -1,5 +1,36 @@
 # Implementation Plan: Aggregated-Space Planning Cost
 
+> ## FEATURE CLOSED — 2026-08-09, by recorded decision (Requirement 11.7)
+>
+> **No further task in this plan runs.** Sections 12 (weight sweep), 14 (confirmation run), 15
+> (Acceptance_Gate) and 16 were never launched and are not to be launched without a new recorded approval.
+> The closing record is `PROGRESS_AGG.md` §10.
+>
+> **Why.** Task 11.4's Positive_Control completed all four runs (~2.5 GPU-h) and returned a **+0.00** delta in
+> both settings against the paper's +6.67 open-loop / **+9.33** MPC. Task 11.5 pre-registered that in this
+> branch a short-horizon null would be uninterpretable, and blocked the sweep. The arm was closed rather than
+> unblocked by post-hoc re-argument — the §9.5 case that the wrapper is sound on other evidence was assembled
+> *after* seeing the gate fall, and acting on it would have been the `PROGRESS_MCA.md` §0 failure mode.
+>
+> **Status of the task checkboxes below.** Tasks 1-11.5 are complete and their `[x]` marks are accurate.
+> Everything from section 12 onward is unstarted and stays unstarted; the `[ ]` marks are not a work queue.
+>
+> **What the arm measured, kept as the transferable result.** At the paper's literal `w = 0.1` the aggregated
+> term is **1.5-2.0% of `L_spatial`** (step-0 ratio 0.0154, step-99 0.0196). It is live and well-formed — it
+> descends 84% under the planner's optimizer and perturbs 50 of 50 plans — and far too small at this weight to
+> move a decision boundary. Open-loop returned a bit-identical 50-episode outcome vector; MPC flipped 4 of 50,
+> split exactly 2-2 (McNemar p = 1.000, paired SE on the delta 4.00 points).
+>
+> **Closed as *not demonstrated*, not *refuted*.** The reported result was always section 14 at the **short**
+> 25-step horizon against the 75.33 / 82.00 baseline, and it never ran. Nothing here says whether the
+> aggregated cost helps at short horizon. Baseline intact; no reported cell was touched.
+>
+> **Design lesson (`PROGRESS_AGG.md` §10.3).** This plan specified a control whose only detectable target was
+> the paper's largest and least typical cell: across `tab:long_horizon`'s four combined-cost MPC cells the
+> deltas are +9.33, +2.67, +4.00 and +0.00, mean **+4.00**, which at the design's implied paired SE of 4.00 is a
+> 1.0 SE quantity — undetectable. A control must be powered against the effect size actually reported, and that
+> arithmetic belongs in the design before the GPU-hours.
+
 ## Overview
 
 Python 3.10 / PyTorch / Hydra, matching the rest of the repo. Two new root-level files carry the whole
