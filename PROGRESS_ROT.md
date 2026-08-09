@@ -563,3 +563,52 @@ straightening does to state content, together with the circular-code observation
 -0.021, a *kind* of degradation unique to the periodic dimension since positional dimensions have no
 circular structure to lose). That is a workshop-scale analysis note. It is not a novel method and it
 does not beat the baseline.
+
+---
+
+## 12. OFF@124k landed: the §7.2 interaction gate is CAUSAL CONFIRMED (2026-08-09)
+
+`checkpoints_off_full` finished training 19:34 UTC (epoch 2/2, 123,858 steps) and the watcher ran the
+probe automatically at 19:37 UTC: `probe_outputs/rot_rung2_off_full.json`, rc=0, checkpoint sha256
+`bb7718aaea867f41...` verified unchanged before and after, 192/192 windows, 4 draws.
+
+Run identity (from the live process cmdline, verified before arming): `env=pusht encoder=dino_channel
+training.straighten=False training.encoder_lr=1e-5 training.lambda_cf=0 training.ccr_rho=0
+training.mca_weight=0`, run dir
+`checkpoints_off_full/test/pusht_False_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05`. The probe log
+confirms `Straightening disabled` and `CCR disabled (lambda_cf=0.0)` on load; the probe's own 8.1
+curvature gate reports FAIL, which is the correct, expected reading for a straightening-OFF checkpoint
+and independently certifies the run was clean.
+
+### 12.1 The completed 2x2 (orientation_readable.block_angle.best_r2, --num-windows 192)
+
+| | ON | OFF | OFF - ON |
+|---|---|---|---|
+| 8k | 0.394 | 0.871 | +0.477 |
+| 124k (full) | 0.166 | 0.978203 | +0.812203 |
+
+OFF@full detail: linear readout 0.755696, circular readout 0.978203, best = circular. The OFF arm
+preserves a genuine (cos,sin)-style orientation code at full budget -- the strongest decodability in
+the entire 2x2.
+
+### 12.2 Verdict, judged against §7.2 exactly as written
+
+Interaction = (OFF_full - ON_full) - (OFF_8k - ON_8k) = 0.812203 - 0.477 = **+0.335203 >= 0.15
+-> CAUSAL CONFIRMED.** Matched-8k main effect, reported separately as the pre-registration requires:
+**+0.477.**
+
+The pre-data prior was MIDDLE on the grounds that the 8k main effect already looked saturated. It was
+wrong in the informative direction: the OFF side did not saturate (0.871 -> 0.978) while the ON side
+kept collapsing (0.394 -> 0.166). The causal effect of the straightening term on destroying the
+orientation code **widens with training budget** rather than being a transient initialization artifact.
+
+### 12.3 What this does and does not change
+
+It does not resurrect the mechanism claim of §2 -- the specificity gate of §10.3 still stands FAILED
+(block_y +0.1793 breaches the 0.15 clause), and the §11.2 objection still stands: none of this touches
+planning success. What it upgrades is the measurement: a budget-growing, causally-attributed,
+orientation-worst destruction of decodable state content, on a circular code, is a solid empirical
+core. The next and final step for this arm is HANDOFF §10.2 -- the paired per-episode selection
+experiment on this exact ON/OFF pair -- which is the only measurement that can convert "straightening
+destroys orientation content" into anything about behaviour.
+
