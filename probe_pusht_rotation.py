@@ -76,26 +76,63 @@ def infer_period(theta):
     return 2.0 * np.pi, "radians"
 
 
-def load_states(data_dir):
-    """`(states, seq_lengths_or_None)`. `states` is (n_rollouts, T, state_dim), unnormalized."""
+#: Split subdirectories. `datasets.pusht_dset.load_pusht_slice_train_val` appends `/train` and
+#: `/val` to the configured `data_path`, so `$DATASET_DIR/pusht_noise` itself holds no `states.pth`.
+#: Train is the headline because it is what training sees; val is measured too, as the cross-check.
+SPLIT_DIRS = ("train", "val")
+
+
+def resolve_splits(data_dir):
+    """`[(split_name, path)]` for a dataset root, or a single entry for one split directory."""
+    root = Path(data_dir)
+    if (root / "states.pth").is_file():
+        return [(root.name or "split", root)]
+    found = [(s, root / s) for s in SPLIT_DIRS if (root / s / "states.pth").is_file()]
+    if found:
+        return found
+    raise FileNotFoundError(
+        f"no states.pth at {root / 'states.pth'} nor under "
+        f"{'/, '.join(str(root / s) for s in SPLIT_DIRS)}/. "
+        f"datasets/pusht_dset.load_pusht_slice_train_val appends '/train' and '/val' to "
+        f"data_path, so pass the dataset root (e.g. $DATASET_DIR/pusht_noise) or one split "
+        f"directory directly."
+    )
+
+
+def load_seq_lengths(split_dir):
+    """`(lengths_or_None, source)`. The dataset stores these as a **pickle**, not a tensor.
+
+    `datasets/pusht_dset.py` reads `seq_lengths.pkl` with `pickle.load`. Guessing `.pth` here is
+    what made the first run of this probe fail, so both are tried and the one used is recorded --
+    a wrong length silently biases every per-step statistic.
+    """
+    import pickle
+
+    import numpy as np
     import torch
 
-    path = Path(data_dir) / "states.pth"
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"no states.pth at {path}. Pass --data-dir pointing at the PushT dataset "
-            f"directory (the one datasets/pusht_dset.py reads), e.g. "
-            f"$DATASET_DIR/pusht_noise."
-        )
-    states = torch.load(path, map_location="cpu").float().numpy()
-
-    seq = None
+    p = Path(split_dir)
+    cand = p / "seq_lengths.pkl"
+    if cand.is_file():
+        with open(cand, "rb") as fh:
+            return np.asarray(pickle.load(fh)).astype(np.int64), "seq_lengths.pkl"
     for name in ("seq_lengths.pth", "seq_length.pth"):
-        cand = Path(data_dir) / name
-        if cand.is_file():
-            seq = torch.load(cand, map_location="cpu").long().numpy()
-            break
-    return states, seq
+        c = p / name
+        if c.is_file():
+            return torch.load(c, map_location="cpu").long().numpy(), name
+    return None, "inferred from constant tail"
+
+
+def load_states(split_dir):
+    """`(states, seq_lengths_or_None, seq_source)`; states is (n_rollouts, T, dim), unnormalized."""
+    import torch
+
+    path = Path(split_dir) / "states.pth"
+    if not path.is_file():
+        raise FileNotFoundError(f"no states.pth at {path}")
+    states = torch.load(path, map_location="cpu").float().numpy()
+    seq, seq_source = load_seq_lengths(split_dir)
+    return states, seq, seq_source
 
 
 def valid_length(states, seq, i):
@@ -245,24 +282,35 @@ def main(argv=None):
             return 2
         data_dir = str(Path(root) / "pusht_noise")
 
-    states, seq = load_states(data_dir)
-    if states.ndim != 3 or states.shape[-1] <= ANGLE_INDEX:
-        print(f"ERROR: states.pth has shape {states.shape}; expected "
-              f"(rollouts, frames, >={ANGLE_INDEX + 1}).", file=sys.stderr)
-        return 2
-
-    period, unit = infer_period(states[..., ANGLE_INDEX])
+    splits = resolve_splits(data_dir)
     report = {
         "probe": "probe_pusht_rotation.py",
         "data_dir": str(data_dir),
-        "states_shape": list(states.shape),
-        "seq_lengths_source": "seq_lengths.pth" if seq is not None
-        else "inferred from constant tail",
-        "angle_period": period,
-        "angle_unit": unit,
         "state_names": list(STATE_NAMES),
-        "measurements": measure(states, seq, period),
+        "splits": {},
     }
+
+    for name, split_dir in splits:
+        states, seq, seq_source = load_states(split_dir)
+        if states.ndim != 3 or states.shape[-1] <= ANGLE_INDEX:
+            print(f"ERROR: {split_dir}/states.pth has shape {states.shape}; expected "
+                  f"(rollouts, frames, >={ANGLE_INDEX + 1}).", file=sys.stderr)
+            return 2
+        period, unit = infer_period(states[..., ANGLE_INDEX])
+        report["splits"][name] = {
+            "path": str(split_dir),
+            "states_shape": list(states.shape),
+            "seq_lengths_source": seq_source,
+            "angle_period": period,
+            "angle_unit": unit,
+            "measurements": measure(states, seq, period),
+        }
+
+    # `train` is the headline -- it is what training saw -- and the gate is read on it. `val` is
+    # reported as the cross-check, the same convention `--readout actions` uses for its splits.
+    headline = "train" if "train" in report["splits"] else next(iter(report["splits"]))
+    report["headline_split"] = headline
+    report["measurements"] = report["splits"][headline]["measurements"]
     report["gate"] = verdict(report)
 
     out = Path(args.out)
@@ -272,30 +320,38 @@ def main(argv=None):
     print("=" * 78)
     print(f"PUSHT ROTATION IN THE LOGGED DATA   {data_dir}")
     print("=" * 78)
-    print(f"  states               : {tuple(states.shape)}  "
-          f"(angle at index {ANGLE_INDEX}, {unit}, period {period:g})")
-    print(f"  seq_lengths          : {report['seq_lengths_source']}")
-    d = report["measurements"]["angle_distribution"]
-    print(f"  block_angle spread   : std {d.get('std'):.4f} {unit}, "
-          f"circular std {d.get('circular_std_deg'):.2f} deg, "
-          f"{d.get('frames')} frames over {d.get('rollouts')} rollouts")
-    print()
-    print(f"  {'horizon':>8}{'rot median':>12}{'rot p90':>10}{'rot max':>10}"
-          f"{'>15deg':>9}{'>30deg':>9}{'block |dxy| med':>17}")
-    for h in HORIZONS:
-        e = report["measurements"]["horizons"][str(h)]
-        r, t = e["rotation_deg"], e["block_translation"]
-        f15 = e["fraction_exceeding_deg"].get("15.0")
-        f30 = e["fraction_exceeding_deg"].get("30.0")
-        print(f"  {h:>8}{r.get('median', float('nan')):>12.2f}"
-              f"{r.get('p90', float('nan')):>10.2f}{r.get('max', float('nan')):>10.2f}"
-              f"{(f15 if f15 is not None else float('nan')):>9.3f}"
-              f"{(f30 if f30 is not None else float('nan')):>9.3f}"
-              f"{t.get('median', float('nan')):>17.3f}")
+    for name in report["splits"]:
+        s = report["splits"][name]
+        d = s["measurements"]["angle_distribution"]
+        mark = "  <- gate read here" if name == headline else ""
+        print()
+        print(f"  [{name}]{mark}")
+        print(f"    states             : {tuple(s['states_shape'])}  "
+              f"(angle idx {ANGLE_INDEX}, {s['angle_unit']}, period {s['angle_period']:g})")
+        print(f"    seq_lengths        : {s['seq_lengths_source']}")
+        cstd = d.get("circular_std_deg")
+        print(f"    block_angle spread : std {d.get('std', float('nan')):.4f} "
+              f"{s['angle_unit']}, circular std "
+              f"{(cstd if cstd is not None else float('nan')):.2f} deg, "
+              f"{d.get('frames')} frames / {d.get('rollouts')} rollouts")
+        print(f"    {'horizon':>8}{'rot median':>12}{'rot p90':>10}{'rot max':>10}"
+              f"{'>15deg':>9}{'>30deg':>9}{'blk |dxy| med':>15}")
+        for h in HORIZONS:
+            e = s["measurements"]["horizons"].get(str(h))
+            if not e:
+                continue
+            r, t = e["rotation_deg"], e["block_translation"]
+            f15 = e["fraction_exceeding_deg"].get("15.0")
+            f30 = e["fraction_exceeding_deg"].get("30.0")
+            print(f"    {h:>8}{r.get('median', float('nan')):>12.2f}"
+                  f"{r.get('p90', float('nan')):>10.2f}{r.get('max', float('nan')):>10.2f}"
+                  f"{(f15 if f15 is not None else float('nan')):>9.3f}"
+                  f"{(f30 if f30 is not None else float('nan')):>9.3f}"
+                  f"{t.get('median', float('nan')):>15.3f}")
     print()
     g = report["gate"]
     print(f"  criterion            : {g['criterion']}")
-    print(f"  VERDICT              : {g['verdict']}  -- {g['reason']}")
+    print(f"  VERDICT ({headline})   : {g['verdict']}  -- {g['reason']}")
     print()
     print(f"Report written to {out.resolve()}")
     return 0

@@ -178,3 +178,70 @@ def test_seq_lengths_take_precedence_over_inference():
     s = _states(4, 60, math.radians(1.0), wrap=False)
     seq = np.full(4, 30, dtype=np.int64)
     assert rot.valid_length(s, seq, 0) == 30
+
+
+# ---------------------------------------------------------------------------
+# Dataset layout -- the two assumptions that made the first pod run fail
+# ---------------------------------------------------------------------------
+#
+# `datasets.pusht_dset.load_pusht_slice_train_val` appends "/train" and "/val" to the configured
+# `data_path`, so `$DATASET_DIR/pusht_noise` holds no `states.pth` itself; and the sequence lengths
+# are a **pickle** (`seq_lengths.pkl`), not a tensor. I guessed both wrong, so both are pinned here.
+
+
+def _write_split(tmp_path, name, n_roll=4, T=40, with_pkl=True):
+    import pickle
+
+    import torch
+
+    d = tmp_path / name if name else tmp_path
+    d.mkdir(parents=True, exist_ok=True)
+    states = torch.zeros(n_roll, T, 5)
+    states[..., 4] = torch.linspace(0, 1, T)
+    torch.save(states, d / "states.pth")
+    if with_pkl:
+        with open(d / "seq_lengths.pkl", "wb") as fh:
+            pickle.dump([T] * n_roll, fh)
+    return d
+
+
+def test_dataset_root_resolves_to_both_splits(tmp_path):
+    _write_split(tmp_path, "train")
+    _write_split(tmp_path, "val")
+    got = rot.resolve_splits(tmp_path)
+    assert [n for n, _ in got] == ["train", "val"], got
+
+
+def test_a_single_split_directory_is_accepted_directly(tmp_path):
+    d = _write_split(tmp_path, "train")
+    got = rot.resolve_splits(d)
+    assert len(got) == 1 and got[0][1] == d
+
+
+def test_missing_states_names_the_split_layout(tmp_path):
+    """The error must say where it looked, since the first failure was a wrong assumption."""
+    with pytest.raises(FileNotFoundError) as e:
+        rot.resolve_splits(tmp_path)
+    msg = str(e.value)
+    assert "train" in msg and "val" in msg and "load_pusht_slice_train_val" in msg
+
+
+def test_seq_lengths_are_read_from_the_pickle(tmp_path):
+    d = _write_split(tmp_path, "train", n_roll=3, T=25)
+    seq, source = rot.load_seq_lengths(d)
+    assert source == "seq_lengths.pkl"
+    assert list(seq) == [25, 25, 25]
+
+
+def test_absent_seq_lengths_falls_back_and_says_so(tmp_path):
+    d = _write_split(tmp_path, "train", with_pkl=False)
+    seq, source = rot.load_seq_lengths(d)
+    assert seq is None
+    assert "inferred" in source
+
+
+def test_load_states_returns_the_source_it_used(tmp_path):
+    d = _write_split(tmp_path, "train", n_roll=2, T=30)
+    states, seq, source = rot.load_states(d)
+    assert states.shape == (2, 30, 5)
+    assert source == "seq_lengths.pkl" and list(seq) == [30, 30]
