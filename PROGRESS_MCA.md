@@ -72,6 +72,11 @@ shown to suppress `block_angle`.
 | Rung-2 pilot (~0.8 GPU-h) | **NOT LAUNCHED — rung 2 not permitted** |
 | Rung 3 | not reached |
 
+> **REOPENED 2026-08-09 as an openly post-hoc decision — see §8.** The rung-1 STOP below stands as written
+> and §4.3 is unedited; the prior is revised down to under 15% per §6.2. A full 123,858-step run at
+> `mca_weight=0.1` is in progress (~12 h), to be followed by the 3-seed evaluation. The banner below records
+> the state at rung 1 and is deliberately left intact.
+>
 > **THIS ARM IS CLOSED AT RUNG 1. `ρ(r, ‖Δpatch‖) = +0.487` — `encoder.agg` *expands* large motions
 > rather than compressing them, which §4.3 pre-registered as a STOP at any magnitude. MCA is not
 > piloted. Total GPU-hours spent: 0. Total CPU: 53 seconds. The return is findings M1 and M2 (§6.4).**
@@ -339,3 +344,85 @@ independent confirmations of `SHORT_BUDGET_PILOTS.md` §4 within one day, at a c
 |---|---|---|---|---|
 | 1 | 2026-08-08 | **§4.2's LayerNorm saturation argument was wrong, and it was the argument the whole gate was built around.** It reasoned that a terminal `nn.LayerNorm(128)` bounds `‖Δagg‖` at `≈ 22.63` while `‖Δpatch‖` is unbounded, so `r` must *decrease* with `‖Δpatch‖`. Measured `ρ = +0.487` — the opposite sign, at 19σ, monotone across all ten deciles and positive in all five state channels. The bound is real but sits **38× above** the typical `‖Δagg‖ ≈ 0.603`, so it never engages and constrains nothing | 53 s of CPU and one probe implementation; **0 GPU-h.** The pre-registered gate converted a wrong prediction into a cheap, recorded STOP instead of a 0.8 GPU-h pilot chasing a mechanism that does not exist in the claimed direction | The rung-1 probe itself, on its first run. §4.3 had pre-registered `ρ > 0` as a distinct STOP whose stated meaning was "the architecture is not understood" — written before the data, and it turned out to be the branch that fired. The disaggregated decile table (§4.4, mandatory) made the direction unmistakable rather than arguable |
 | 2 | 2026-08-08 | **The `ρ > 0` branch of my own gate conflates two questions and therefore over-fires.** `L_mca` is sign-agnostic, so a large positive `ρ` is as much a systematic bias to correct as a large negative one; a two-sided gate would have returned GO. The rule fused "is the distortion systematic?" with "does my architectural story hold?" | none yet — the STOP is honored as written rather than revised, so the cost is a possibly-forgone arm, not a wrong action | Noticed while writing §6.2 up, immediately after reading the verdict. Recorded there rather than acted on: editing §4.3 after seeing `ρ` is the §0 failure mode. The fix belongs to the next pre-registration — ask the systematic question two-sidedly, keep the mechanism-story check separate and explicitly labelled |
+
+---
+
+## 8. ARM REOPENED 2026-08-09 — openly post-hoc, at the user's direction
+
+**This is the post-hoc reopening §6.2 anticipated and constrained.** §4.3 is **not edited**: the rung-1 STOP
+at `ρ = +0.487` stands exactly as written, and the reopening is recorded here as a separate, later,
+explicitly non-pre-registered decision. Per §6.2 the 12–18% prior is revised **downward, to under 15%**.
+
+**Grounds, such as they are.** §7.2 recorded against myself that the `ρ > 0` branch over-fires: it fused
+*"is the distortion systematic?"* — which `|ρ| = 0.487` at 19σ answers emphatically yes — with *"does my
+architectural story hold?"*, which the sign answers no. A two-sided gate would have returned GO. That was
+recorded before this reopening was contemplated, which is the only reason it can be leaned on now.
+It remains a *forgone-arm* argument, not evidence that MCA works.
+
+**Why MCA rather than CCR or ACS**, all three checked before launching:
+
+- **ACS is not runnable.** `total_curvature` accepts only `"aggcos"` and `"cos"`; `mode="acsaggcos"` raises
+  `ValueError`. The parser, the enums and the validation landed (ACS tasks 3.3–4.4) and the loss never did,
+  so `training.straighten=acsaggcos1e-1` would crash. ACS closed at 21/70 tasks.
+- **CCR costs ~29 h**, not 12: its pilot ran at 1.198 it/s against the baseline's 2.86, so 123,858 steps is
+  ~103,000 s. And §6e measured it degrading `block_angle` against a matched control, on the one Table-1 task
+  that has rotational state.
+- **MCA is `<0.1%` overhead and ~12 h**, and its STOP is the one I have on record as mis-specified.
+
+### 8.1 Configuration, and why it is comparable to the paper
+
+`checkpoints_mca/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05_cf0_rho0_srcsynthetic_mca0p1`
+
+Only `training.mca_weight` differs from the paper's ✓ recipe. Confirmed from the run header:
+`Straightening enabled: mode=aggcos, scale=0.1`, `MCA enabled: weight=0.1`, `CCR disabled (lambda_cf=0.0)`,
+`Iteration budget: steps/epoch=61929 epochs=2 total=123858 max_iterations=0 (no cap)` — the baseline's exact
+step budget — `env=pusht encoder=dino_channel training.encoder_lr=1e-5 stop_grad=True`, bf16, batch 32.
+`encoder.agg_mlp.{0,2,4}` and `agg_post_norm` are in the trainable list, which is the necessary condition
+for MCA's penalty to act on anything.
+
+**`mca_weight = 0.1` is a guess, not a calibrated value.** §5's rung-2 gate was never written, so no weight
+was pre-registered. 0.1 matches the project's λ convention and nothing more. This is the same exposure that
+sank `aggregated-space-planning-cost`, where a plausible-looking weight put the term at 1.5–2.0% of the
+objective and it could not flip one episode in fifty.
+
+### 8.2 Smoke test on never-run code — PASS
+
+`compute_mca` had never executed. Both bugs in the aggregated-space arm were in never-executed code, so a
+200-iteration smoke ran first into `checkpoints_mca_smoke/`, ~80 s. It completed at **2.88 it/s**, matching
+the baseline's 2.862–2.865 and confirming the `<0.1%` overhead claim on real hardware.
+
+### 8.3 Early veto checks at global_iter 600 — neither fired
+
+Rules carried over from CCR (§6a's `[2%, 30%]` share window and §7(1)'s prediction-degradation pattern)
+rather than invented for this arm.
+
+| global_iter | `mca` scaled | `mca` share | `prediction` ours | ref | delta |
+|---|---|---|---|---|---|
+| 200 | 0.003484 | **1.410%** | 0.157518 | 0.158464 | **−0.6%** |
+| 400 | 0.003692 | 2.026% | 0.098745 | 0.098584 | +0.16% |
+| 600 | 0.004198 | **3.023%** | 0.072052 | 0.072869 | **−1.1%** |
+
+**The raw MCA term is not self-solving** — 0.003484 → 0.004198, slightly *up*, while total loss falls
+0.247 → 0.139. The share rises because the denominator shrinks. That is the **opposite** of CCR's killer
+signature, whose raw term fell 79% by step 8,000 ("measured cost with vanishing benefit", §7(2) there).
+
+**Prediction loss is not degraded**: 2 of 3 rows better than the matched baseline, one tied at +0.16%. CCR's
+tell was 8 of 8 rows worse from ~1,200 steps at +3% to +22%. The falling prediction *share* (−0.0091,
+−0.0242, −0.0267) is MCA entering the denominator, not the predictor getting worse.
+
+Step rate 2.855 vs 2.900 reference (+1.6% step time), floor 1.933 — PASS. Step-200 shared-term match against
+the reference — PASS at rtol 0.05 on curvature, decoder and prediction.
+
+**A specification gap in my own rule, recorded rather than resolved conveniently.** I wrote "share in
+[2%, 30%]" without naming the row, and the answer depends on it: 1.410% at step 200 is *below* the floor,
+3.023% at 600 is inside. CCR calibrated that window at `global_iter 8000` and `PROGRESS_ACS.md` states the
+reference is read "at 8,000 and nowhere else", so **8,000 is the row that governs** and it is the read that
+counts. Written down before that row exists.
+
+### 8.4 What these checks cannot do
+
+CCR's §6a said its 8,000-step row "can veto but cannot endorse", because a pilot predictor is ~7x worse on
+`z_loss` than a finished one. At 600 steps that applies far more strongly. Nothing here predicts a success
+rate. The only thing that will is the 3-seed evaluation at the end, against the paper's 77.33 / 85.33 and the
+platform's 75.33 / 82.00, and the `ccr_acceptance_gate.py` predicate requires **+6.0 on both settings** for a
+`pass` rather than the 79.33 / 87.00 quoted in the ACS and TMR design prose.
