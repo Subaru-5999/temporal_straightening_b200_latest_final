@@ -73,3 +73,35 @@ decision. No gate in this file may be revised after data is seen.
 
 - 2026-08-10: pre-registration approved; first eval leg = ON arm, open-loop, seed 100, as a smoke
   leg to verify the artifact pair before the remaining battery.
+- 2026-08-10: smoke leg PASSED — ON OL seed 100 = 0.74, exactly the recorded per-seed value; the
+  full ON 3-seed mean reproduces 75.33 with per-seed 74/82/70, bitwise-identical to the recorded
+  baseline cell. Battery: 12 legs (2 arms × 3 seeds × 2 settings) chained serially on the MIG slice.
+- 2026-08-10: **OPEN-LOOP ANALYSIS** (`sel_outputs/sel_report_ol.json`, 150 paired episodes):
+  overall ON 75.33 vs OFF 70.00, paired delta +5.33 ± 3.75 pts, McNemar exact p = 0.2153
+  (on_only 20, off_only 12). Splits (gap = high − low, gate ≥ 8 pts AND ≥ 2×SE):
+  - rot ≤ 15°: low +9.09, high +1.37, gap −7.72 ± 7.52 → not qualify, not reversed;
+  - rot ≤ 30°: low +10.64 (p=0.021), high −3.57, gap −14.21 ± 8.23 → not qualify, not reversed
+    (reversal would need ≤ −16.46);
+  - block_trans @ 26.28: gap +13.33 ± 7.41 → short of 2SE (needs ≥ 14.82);
+  - goal_dist @ 147.92: gap +8.00 ± 7.46 → short of 2SE (needs ≥ 14.92);
+  - agent_block_dist @ 101.95: gap −2.67 ± 7.49 → nothing.
+  **Rotation verdict: NULL. Stopping rule: TRIGGERED for the OL setting** — no qualifying split.
+  Descriptive (not gate-relevant) note: every rotation point estimate trends OPPOSITE to the ROT
+  prediction; the ON benefit sits on LOW-rotation episodes. MPC legs were already launched before
+  this result and will complete and be judged identically; no further selection evals will be
+  launched (stopping rule, §1).
+- 2026-08-10: **MPC ANALYSIS** (`sel_outputs/sel_report_mpc.json`, 150 paired episodes):
+  overall ON 82.00 (matches the recorded platform baseline exactly) vs OFF 75.33, paired delta
+  +6.67 ± 4.68 pts, McNemar exact p = 0.2026 (on_only 30, off_only 20). Splits: rot ≤ 15° gap
+  −2.31 ± 9.36; rot ≤ 30° gap +0.76 ± 9.61; block_trans +5.33 ± 9.35; goal_dist +5.33 ± 9.35;
+  agent_block_dist −2.67 ± 9.36. All below gate. **Rotation verdict: NULL. Stopping rule:
+  TRIGGERED for the MPC setting.**
+- 2026-08-10: **SELECTION EXPERIMENT CLOSED.** Both settings judged by the frozen gates; neither
+  produced a qualifying split; rotation NULL in both. Final reading: straightening confers a
+  roughly UNIFORM +5.3 (OL) / +6.7 (MPC) point advantage, individually non-significant on paired
+  tests, with no behavioural concentration on required rotation or any other pre-registered
+  covariate. The ROT mechanism has no behavioural signature. Per §1: no further selection evals;
+  the measurement core stands as recorded (PROGRESS_ROT §12 + this file). Next: the method-first
+  program (Paper B), designed from these measurements, with its own pre-registered pilot gates.
+
+
