@@ -493,3 +493,73 @@ aggregate 0.701). Both JSONs are already on disk; the comparison costs nothing.
 dimension improves by more than 0.15**, the effect is orientation-specific and the arm's mechanism
 stands. If the positional dimensions improve comparably, the finding degrades to "straightening
 reduces linear state decodability across the board" and the rotation story is not supported.
+
+---
+
+## 11. SPECIFICITY TEST — **FAILED** (2026-08-09, 0 GPU-h). The mechanism claim is not supported.
+
+Matched 8k pair, `--num-windows 192`, `state_readout_r2` per dimension:
+
+| dimension | ON @ 8k | OFF @ 8k | delta |
+|---|---|---|---|
+| agent_x | 0.8257 | 0.8393 | +0.0136 |
+| agent_y | 0.6696 | 0.8160 | +0.1464 |
+| block_x | 0.8386 | 0.9122 | +0.0736 |
+| block_y | 0.7869 | 0.9662 | **+0.1793** |
+| block_angle (linear) | 0.3943 | 0.6635 | +0.2692 |
+| **block_angle (best_r2)** | 0.3943 | 0.8707 | **+0.4763** |
+
+§10.3 pre-registered: **specific iff `block_angle` improves ≥0.30 AND no positional dimension
+improves >0.15.** First clause passes (+0.4763). **Second clause fails: `block_y` +0.1793.**
+
+**Verdict: NOT SPECIFIC. Recorded as written, missing by 0.029.** A threshold that is relaxed because
+the result landed just outside it is not a threshold. §0 of `PROGRESS_MCA.md` and rule 1 of
+`RESEARCH_GOAL.md` both apply.
+
+### 11.1 What the numbers do support, stated without inflation
+
+Straightening degrades **every** state readout at matched budget. Mean positional improvement when it
+is removed: **+0.1032**. `block_angle`: **+0.4763** — 4.6x the positional mean and 2.7x the worst
+single positional dimension. So there is a **gradient**, not a clean dissociation.
+
+The supportable claim is therefore: *temporal straightening reduces the linearly-decodable state
+content of the aggregated representation across all measured dimensions, most severely for
+orientation.* That is real, unreported, and much weaker than the arm's premise. It is an analysis note,
+not the ICLR mechanism paper described in `RESEARCH_GOAL.md` §2.
+
+### 11.2 The deeper objection, which the near-miss exposed
+
+**Reduced decodability may be the method succeeding.** The paper's abstract argues pretrained encoders
+carry information *"irrelevant -- or even detrimental -- to planning"*, and straightening lifts UMaze
+open-loop 44 -> 94. If it removes state information **and** improves planning, then everything
+measured in §5, §7, §10 and §11 is the mechanism **working as intended**, and "orientation is
+destroyed" is a description of the method's operation rather than a defect.
+
+Nothing measured so far distinguishes those two readings, because **no measurement in this arm has
+touched planning success.** The entire arm is readout probes. A finding about decodability cannot
+become a finding about a *deficiency* without showing that the lost information was needed — which
+requires the paired per-episode success comparison of §9.2, on episodes split by required rotation.
+
+That objection was available from the paper's own abstract on day one and I did not raise it. It is a
+worse miss than the specificity threshold.
+
+### 11.3 Status and what remains defensible
+
+| item | state |
+|---|---|
+| §2 rung-1 gate | PASSED (`best_r2` 0.166 ≤ 0.30) |
+| §8 data gate | SUBSTANTIAL (block rotates 11.43 deg median / 25 steps) |
+| §10.3 specificity gate | **FAILED** — the mechanism claim is not supported |
+| §7.2 interaction gate | undecided; `OFF_full` ~9 h out |
+| GPU-hours spent | ~0.8 (the 8k OFF pilot); every probe was free |
+
+**`checkpoints_off_full` is left to finish.** Not to rescue the mechanism claim, but because it is the
+**straightening-OFF full-budget checkpoint this project has never had** — `REPRODUCTION.md`'s ✗ arm
+lived in a deleted tree — and every future comparison, including the paper's own ✗ row, needs it. It
+also completes the 2x2 and will be reported against §7.2 as written.
+
+**What is genuinely publishable from this arm, if anything:** the 2x2 itself, as a measurement of what
+straightening does to state content, together with the circular-code observation (0.871 -> 0.343 ->
+-0.021, a *kind* of degradation unique to the periodic dimension since positional dimensions have no
+circular structure to lose). That is a workshop-scale analysis note. It is not a novel method and it
+does not beat the baseline.
