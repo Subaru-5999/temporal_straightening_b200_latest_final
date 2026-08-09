@@ -129,6 +129,108 @@ comparison matters.
 |---|---|
 | Circular readout implemented + CPU-validated | **done** — 15 tests; suite 404 passed, 12 skipped, 3 pre-existing CUDA-only failures |
 | Rung-1 gate pre-registered | **done — §2, before the probe** |
-| Rung-1 probe run | _not run_ |
-| Rung-2 gate | not written (deliberately — see §3) |
+| Rung-1 probe run | **done — SURVIVES.** `best_r2(block_angle) = 0.166` (linear 0.166, circular **−0.021**) against positional 0.506-0.709. Artifact hypothesis dead. §5 |
+| Rung-2 gate | **written before the ✗ arms exist — §6** |
+| Rung-2 control **C** measured | _not run_ — free, CPU, next step |
+| Rung-2 arms B / C trained | _not run_ — ~1.6 GPU-h total |
 | GPU-hours spent on this arm | **0** |
+
+---
+
+## 5. RUNG 1 RESULT — **SURVIVES** (2026-08-09, 0 GPU-h, 117 s CPU)
+
+`probe_outputs/rot_rung1_pusht.json`, paper's ✓ checkpoint (`model_2.pth`, 123,858 steps,
+sha256 `4d68b528…`, UNCHANGED after the run), `--num-windows 192` → 64 windows per
+per-dimension subset, the sampling §6e of `PROGRESS_CCR.md` used for its robustness check.
+
+| dimension | `state_readout_r2` (linear) |
+|---|---|
+| agent_x | 0.709061 |
+| agent_y | 0.506135 |
+| block_x | 0.694847 |
+| block_y | 0.685037 |
+| **block_angle** | **0.166436** |
+| aggregate | 0.627166 |
+
+| angular dim | linear | circular | **best** | which |
+|---|---|---|---|---|
+| `block_angle` | 0.166436 | **−0.021162** | **0.166436** | linear |
+
+**Verdict against the §2 gate, which was written before this ran: `best_r2 = 0.166 ≤ 0.30`
+→ SURVIVES.** Proceed to rung 2.
+
+### 5.1 The artifact hypothesis is dead, and it was mine
+
+§1.1(b) raised the possibility that `block_angle` = 0.183 was an artifact of reading a periodic
+variable with a linear ridge. The circular readout settles it: **−0.021**, i.e. *worse than
+predicting the circular mean*. Against the calibration in `tests/test_circular_state_readout.py`:
+
+- a `(cos t, sin t)` encoding read circularly scores **>0.95** — ruled out;
+- a raw-angle encoding read circularly scores **~0.50** — ruled out;
+- orientation absent scores **<0.3** on both readouts — **this is what we observe**.
+
+And the linear 0.166 is far below the **~0.60** that an exactly `(cos, sin)`-encoded angle produces
+under a linear readout, so the linear number is not merely under-reporting a well-encoded quantity.
+
+**Both readouts low, at robustness sampling, is the evidence §1.2 said was required.** Orientation is
+not represented in the aggregated latent in any linearly-recoverable form, while the four positional
+dimensions read at 0.506-0.709 — a factor of 3-4 higher. The deficit is a property of the
+representation, not of the probe.
+
+### 5.2 What this does NOT establish — unchanged from §2, restated because it is the whole risk
+
+This is **one trained model, trained with straightening**. It shows orientation is absent; it does
+**not** show straightening caused that. Competing explanations that this measurement cannot separate:
+
+1. **Straightening causes it** — the arm's hypothesis.
+2. **The `agg` pooling causes it.** A 1568→128 MLP pooling patch tokens may simply discard
+   orientation regardless of any regulariser.
+3. **The task/data cause it.** PushT's T-block may rotate little in the logged trajectories, leaving
+   little orientation variance to encode. *Cheap to check and currently unchecked.*
+4. **The 8-channel projector causes it.** `dim8` may be too narrow to carry orientation alongside
+   position.
+
+Rung 2's matched control separates (1) from (2) and (4). Explanation (3) is separable offline from
+the dataset alone and should be checked before any GPU is spent, because if the logged block angle
+barely moves, "the representation discards orientation" is uninteresting — there was nothing to
+discard.
+
+**The `PROBE GATE: FAIL` block in the output is not this arm's gate.** It is CCR's curvature gate at
+the probe's default `rho=0.05`, which `PROGRESS_CCR.md` §5a already established is 10-20x smaller
+than the region the planner explores (CCR needed `rho=0.5`). Faithfully reproduced, irrelevant here.
+
+---
+
+## 6. RUNG 2 GATE — WRITTEN 2026-08-09, BEFORE THE ✗ ARMS ARE TRAINED
+
+Rung 1's verdict is known, so §3's deferral is discharged. Definitions:
+
+- **C** = `orientation_readable.block_angle.best_r2` for `checkpoints_ctrl8k` — straightening **ON**,
+  `lr 1e-5`, 8,000 steps, the existing bitwise control. Measured at `--num-windows 192` **before**
+  either treatment arm is trained, so it is a reference and not an outcome.
+- **B** = the same quantity for **arm B**: `straighten=False`, `encoder_lr=1e-5`, 8,000 steps —
+  matched lr, so straightening is the only variable.
+- **B_C** = the same for **arm C**: `straighten=False`, `encoder_lr=1e-6` — the paper's own ✗
+  protocol (Table 3 footnote).
+- **P** = mean `state_readout_r2` over the four positional dimensions in arm B.
+
+| condition | verdict |
+|---|---|
+| **B − C ≥ 0.15** AND **B ≥ 0.5·P** AND `sign(B_C − C) = sign(B − C)` | **CAUSAL CONFIRMED.** Turning straightening off recovers orientation to at least half the positional level, by a margin no plausible probe noise covers, and the paper's own ✗ protocol agrees in direction. The mechanism claim is established and the direction proceeds to the method |
+| **B − C ≤ 0.05** | **REFUTED.** Straightening is not the cause; the deficit is architectural or in the data. The finding degrades to "PushT orientation is poorly encoded", which is **not** an ICLR story on its own, and this arm closes |
+| 0.05 < B − C < 0.15, or the two ✗ arms disagree in sign | **MIDDLE.** Partial or lr-confounded. Recorded as such; a full-budget ✗ run (12 h) becomes the only way to resolve it, and that spend requires explicit approval |
+
+**Why arm C exists.** The paper changes *two* things between its ✗ and ✓ rows — straightening and the
+encoder lr (1e-5 → 1e-6, Table 3 footnote). A single ✗ run cannot say which moved orientation. B
+isolates straightening; C matches the paper. `REPRODUCTION.md` pitfall 1 records that ✗ at `lr 1e-5`
+collapses open-loop planning, which is irrelevant here: rung 2 measures a *readout*, not success.
+
+**Cost:** 2 × ~47 min training (8,000 steps at 2.86 it/s) + 3 × ~2 min CPU probes ≈ **1.6 GPU-h**.
+
+**Order, and it matters:** measure **C** first (free, CPU, the checkpoint already exists), then train
+B and C. Measuring the control before the treatments exist is what keeps the reference honest.
+
+**Pre-registered prediction, so it can fail.** If straightening causes the deficit, B should land in
+or near the positional band (≳0.35 absolute) while C stays near 0.28. If B comes back near C, the
+mechanism is refuted and I will record that as the arm's outcome rather than looking for a third
+explanation.
