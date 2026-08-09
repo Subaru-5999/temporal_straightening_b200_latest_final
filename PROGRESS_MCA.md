@@ -426,3 +426,51 @@ CCR's §6a said its 8,000-step row "can veto but cannot endorse", because a pilo
 rate. The only thing that will is the 3-seed evaluation at the end, against the paper's 77.33 / 85.33 and the
 platform's 75.33 / 82.00, and the `ccr_acceptance_gate.py` predicate requires **+6.0 on both settings** for a
 `pass` rather than the 79.33 / 87.00 quoted in the ACS and TMR design prose.
+
+### 8.5 The stated mechanism is wrong, and the defensible one is narrower — found 2026-08-09, mid-run
+
+`compute_mca`'s docstring says `agg` "only needs to be a *similarity* (distance-preserving up to one global
+constant) for straightness to transfer". The first half is sound: a true similarity preserves angles, and the
+paper's curvature term is a cosine, so straightness would transfer exactly. **But `CV(r) = 0` does not make
+`agg` a similarity.**
+
+`r = ‖Δagg‖ / ‖Δpatch‖` is the norm ratio along **one direction per frame pair** — the consecutive-frame
+velocity. Equalising those ratios constrains the map's stretch along sampled trajectory directions only.
+Angle preservation requires the Jacobian to be a constant multiple of an orthonormal frame in *every*
+direction, which is what [Rate-Distortion Optimization Guided Autoencoder, arXiv 1910.04329] enforces and
+what MCA does not. Two velocities can each be scaled by exactly `r̄` while the angle between them is changed
+arbitrarily. **MCA is a necessary but far from sufficient condition for the property its motivation invokes.**
+
+This is the same shape of error as §7.1 — invoking a geometric constraint without checking that it delivers
+what is claimed — and as `PROGRESS_AGG.md` §7.3, where a pre-registered diagnosis was confidently wrong.
+Third instance today, same failure mode: reasoning from a geometric property's *name* rather than its
+*content*.
+
+**The defensible mechanism, which survives.** Uniform `r` reduces **distance-ranking distortion**: §6.4
+measured 18.6% of motion pairs ranked differently by the two spaces, and a planner whose objective is a
+distance cares about ranking. That is a real and measured harm, and MCA plausibly reduces it. So the arm is
+not void — but its claim must be "reduces distance-ranking distortion", never "makes straightness transfer".
+
+**A counter-argument from the paper's own ablation, which I had not weighed.** `paper_tex/sec/2_appendix.tex`
+`app:straightening` reports that the learnable aggregation head **beats** patch-wise `cos` (`λ=0.1` agg vs
+`λ=0.01` patch-wise, `img:ablation_str`), with the stated reasoning that straightening should act on global
+trajectory representations. If the metric distortion were simply harmful that result is hard to explain; the
+likelier reading is that the distortion is the *price of a benefit* — agg wins because it is free to reshape
+the space. MCA pushes it back toward patch-space fidelity and therefore risks undoing the very thing that
+made agg the best variant. This strengthens §6.4 M1 with the paper's own evidence rather than a hunch.
+
+**Consequence for reading the run.** A null is now the *expected* outcome on two independent grounds: the
+mechanism is weaker than stated, and the paper's ablation suggests the distortion is load-bearing. The prior
+of "under 15%" from §8 should be read at the low end of that. The run continues because the empirical question
+is still unanswered and because it is this project's first completed full-budget run, not because the
+mechanism story is strong.
+
+**Novelty position, checked against the literature rather than asserted.** The loss family is not novel —
+scaled-isometry and distance-preserving regularizers are established prior art ([Isometric Autoencoders,
+arXiv 2006.09289], [arXiv 1910.04329], [low bending and low distortion embeddings, arXiv 2208.10193], [Neural
+Isometries, arXiv 2405.19296]). The *question* is not asked in the paper, which diagrams the space split
+(`img:agg`) and defends it but never examines metric distortion. The *combination* appears unpublished, but is
+an obvious pairing, and [arXiv 2603.03238] reports encoder geometry regularizers making latent-dynamics
+training harder, especially for long-horizon rollouts — prior art pointing against the premise. **The
+transferable contribution is the diagnosis (`CV(r)` 0.094 → 0.589, `ρ = +0.487` at 19σ, 18.6% rank
+disagreement), not the regularizer.**
