@@ -351,3 +351,72 @@ failures.
 straightening-OFF full run is training concurrently (`checkpoints_off_full`, `pusht_False_..._lr1e-05`,
 ~11 h remaining at 2.90 it/s); this probe is CPU-only and reads a different file, so it does not
 contend for the MIG slice.
+
+---
+
+## 9. DATA GATE RESULT — **SUBSTANTIAL** (2026-08-09, 0 GPU-h, seconds)
+
+`probe_outputs/rot_data_pusht.json`. Train split: 18,685 rollouts x 246 frames = 2,336,736 frames.
+`seq_lengths.pkl` used (not inferred). Angle in radians, period 2π. Circular std 66.52°.
+
+| horizon (env steps) | rot median | rot p90 | rot max | >15° | >30° | block \|Δxy\| median |
+|---|---|---|---|---|---|---|
+| **5** (= 1 latent step, frameskip 5) | **0.09°** | 14.80° | 101.57° | 9.8% | 1.0% | 0.136 |
+| **25** (short `goal_H`) | **11.43°** | 61.65° | 179.81° | **44.3%** | 28.8% | 25.353 |
+| **50** (long `goal_H`) | **32.14°** | 98.91° | 179.97° | 67.5% | 51.8% | 67.786 |
+
+Val split (21 rollouts) agrees and runs slightly higher: 13.85° median and 49.0% over 15° at horizon
+25. **Verdict against the §8 gate: median 11.43 ≥ 10 AND f15 0.443 ≥ 0.20 → SUBSTANTIAL.**
+§5.2 explanation (3) is closed; the arm proceeds.
+
+### 9.1 Two findings sharper than the gate they came from
+
+**(a) Rotation is heavy-tailed and intermittent, and this refines the mechanism.** At **one latent
+step** — the unit the curvature penalty actually operates on — the median rotation is **0.09°** while
+p90 is **14.80°** and the max is 101°. Most transitions barely rotate; roughly a tenth rotate a lot.
+
+The penalty `1 − cos(v_t, v_{t+1})` is applied **uniformly to every transition**, so it bears
+disproportionately on that informative minority. The mechanism is therefore not the generic "rotation
+is direction change" I first wrote, but the sharper: *a uniform curvature penalty preferentially
+suppresses a heavy-tailed minority of transitions, and in PushT those are exactly the transitions
+carrying orientation change.* It also explains how orientation can be destroyed without visible harm
+to aggregate prediction loss — the affected transitions are ~10% of the data.
+
+**(b) Rotation is not a low-signal dimension, so the deficit is not correct capacity allocation.**
+Over 25 steps the block translates a median 25.35 units and rotates a median 11.43° — comparable
+quantities of motion. Yet the trained model reads translation at **0.685-0.695** and rotation at
+**0.166** (§5). The competing explanation "the encoder correctly ignores a variable that does not
+move" is refuted by the data, not argued away.
+
+### 9.2 The within-PushT split point — PRE-REGISTERED NOW, before any success rate is examined
+
+`RESEARCH_GOAL.md` §2.3 requires the rotation axis to live *inside* PushT (n≈150 paired episodes)
+rather than across n=4 environments. The split has to come from the data distribution, chosen before
+any outcome is looked at, or it is fitted.
+
+At the short horizon the distribution supports two clean splits, and both are fixed here:
+
+- **Primary: 15°.** 44.3% of 25-step spans exceed it, so both sides have ~equal support — the
+  best-powered split available.
+- **Secondary: 30°.** 28.8% exceed it; a sharper contrast with weaker power, reported as the
+  robustness check rather than the headline.
+
+**Pre-registered prediction:** if straightening trades away rotation, its per-episode benefit
+(straightening-ON minus straightening-OFF, paired on identical episodes) should be **smaller on
+high-rotation episodes than on low-rotation ones**, split at 15°. A null or reversed ordering
+contradicts the mechanism even if §5/§7/§9 all hold, and will be recorded as such.
+
+Note this test needs the straightening-**OFF** checkpoint to be evaluated for planning success, not
+just probed for readouts — so it depends on `checkpoints_off_full` finishing.
+
+### 9.3 Status
+
+| cell of the §7.2 2x2 | value |
+|---|---|
+| ON @ 8k | **0.394** |
+| ON @ 124k | **0.166** |
+| OFF @ 8k | measurable now — `checkpoints_off8k` exists, CPU probe, ~2 min |
+| OFF @ 124k | training, ~10 h remaining (`checkpoints_off_full`, `pusht_False_..._lr1e-05`, 2.90 it/s) |
+
+GPU-hours spent on this arm: **0** for every measurement so far. The only spend is the OFF training
+pair (~13 GPU-h), of which the 8k half is already done.
