@@ -44,7 +44,7 @@ distortion is good.
 | Task 11.3 — long-horizon protocol column | **complete** — `PROTOCOL_EXPECTED` keyed on `(config_name, goal_H)`; short columns unweakened; `goal_H` now pinned. See §6 |
 | Task 9.2 — driver-contract test | **complete, promoted out of optional** — §5's recommendation, acted on |
 | Task 11.3b — long-horizon attention deviation | **complete** — gated on the horizon regime; the inner-scope override that defeated it is fixed. See §7.3, §7.4 |
-| Task 11.4 — Positive_Control (~2.5 GPU-h, revised) | **2 of 4 runs done** — arm A open-loop **0.16** (§8), arm A MPC **0.16** (§8.3). Both arm B legs outstanding |
+| Task 11.4 — Positive_Control (~2.5 GPU-h, revised) | **3 of 4 runs done** — arm A open-loop **0.16** (§8), arm A MPC **0.16** (§8.3), arm B open-loop **0.16**, delta **+0.00**, identical success vector (§8.5). **Arm B MPC is the decisive leg** and is outstanding |
 | Task 11.5 — Positive_Control verdict | _not read_ — needs the `w=0` → `w=0.1` delta, so all four runs |
 | Section 12 — the 6-arm weight sweep (~4 GPU-h) | **not launched; gated on BOTH 11.1 and 11.4** |
 | Acceptance gate | not reached |
@@ -457,3 +457,53 @@ that `PROGRESS_MCA.md` §7.2 caught me at. Any extension needs the Requirement 1
 a job runs, and task 12.8 already handles the boundary-selection case. Caveat on the number itself: it comes
 from the `w = 0` run, so the optimizer trajectory is the spatial-only one; at nonzero weight the ratio can
 drift because the actions being optimized differ.
+
+### 8.5 Arm B open-loop — RAN (2026-08-09): delta exactly 0.00, and the reason is visible
+
+| field | value |
+|---|---|
+| arm / setting / seed | `agg_weight=0.1` / open-loop / 100 |
+| objective rewrite | `agg_weight=0.1, enabled=True` — `L_agg` **is** in the sum |
+| protocol / attention | `protocol_ok=True`, `long`, `goal_H 50`, `n_taken_actions 50` / `sdpa` |
+| **success rate** | **0.16** = 8/50 |
+| successful episodes | 6, 28, 29, 31, 37, 39, 41, 48 |
+| `perform_planning_s` | 209.60 (arm A: 210.03 — the <0.1% overhead claim holds at long horizon too) |
+
+**The success vector is identical to arm A's, element for element.** Paired counts (Requirement 11.4):
+candidate-only **0**, baseline-only **0**, matching **50**. Open-loop delta = **+0.00** against the paper's
+**+6.67**.
+
+**This is not a no-op, and that distinction is the finding.** `state_dist` differs on **50 of 50** episodes, so
+the term genuinely changed the optimized actions everywhere:
+
+| | arm A (`w=0`) | arm B (`w=0.1`) | delta |
+|---|---|---|---|
+| mean `state_dist` | 80.656 | 82.188 | **+1.532** (worse) |
+| mean over the 8 successes | 33.132 | 33.904 | +0.772 |
+| mean over the 42 failures | 89.708 | 91.385 | +1.676 |
+| episodes B ended closer / farther | — | — | **19 / 31** |
+| median \|delta\| / max \|delta\| | — | — | 0.628 / 55.691 (episode 3) |
+
+So `L_agg` perturbs every plan, usually by very little (median 0.63 on distances averaging ~81), occasionally a
+lot (episode 3 moved 55.7 — a failure in both arms either way), and **never by enough to cross a success
+threshold**. The direction is slightly unfavourable: 31 of 50 episodes ended farther from the goal, which at
+n=50 is p≈0.14 two-sided and therefore **not** a significant degradation — it is noise around zero, recorded so
+the "slightly worse" is not later upgraded into a claim.
+
+**The §8.4 prediction held.** It was written before this run: at `w = 0.1` the term contributes 1.5-2.0% of
+L_spatial, so "if arm B is flat, *the term was too weak to matter at this weight* is the reading the
+instrumentation already supports." Arm B is flat to the episode. That is one pre-registered prediction
+confirmed, against the two of mine that failed today (§7.3's backend diagnosis, §7.2's still-unverified
+arithmetic).
+
+**What this does and does not decide.** It does **not** decide the Positive_Control. The paper makes **no**
+open-loop claim at long horizon — its claim is scoped to MPC — and two of its four open-loop combined-cost
+cells are worse than spatial-only. The decisive leg is arm B MPC, which is the only one of the four that tests
+what the paper actually asserts.
+
+**A prediction for section 12, recorded now so it is not hindsight.** If `w = 0.1` cannot flip a single episode
+out of 50 at long horizon, the sweep's two smallest weights (0.01, 0.03 — contributions of ~0.2% and ~0.6%)
+are very likely to return the Baseline_Arm's vector exactly, making 2 of the 6 arms uninformative by
+construction. Caveat: that is an extrapolation *across regimes*, and the short horizon has a different loss
+scale and a far higher baseline, so it is a prediction to check rather than a reason to change the grid. The
+grid stays as pre-registered.
